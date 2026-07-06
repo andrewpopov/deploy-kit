@@ -20,6 +20,7 @@ export interface DeployConfig {
   port: number;
   healthPath: string;
   health: { attempts: number; delaySeconds: number };
+  buildBeforeMigrate?: boolean;
   hooks: DeployHooks;
 }
 
@@ -29,6 +30,7 @@ export interface DeployOptions {
   skipMigrate?: boolean;
   stash?: boolean;
   force?: boolean;
+  buildBeforeMigrate?: boolean;
 }
 
 export interface DeployResult {

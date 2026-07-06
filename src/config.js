@@ -19,6 +19,9 @@ const DEFAULT_CONFIG = {
   port: 3000,
   healthPath: '/api/health',
   health: { attempts: 30, delaySeconds: 2 },
+  // Build before the backup/stop/migrate block (apps stay up during build) so the
+  // paused window is just migration. Default false = build after migrate (paused).
+  buildBeforeMigrate: false,
   // The 4 framework-specific seams. Each is a shell command run on the target.
   hooks: {
     install: 'npm ci || npm install',
