@@ -87,11 +87,20 @@ describe('deploy pipeline', () => {
     expect(calls.join('\n')).not.toContain('db:migrate');
   });
 
-  it('restarts paused db-bound apps if the migration fails, then aborts', () => {
+  it('resumes paused db-bound apps if the migration fails, then aborts', () => {
     const { runtime, calls } = makeRuntime({ fail: ['db:migrate'] });
     expect(() => deploy(baseConfig, {}, ctxWith(runtime))).toThrow(/Running database migrations failed/);
-    // the onFail restart of the paused app must have run
-    expect(calls.filter((c) => c.includes('pm2 restart app')).length).toBeGreaterThan(0);
+    // the paused app must be brought back up (pm2 start) before aborting
+    expect(calls.some((c) => c.includes('pm2 start app'))).toBe(true);
+  });
+
+  it('resumes paused db-bound apps if the BUILD fails (never leaves prod stopped)', () => {
+    const { runtime, calls } = makeRuntime({ fail: ['npm run build'] });
+    expect(() => deploy(baseConfig, {}, ctxWith(runtime))).toThrow(/Building failed/);
+    // build runs after migrate with apps paused — a build failure must resume them
+    expect(calls.some((c) => c.includes('pm2 start app'))).toBe(true);
+    // and it must not have reached the final restart/health
+    expect(calls.some((c) => c.includes('curl'))).toBe(false);
   });
 
   it('throws if health never comes up', () => {

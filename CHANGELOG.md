@@ -7,6 +7,15 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.1.1
+
+- Safety fix: once the DB-bound apps are paused for migration, a failure in
+  ANY later step (now including **build**, not just migrate) resumes them via
+  `pm2 start` before aborting. Previously a build failure left the paused apps
+  stopped — production down. Matches deploy.sh, which resumes on every post-stop
+  failure. Recovery now uses `pm2 start` (the apps are stopped) rather than
+  `pm2 restart`.
+
 ## 0.1.0
 
 Initial extraction (BWK-86) — generalizes the deploy/ops tooling that was
