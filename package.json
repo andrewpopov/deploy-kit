@@ -1,0 +1,30 @@
+{
+  "name": "@andrewvpopov/deploy-kit",
+  "version": "0.1.0",
+  "description": "Hook-driven SSH/local deploy pipeline + remote PM2 ops CLI + Cloudflare tunnel launcher for the Pi service fleet",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/andrewvpopov/deploy-kit.git"
+  },
+  "bin": {
+    "deploy-kit": "src/cli.js"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "vitest run",
+    "verify:pack": "node scripts/verify-pack.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "vitest": "^4.0.18"
+  }
+}

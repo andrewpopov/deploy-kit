@@ -1,0 +1,123 @@
+import { describe, it, expect } from 'vitest';
+import { createRequire } from 'module';
+
+const require = createRequire(__filename);
+const kit = require('../index.js') as typeof import('../index');
+const { buildTargetCommand, loadConfig, mergeConfig, DEFAULT_CONFIG, deploy, remote } = kit;
+
+// A fake execFileSync that records every command and returns programmed output.
+// SSH commands arrive as ('ssh', [host, 'cd dir && <cmd>']); local as ('sh', ['-c', ...]).
+function makeRuntime({ fail = [] as string[] } = {}) {
+  const calls: string[] = [];
+  const execFileSync = (file: string, args: string[]) => {
+    const remoteCmd = file === 'ssh' ? args[1] : args[1]; // both put the cmd at [1]
+    calls.push(remoteCmd);
+    if (fail.some((f) => remoteCmd.includes(f))) {
+      const err: any = new Error(`fake failure: ${remoteCmd}`);
+      err.stdout = '';
+      throw err;
+    }
+    if (remoteCmd.includes('curl')) return '200';
+    return '';
+  };
+  return { runtime: { execFileSync }, calls };
+}
+
+const baseConfig = mergeConfig(DEFAULT_CONFIG, {
+  host: 'app@pi',
+  projectDir: '/srv/app',
+  appNames: ['app'],
+  dbBoundApps: ['app'],
+  branch: 'master',
+  hooks: { install: 'npm ci', backup: 'npm run db:backup', migrate: 'npm run db:migrate', build: 'npm run build' },
+});
+
+const ctxWith = (runtime: any) => ({ runtime, sleep: () => {} });
+
+describe('config', () => {
+  it('deep-merges hooks and health over defaults', () => {
+    const c = mergeConfig(DEFAULT_CONFIG, { hooks: { migrate: 'x' }, health: { attempts: 5 } });
+    expect(c.hooks.install).toBe(DEFAULT_CONFIG.hooks.install); // preserved
+    expect(c.hooks.migrate).toBe('x');
+    expect(c.health.attempts).toBe(5);
+    expect(c.health.delaySeconds).toBe(DEFAULT_CONFIG.health.delaySeconds);
+  });
+
+  it('loadConfig returns defaults when no config file exists', () => {
+    const fsImpl = { existsSync: () => false, readFileSync: () => '' };
+    const c = loadConfig({ cwd: '/nowhere', fsImpl });
+    expect(c.mode).toBe('ssh');
+    expect(c.appNames).toEqual([]);
+  });
+});
+
+describe('buildTargetCommand', () => {
+  it('wraps ssh with cd into projectDir', () => {
+    const { file, args } = buildTargetCommand('pm2 status', { mode: 'ssh', host: 'app@pi', projectDir: '/srv/app' });
+    expect(file).toBe('ssh');
+    expect(args).toEqual(['app@pi', 'cd /srv/app && pm2 status']);
+  });
+  it('runs local mode via sh -c', () => {
+    const { file, args } = buildTargetCommand('pm2 status', { mode: 'local', host: null, projectDir: '/srv/app' });
+    expect(file).toBe('sh');
+    expect(args).toEqual(['-c', 'cd /srv/app && pm2 status']);
+  });
+  it('throws in ssh mode without a host', () => {
+    expect(() => buildTargetCommand('x', { mode: 'ssh', host: null, projectDir: '/d' })).toThrow(/requires a .host/);
+  });
+});
+
+describe('deploy pipeline', () => {
+  it('runs steps in the correct order with the safety gates', () => {
+    const { runtime, calls } = makeRuntime();
+    const result = deploy(baseConfig, {}, ctxWith(runtime));
+    expect(result.steps).toEqual(['stash', 'pull:master', 'install', 'backup', 'migrate', 'build', 'restart', 'health']);
+    const joined = calls.join('\n');
+    // backup happens before migrate; db-bound app is stopped before migrate.
+    expect(joined.indexOf('db:backup')).toBeLessThan(joined.indexOf('pm2 stop app'));
+    expect(joined.indexOf('pm2 stop app')).toBeLessThan(joined.indexOf('db:migrate'));
+    expect(joined.indexOf('db:migrate')).toBeLessThan(joined.indexOf('npm run build'));
+    expect(joined).toContain('git pull --ff-only origin master');
+    expect(joined).toContain('curl -f -s http://localhost:3000/api/health');
+  });
+
+  it('aborts BEFORE migrating if the backup gate fails', () => {
+    const { runtime, calls } = makeRuntime({ fail: ['db:backup'] });
+    expect(() => deploy(baseConfig, {}, ctxWith(runtime))).toThrow(/Pre-migration database backup failed/);
+    expect(calls.join('\n')).not.toContain('db:migrate');
+  });
+
+  it('restarts paused db-bound apps if the migration fails, then aborts', () => {
+    const { runtime, calls } = makeRuntime({ fail: ['db:migrate'] });
+    expect(() => deploy(baseConfig, {}, ctxWith(runtime))).toThrow(/Running database migrations failed/);
+    // the onFail restart of the paused app must have run
+    expect(calls.filter((c) => c.includes('pm2 restart app')).length).toBeGreaterThan(0);
+  });
+
+  it('throws if health never comes up', () => {
+    const runtime = {
+      execFileSync: (_file: string, args: string[]) => (args[1].includes('curl') ? '503' : ''),
+    };
+    const cfg = mergeConfig(baseConfig, { health: { attempts: 2, delaySeconds: 0 } });
+    expect(() => deploy(cfg, {}, { runtime, sleep: () => {} })).toThrow(/unhealthy/);
+  });
+
+  it('skips deps/build/migrate when requested', () => {
+    const { runtime } = makeRuntime();
+    const result = deploy(baseConfig, { skipDeps: true, skipBuild: true, skipMigrate: true, stash: false }, ctxWith(runtime));
+    expect(result.steps).toEqual(['pull:master', 'restart', 'health']);
+  });
+});
+
+describe('remote ops', () => {
+  it('restart issues pm2 restart for configured apps', () => {
+    const { runtime, calls } = makeRuntime();
+    const ok = remote.restart(baseConfig, { runtime });
+    expect(ok).toBe(true);
+    expect(calls.some((c) => c.includes('pm2 restart app'))).toBe(true);
+  });
+  it('health returns true on 200', () => {
+    const { runtime } = makeRuntime();
+    expect(remote.health(baseConfig, { runtime })).toBe(true);
+  });
+});
