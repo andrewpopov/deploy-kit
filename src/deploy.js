@@ -1,6 +1,6 @@
 'use strict';
 
-const { runOnTarget } = require('./exec');
+const { runOnTarget, buildHealthCommand } = require('./exec');
 const { log: defaultLog } = require('./log');
 
 function defaultSleep(seconds) {
@@ -25,13 +25,9 @@ function resolveBranch(config, ctx) {
 // are exhausted. In ssh mode curl runs on the remote (localhost:port).
 function waitForHealth(config, ctx) {
   const { attempts, delaySeconds } = config.health;
-  const url = `http://localhost:${config.port}${config.healthPath}`;
+  const command = buildHealthCommand(config);
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const res = runOnTarget(
-      `curl -f -s ${url} -o /dev/null -w '%{http_code}'`,
-      config,
-      { capture: true, runtime: ctx.runtime },
-    );
+    const res = runOnTarget(command, config, { capture: true, runtime: ctx.runtime });
     const code = (res.output || '').trim();
     if (code === '200') {
       ctx.log.success(`Application is healthy (HTTP 200) after ${attempt} attempt(s)`);
