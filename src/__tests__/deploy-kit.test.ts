@@ -111,6 +111,24 @@ describe('deploy pipeline', () => {
     expect(() => deploy(cfg, {}, { runtime, sleep: () => {} })).toThrow(/unhealthy/);
   });
 
+  it('buildBeforeMigrate builds while apps are up, before stop+migrate', () => {
+    const { runtime, calls } = makeRuntime();
+    const result = deploy(mergeConfig(baseConfig, { buildBeforeMigrate: true }), {}, ctxWith(runtime));
+    // build now precedes backup/stop/migrate (only one build)
+    expect(result.steps).toEqual(['stash', 'pull:master', 'install', 'build', 'backup', 'migrate', 'restart', 'health']);
+    const joined = calls.join('\n');
+    expect(joined.indexOf('npm run build')).toBeLessThan(joined.indexOf('db:backup'));
+    expect(joined.indexOf('npm run build')).toBeLessThan(joined.indexOf('pm2 stop app'));
+  });
+
+  it('a buildBeforeMigrate build failure aborts before anything is stopped', () => {
+    const { runtime, calls } = makeRuntime({ fail: ['npm run build'] });
+    expect(() => deploy(mergeConfig(baseConfig, { buildBeforeMigrate: true }), {}, ctxWith(runtime)))
+      .toThrow(/Building failed/);
+    expect(calls.some((c) => c.includes('pm2 stop app'))).toBe(false);
+    expect(calls.some((c) => c.includes('db:backup'))).toBe(false);
+  });
+
   it('skips deps/build/migrate when requested', () => {
     const { runtime } = makeRuntime();
     const result = deploy(baseConfig, { skipDeps: true, skipBuild: true, skipMigrate: true, stash: false }, ctxWith(runtime));

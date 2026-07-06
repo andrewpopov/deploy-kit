@@ -72,6 +72,11 @@ function deploy(config, options = {}, ctx = {}) {
     skipMigrate = false,
     stash = config.mode !== 'local',
     force = false,
+    // Build while apps are still UP, before the backup/stop/migrate block, to keep
+    // the app-paused window down to just migration (some repos, e.g. stoki, build
+    // first then stop only for the DB work). Default false = build after migrate,
+    // while apps are paused (bewks' model). Option or config both work.
+    buildBeforeMigrate = config.buildBeforeMigrate === true,
   } = options;
 
   const run = (message, command, opts) => {
@@ -117,6 +122,15 @@ function deploy(config, options = {}, ctx = {}) {
     gate({ message, command }, config, c, { onFail: resumeDbApps });
   };
 
+  const doBuild = !skipBuild && config.hooks.build;
+
+  if (buildBeforeMigrate && doBuild) {
+    // Build with apps still up — no pause yet, so a build failure aborts without
+    // any service having been stopped.
+    run('Building', config.hooks.build);
+    steps.push('build');
+  }
+
   if (!skipMigrate) {
     if (config.hooks.backup) {
       // Backup BEFORE migrating; a failed backup aborts before any schema change
@@ -136,9 +150,9 @@ function deploy(config, options = {}, ctx = {}) {
     }
   }
 
-  if (!skipBuild && config.hooks.build) {
-    // Build while apps are still paused (mirrors deploy.sh); resume-on-failure so
-    // a broken build never leaves the fleet stopped.
+  if (!buildBeforeMigrate && doBuild) {
+    // Default: build while apps are paused (bewks' model); resume-on-failure so a
+    // broken build never leaves the fleet stopped.
     safeStep('Building', config.hooks.build);
     steps.push('build');
   }

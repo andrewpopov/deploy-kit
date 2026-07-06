@@ -7,6 +7,15 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.2.0
+
+- Add `buildBeforeMigrate` (config or option, default false). When true, the build
+  runs while the apps are still up — before the backup/stop/migrate block — so the
+  app-paused window is just the migration, not migration + build. Repos that build
+  first and stop only for the DB work (e.g. stoki) use this to avoid extra downtime.
+  A build failure in this mode aborts before anything is stopped. Default (false)
+  preserves the existing build-while-paused order (bewks/kira unaffected).
+
 ## 0.1.1
 
 - Safety fix: once the DB-bound apps are paused for migration, a failure in
