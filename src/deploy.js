@@ -43,6 +43,19 @@ function waitForHealth(config, ctx) {
   return false;
 }
 
+// Build the PM2 (re)start command for one or more process names. With an
+// `ecosystemFile`, start from the file when a process isn't registered yet (first
+// deploy) and fall back to `pm2 restart` when it is — the proven
+// `pm2 start <file> --only <name> || pm2 restart <name>` idiom from the
+// hand-rolled deploy.sh (sano). Without a file, plain `pm2 restart <names>`
+// (requires the processes to already exist, matching the original default).
+function pm2StartOrRestart(names, config) {
+  const list = Array.isArray(names) ? names : [names];
+  const restart = `pm2 restart ${list.join(' ')}`;
+  if (!config.ecosystemFile) return restart;
+  return `pm2 start ${config.ecosystemFile} --only ${list.join(',')} 2>/dev/null || ${restart}`;
+}
+
 // A step that must succeed or the whole deploy aborts. onFail runs first
 // (e.g. restart the apps we paused) so we never leave services stopped.
 function gate(step, config, ctx, { onFail } = {}) {
@@ -158,11 +171,22 @@ function deploy(config, options = {}, ctx = {}) {
   }
 
   if (config.appNames.length) {
-    const restartCmd = config.hooks.restart || `pm2 restart ${config.appNames.join(' ')}`;
+    const restartCmd = config.hooks.restart || pm2StartOrRestart(config.appNames, config);
     run(`Restarting apps (${config.appNames.join(', ')})`, restartCmd);
     dbAppsPaused = false;
-    run('Persisting PM2 process list', 'pm2 save 2>/dev/null || true', { tolerate: true });
     steps.push('restart');
+
+    if (config.ensureTunnelOnDeploy && config.tunnelName) {
+      // Bring the cloudflared tunnel up if it isn't already (tolerant — a tunnel
+      // that's already running, or briefly flaps, must never fail an otherwise
+      // healthy deploy). Mirrors deploy.sh's `pm2 start ... --only <tunnel> ||
+      // pm2 restart <tunnel> || true` tail.
+      run(`Ensuring tunnel (${config.tunnelName})`,
+        pm2StartOrRestart(config.tunnelName, config), { tolerate: true });
+      steps.push('tunnel');
+    }
+
+    run('Persisting PM2 process list', 'pm2 save 2>/dev/null || true', { tolerate: true });
   }
 
   const healthy = waitForHealth(config, c);

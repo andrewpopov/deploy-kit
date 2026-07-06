@@ -38,8 +38,40 @@ The `.deploy-kit.config.json` holding your real host/paths lives in each
 **consumer** repo, never in this package.
 
 The 4 hooks are the only framework-specific seams — everything else (git pull,
-PM2 lifecycle, tunnel, health-gate) is shared. Set `"mode": "local"` for a box
-that runs the deploy on itself (no SSH), like sano.
+PM2 lifecycle, tunnel, health-gate) is shared.
+
+### mode: local + ecosystem/tunnel (sano)
+
+Set `"mode": "local"` for a box that runs the deploy on itself (no SSH) — it runs
+each step as `sh -c 'cd <projectDir> && …'` and skips the tracked-file stash. Two
+optional fields fold in the last of the hand-rolled `deploy.sh` behavior:
+
+- **`ecosystemFile`** — path to the PM2 ecosystem file (relative to `projectDir`).
+  When set, apps and the tunnel (re)start via
+  `pm2 start <file> --only <name> 2>/dev/null || pm2 restart <name>`, so a
+  not-yet-registered process starts on the first deploy and a running one restarts.
+- **`ensureTunnelOnDeploy`** — with `tunnelName` set, bring the cloudflared tunnel
+  up at the end of a deploy (tolerant — a tunnel hiccup never fails the deploy).
+
+```json
+{
+  "mode": "local",
+  "projectDir": "/srv/sano-os",
+  "branch": "main",
+  "appNames": ["sano-app"],
+  "dbBoundApps": ["sano-app"],
+  "tunnelName": "sano-tunnel",
+  "ecosystemFile": "ecosystem.config.cjs",
+  "ensureTunnelOnDeploy": true,
+  "port": 3003,
+  "hooks": {
+    "install": "pnpm install --frozen-lockfile",
+    "backup": "bash scripts/backup-db.sh",
+    "migrate": "pnpm --filter @sano/api db:migrate",
+    "build": "pnpm build"
+  }
+}
+```
 
 ## Use
 

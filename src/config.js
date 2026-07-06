@@ -16,6 +16,15 @@ const DEFAULT_CONFIG = {
   appNames: [], // PM2 apps to (re)start
   dbBoundApps: [], // PM2 apps to stop before migrate to release a SQLite lock
   tunnelName: null, // PM2-managed cloudflared process name (for ops verbs)
+  // Path (relative to projectDir) to the PM2 ecosystem file. When set, the deploy
+  // (re)starts apps/tunnel via `pm2 start <file> --only <name> || pm2 restart <name>`
+  // so a not-yet-registered process starts on first deploy and a running one
+  // restarts. null → plain `pm2 restart <appNames>` (process must already exist).
+  ecosystemFile: null,
+  // When true and `tunnelName` is set, ensure the cloudflared tunnel is up at the
+  // end of a deploy (tolerant — never fails the deploy). Off by default; ops verbs
+  // still manage the tunnel regardless.
+  ensureTunnelOnDeploy: false,
   port: 3000,
   healthPath: '/api/health',
   health: { attempts: 30, delaySeconds: 2 },
