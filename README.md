@@ -1,4 +1,4 @@
-# @andrewvpopov/deploy-kit
+# @andrewpopov/deploy-kit
 
 Hook-driven deploy pipeline + remote PM2 ops CLI + Cloudflare tunnel launcher for
 the Raspberry-Pi service fleet (bewks, kira, smarthome, stoki, sano). Extracts the
@@ -8,7 +8,7 @@ the Raspberry-Pi service fleet (bewks, kira, smarthome, stoki, sano). Extracts t
 ## Install
 
 ```
-npm install github:andrewvpopov/deploy-kit#v0.1.0
+npm install github:andrewpopov/deploy-kit#v0.1.0
 ```
 
 ## Configure
@@ -52,7 +52,7 @@ npx deploy-kit restart|logs|health
 Or programmatically:
 
 ```js
-const { loadConfig, deploy } = require('@andrewvpopov/deploy-kit');
+const { loadConfig, deploy } = require('@andrewpopov/deploy-kit');
 deploy(loadConfig());
 ```
 
@@ -66,5 +66,5 @@ deploy(loadConfig());
 - **Health-gate** — polls `http://localhost:<port><healthPath>` and fails the
   deploy if it never returns 200.
 
-Pair with [`@andrewvpopov/db-backup`](https://github.com/andrewvpopov/db-backup)
+Pair with [`@andrewpopov/db-backup`](https://github.com/andrewpopov/db-backup)
 for the backup hook.

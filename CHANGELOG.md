@@ -7,6 +7,10 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.2.1
+
+- Renamed package scope `@andrewvpopov/*` -> `@andrewpopov/*` after consolidating the GitHub org into the `andrewpopov` user. No runtime or API change; update imports and the `github:` install path to `andrewpopov/deploy-kit`.
+
 ## 0.2.0
 
 - Add `buildBeforeMigrate` (config or option, default false). When true, the build
@@ -42,5 +46,5 @@ copy-pasted across bewks/kira/smarthome/stoki/sano into one hook-driven kit.
   restart`, generalized from bewks `remote-agent.js`, driven by PM2 app names.
 - `startTunnel({ configPath, tunnelName })` — Cloudflare tunnel launcher.
 - `deploy-kit` bin + `.deploy-kit.config.json` config file.
-- Consumers pair this with `@andrewvpopov/db-backup` by pointing `hooks.backup`
+- Consumers pair this with `@andrewpopov/db-backup` by pointing `hooks.backup`
   at a db-backup CLI invocation.
