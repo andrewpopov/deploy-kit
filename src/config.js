@@ -27,6 +27,9 @@ const DEFAULT_CONFIG = {
   ensureTunnelOnDeploy: false,
   port: 3000,
   healthPath: '/api/health',
+  // Extra headers for the health probe, e.g. { "X-Forwarded-Proto": "https" } for
+  // an app that force-redirects plain http to https behind a TLS-terminating proxy.
+  healthHeaders: {},
   health: { attempts: 30, delaySeconds: 2 },
   // Build before the backup/stop/migrate block (apps stay up during build) so the
   // paused window is just migration. Default false = build after migrate (paused).
