@@ -101,36 +101,52 @@ function deploy(config, options = {}, ctx = {}) {
     steps.push('install');
   }
 
+  // Once the DB-bound apps are paused for migration, EVERY subsequent step
+  // (migrate, build) must bring them back up on failure — otherwise a build
+  // error leaves production stopped. Matches deploy.sh, which `pm2 start`s the
+  // paused apps on every post-stop failure before aborting.
+  let dbAppsPaused = false;
+  const resumeDbApps = () => {
+    if (dbAppsPaused && config.dbBoundApps.length) {
+      runOnTarget(`pm2 start ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, config, { runtime });
+      dbAppsPaused = false;
+    }
+  };
+  // A gated step that, on failure, first resumes any paused apps, then aborts.
+  const safeStep = (message, command) => {
+    gate({ message, command }, config, c, { onFail: resumeDbApps });
+  };
+
   if (!skipMigrate) {
     if (config.hooks.backup) {
-      // Backup BEFORE migrating; a failed backup aborts before any schema change.
+      // Backup BEFORE migrating; a failed backup aborts before any schema change
+      // (apps are still running here, so no resume needed).
       gate({ message: 'Pre-migration database backup', command: config.hooks.backup }, config, c);
       steps.push('backup');
     }
-    const restartDbApps = () => {
-      if (config.dbBoundApps.length) {
-        runOnTarget(`pm2 restart ${config.dbBoundApps.join(' ')}`, config, { runtime });
-      }
-    };
     if (config.dbBoundApps.length) {
       // Stop DB-bound processes so they release the SQLite lock before migrate.
       run(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`,
         `pm2 stop ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, { tolerate: true });
+      dbAppsPaused = true;
     }
     if (config.hooks.migrate) {
-      gate({ message: 'Running database migrations', command: config.hooks.migrate }, config, c, { onFail: restartDbApps });
+      safeStep('Running database migrations', config.hooks.migrate);
       steps.push('migrate');
     }
   }
 
   if (!skipBuild && config.hooks.build) {
-    run('Building', config.hooks.build);
+    // Build while apps are still paused (mirrors deploy.sh); resume-on-failure so
+    // a broken build never leaves the fleet stopped.
+    safeStep('Building', config.hooks.build);
     steps.push('build');
   }
 
   if (config.appNames.length) {
     const restartCmd = config.hooks.restart || `pm2 restart ${config.appNames.join(' ')}`;
     run(`Restarting apps (${config.appNames.join(', ')})`, restartCmd);
+    dbAppsPaused = false;
     run('Persisting PM2 process list', 'pm2 save 2>/dev/null || true', { tolerate: true });
     steps.push('restart');
   }
