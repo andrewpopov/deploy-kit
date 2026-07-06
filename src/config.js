@@ -15,16 +15,20 @@ const DEFAULT_CONFIG = {
   branch: null, // null → resolve origin/HEAD, fall back to 'master'
   appNames: [], // PM2 apps to (re)start
   dbBoundApps: [], // PM2 apps to stop before migrate to release a SQLite lock
-  tunnelName: null, // PM2-managed cloudflared process name (for ops verbs)
+  tunnelName: null, // PM2-managed cloudflared process name (for ops verbs / display)
+  // Auxiliary PM2 processes to ensure are up (tolerant, start-or-restart) AFTER the
+  // main appNames restart — a cloudflared tunnel, a sidecar worker, etc. Generic:
+  // the tunnel is just one entry. A failure here never fails the deploy.
+  ensureApps: [],
+  // Pre-deploy check gates run BEFORE anything is touched. Each { name, command };
+  // a non-zero exit aborts the deploy with nothing changed (free disk, DB reachable,
+  // required secret present, …). The kit runs them; the consumer supplies them.
+  preDeployChecks: [],
   // Path (relative to projectDir) to the PM2 ecosystem file. When set, the deploy
-  // (re)starts apps/tunnel via `pm2 start <file> --only <name> || pm2 restart <name>`
+  // (re)starts apps/ensureApps via `pm2 start <file> --only <name> || pm2 restart <name>`
   // so a not-yet-registered process starts on first deploy and a running one
   // restarts. null → plain `pm2 restart <appNames>` (process must already exist).
   ecosystemFile: null,
-  // When true and `tunnelName` is set, ensure the cloudflared tunnel is up at the
-  // end of a deploy (tolerant — never fails the deploy). Off by default; ops verbs
-  // still manage the tunnel regardless.
-  ensureTunnelOnDeploy: false,
   port: 3000,
   healthPath: '/api/health',
   // Extra headers for the health probe, e.g. { "X-Forwarded-Proto": "https" } for

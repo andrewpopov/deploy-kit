@@ -8,6 +8,11 @@ export interface DeployHooks {
   restart?: string | null;
 }
 
+export interface PreDeployCheck {
+  name: string;
+  command: string;
+}
+
 export interface DeployConfig {
   host: string | null;
   projectDir: string | null;
@@ -17,8 +22,9 @@ export interface DeployConfig {
   appNames: string[];
   dbBoundApps: string[];
   tunnelName: string | null;
+  ensureApps?: string[];
+  preDeployChecks?: PreDeployCheck[];
   ecosystemFile?: string | null;
-  ensureTunnelOnDeploy?: boolean;
   port: number;
   healthPath: string;
   healthHeaders?: Record<string, string>;

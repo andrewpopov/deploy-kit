@@ -23,7 +23,8 @@ function health(config, ctx = {}) {
   return false;
 }
 
-const allApps = (config) => [...config.appNames, config.tunnelName].filter(Boolean);
+const allApps = (config) =>
+  [...new Set([...config.appNames, ...(config.ensureApps || []), config.tunnelName].filter(Boolean))];
 
 function status(config, ctx = {}) {
   (ctx.log || defaultLog).header('📊 Status');

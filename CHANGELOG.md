@@ -7,6 +7,21 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.4.0
+
+- **BREAKING:** replace tunnel-specific `ensureTunnelOnDeploy` (v0.3.0) with generic
+  **`ensureApps: string[]`** — auxiliary PM2 processes ensured up (tolerant,
+  start-or-restart via `ecosystemFile`) AFTER the main `appNames` restart. A tunnel
+  is just one entry; the pipeline no longer hardcodes "tunnel". Migration: replace
+  `"ensureTunnelOnDeploy": true` + reliance on `tunnelName` with
+  `"ensureApps": ["<your-tunnel>"]`. `tunnelName` remains for ops-verb display.
+  The deploy step label changes from `tunnel` to `ensure`.
+- Add **`preDeployChecks: [{ name, command }]`** — user-defined gates run BEFORE
+  anything is touched (no stash/fetch/pull yet). A non-zero exit aborts the deploy
+  with nothing changed. For preconditions: free disk, DB reachable, required secret
+  present. The kit runs them; the consumer supplies them. Adds `check:<name>` steps.
+- `remote.allApps` now includes `ensureApps` (deduped) alongside `appNames`/`tunnelName`.
+
 ## 0.3.1
 
 - Add `healthHeaders` config (default `{}`) — extra headers on the health probe,
