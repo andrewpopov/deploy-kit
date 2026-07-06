@@ -7,6 +7,19 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.3.0
+
+- Add `ecosystemFile` (config, default null). When set, the deploy (re)starts
+  apps via `pm2 start <file> --only <name> 2>/dev/null || pm2 restart <name>`
+  instead of a bare `pm2 restart`, so a not-yet-registered process starts on the
+  first deploy and a running one restarts. Null preserves the old
+  `pm2 restart <appNames>` (bewks/kira/smarthome/stoki unaffected).
+- Add `ensureTunnelOnDeploy` (config, default false). When true and `tunnelName`
+  is set, the cloudflared tunnel is brought up at the end of a deploy (start-or-
+  restart when `ecosystemFile` is set), tolerant of failure so a tunnel hiccup
+  never fails an otherwise-healthy deploy. Adds a `tunnel` step between `restart`
+  and `health`. Folds sano's hand-rolled deploy.sh tunnel-ensure tail into the kit.
+
 ## 0.2.1
 
 - Renamed package scope `@andrewvpopov/*` -> `@andrewpopov/*` after consolidating the GitHub org into the `andrewpopov` user. No runtime or API change; update imports and the `github:` install path to `andrewpopov/deploy-kit`.

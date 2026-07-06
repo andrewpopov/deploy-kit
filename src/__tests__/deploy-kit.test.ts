@@ -129,6 +129,52 @@ describe('deploy pipeline', () => {
     expect(calls.some((c) => c.includes('db:backup'))).toBe(false);
   });
 
+  it('ecosystemFile restarts apps via start-or-restart from the file (first-deploy safe)', () => {
+    const { runtime, calls } = makeRuntime();
+    deploy(mergeConfig(baseConfig, { ecosystemFile: 'ecosystem.config.cjs' }), {}, ctxWith(runtime));
+    expect(calls.some((c) => c.includes('pm2 start ecosystem.config.cjs --only app 2>/dev/null || pm2 restart app'))).toBe(true);
+  });
+
+  it('without ecosystemFile the app restart stays plain pm2 restart', () => {
+    const { runtime, calls } = makeRuntime();
+    deploy(baseConfig, {}, ctxWith(runtime));
+    expect(calls.some((c) => c.includes('pm2 restart app'))).toBe(true);
+    expect(calls.some((c) => c.includes('--only'))).toBe(false);
+  });
+
+  const tunnelConfig = mergeConfig(baseConfig, {
+    tunnelName: 'app-tunnel',
+    ensureTunnelOnDeploy: true,
+    ecosystemFile: 'ecosystem.config.cjs',
+  });
+
+  it('ensureTunnelOnDeploy brings the tunnel up after the app restart', () => {
+    const { runtime, calls } = makeRuntime();
+    const result = deploy(tunnelConfig, {}, ctxWith(runtime));
+    expect(result.steps).toEqual(
+      ['stash', 'pull:master', 'install', 'backup', 'migrate', 'build', 'restart', 'tunnel', 'health'],
+    );
+    const joined = calls.join('\n');
+    expect(joined).toContain('pm2 start ecosystem.config.cjs --only app-tunnel 2>/dev/null || pm2 restart app-tunnel');
+    // tunnel comes up after the apps, before the health gate
+    expect(joined.indexOf('--only app ')).toBeLessThan(joined.indexOf('--only app-tunnel'));
+    expect(joined.indexOf('--only app-tunnel')).toBeLessThan(joined.indexOf('curl'));
+  });
+
+  it('a tunnel-ensure failure does not abort an otherwise healthy deploy', () => {
+    const { runtime } = makeRuntime({ fail: ['app-tunnel'] });
+    const result = deploy(tunnelConfig, {}, ctxWith(runtime));
+    expect(result.healthy).toBe(true);
+    expect(result.steps).toContain('tunnel');
+    expect(result.steps).toContain('health');
+  });
+
+  it('no tunnel step when ensureTunnelOnDeploy is off, even with a tunnelName', () => {
+    const { runtime } = makeRuntime();
+    const result = deploy(mergeConfig(baseConfig, { tunnelName: 'app-tunnel' }), {}, ctxWith(runtime));
+    expect(result.steps).not.toContain('tunnel');
+  });
+
   it('skips deps/build/migrate when requested', () => {
     const { runtime } = makeRuntime();
     const result = deploy(baseConfig, { skipDeps: true, skipBuild: true, skipMigrate: true, stash: false }, ctxWith(runtime));

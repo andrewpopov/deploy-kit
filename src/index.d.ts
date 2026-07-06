@@ -17,6 +17,8 @@ export interface DeployConfig {
   appNames: string[];
   dbBoundApps: string[];
   tunnelName: string | null;
+  ecosystemFile?: string | null;
+  ensureTunnelOnDeploy?: boolean;
   port: number;
   healthPath: string;
   health: { attempts: number; delaySeconds: number };
