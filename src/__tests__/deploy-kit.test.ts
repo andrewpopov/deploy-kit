@@ -136,6 +136,21 @@ describe('deploy pipeline', () => {
   });
 });
 
+describe('buildHealthCommand', () => {
+  const { buildHealthCommand } = kit;
+  it('builds a plain probe with no headers', () => {
+    const cmd = buildHealthCommand(mergeConfig(baseConfig, { port: 3001, healthPath: '/api/health' }));
+    expect(cmd).toBe("curl -f -s http://localhost:3001/api/health -o /dev/null -w '%{http_code}'");
+  });
+  it('injects healthHeaders (e.g. X-Forwarded-Proto for a proxy-redirecting app)', () => {
+    const cmd = buildHealthCommand(mergeConfig(baseConfig, {
+      port: 3001, healthPath: '/api/health', healthHeaders: { 'X-Forwarded-Proto': 'https' },
+    }));
+    expect(cmd).toContain("-H 'X-Forwarded-Proto: https'");
+    expect(cmd).toContain('http://localhost:3001/api/health');
+  });
+});
+
 describe('remote ops', () => {
   it('restart issues pm2 restart for configured apps', () => {
     const { runtime, calls } = makeRuntime();

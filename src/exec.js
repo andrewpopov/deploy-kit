@@ -41,4 +41,16 @@ function runOnTarget(command, config, { capture = false, runtime } = {}) {
   }
 }
 
-module.exports = { normalizeRuntime, buildTargetCommand, runOnTarget };
+// Build the health-probe curl for a config, including any healthHeaders. Apps
+// behind a TLS-terminating proxy that force-redirect plain http (e.g. an Express
+// `res.redirect(301, https://…)`) return 301 to a direct localhost curl; sending
+// `X-Forwarded-Proto: https` via healthHeaders makes them serve the real 200.
+function buildHealthCommand(config) {
+  const headerArgs = Object.entries(config.healthHeaders || {})
+    .map(([key, value]) => `-H '${key}: ${value}'`)
+    .join(' ');
+  const url = `http://localhost:${config.port}${config.healthPath}`;
+  return `curl -f -s ${headerArgs ? `${headerArgs} ` : ''}${url} -o /dev/null -w '%{http_code}'`;
+}
+
+module.exports = { normalizeRuntime, buildTargetCommand, runOnTarget, buildHealthCommand };

@@ -19,6 +19,7 @@ export interface DeployConfig {
   tunnelName: string | null;
   port: number;
   healthPath: string;
+  healthHeaders?: Record<string, string>;
   health: { attempts: number; delaySeconds: number };
   buildBeforeMigrate?: boolean;
   hooks: DeployHooks;
@@ -83,6 +84,7 @@ export function runOnTarget(
   config: DeployConfig,
   options?: { capture?: boolean; runtime?: Runtime },
 ): { ok: boolean; output: string; error?: unknown };
+export function buildHealthCommand(config: DeployConfig): string;
 
 export function deploy(config: DeployConfig, options?: DeployOptions, ctx?: DeployContext): DeployResult;
 export function resolveBranch(config: DeployConfig, ctx: DeployContext): string;

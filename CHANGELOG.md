@@ -7,6 +7,14 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.3.0
+
+- Add `healthHeaders` config (default `{}`) — extra headers on the health probe,
+  applied by both the deploy health-gate and the `remote health` verb. Needed for
+  apps that force-redirect plain http to https behind a TLS-terminating proxy: a
+  direct localhost curl gets a 301, but `{ "X-Forwarded-Proto": "https" }` makes
+  them serve the real 200. Exposes `buildHealthCommand(config)`.
+
 ## 0.2.0
 
 - Add `buildBeforeMigrate` (config or option, default false). When true, the build

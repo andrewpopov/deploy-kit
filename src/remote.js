@@ -1,6 +1,6 @@
 'use strict';
 
-const { runOnTarget } = require('./exec');
+const { runOnTarget, buildHealthCommand } = require('./exec');
 const { log: defaultLog } = require('./log');
 
 // Config-driven remote ops, generalized from bewks scripts/tools/remote-agent.js.
@@ -10,7 +10,7 @@ const { log: defaultLog } = require('./log');
 function health(config, ctx = {}) {
   const log = ctx.log || defaultLog;
   const res = runOnTarget(
-    `curl -f -s http://localhost:${config.port}${config.healthPath} -o /dev/null -w '%{http_code}'`,
+    buildHealthCommand(config),
     config,
     { capture: true, runtime: ctx.runtime },
   );

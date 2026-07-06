@@ -12,7 +12,7 @@ const tunnel = require('./tunnel');
 // so `key: mod.fn` would be invisible to ESM `import { fn }` consumers.
 const { CONFIG_FILENAME, DEFAULT_CONFIG, mergeConfig, loadConfig } = config;
 const { colors, makeLogger } = log;
-const { normalizeRuntime, buildTargetCommand, runOnTarget } = exec;
+const { normalizeRuntime, buildTargetCommand, runOnTarget, buildHealthCommand } = exec;
 const { deploy, resolveBranch, waitForHealth } = deployMod;
 const { startTunnel } = tunnel;
 
@@ -29,6 +29,7 @@ module.exports = {
   normalizeRuntime,
   buildTargetCommand,
   runOnTarget,
+  buildHealthCommand,
   // pipeline
   deploy,
   resolveBranch,
