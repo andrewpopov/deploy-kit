@@ -40,18 +40,23 @@ The `.deploy-kit.config.json` holding your real host/paths lives in each
 The 4 hooks are the only framework-specific seams — everything else (git pull,
 PM2 lifecycle, tunnel, health-gate) is shared.
 
-### mode: local + ecosystem/tunnel (sano)
+### mode: local + ecosystem/aux processes (sano)
 
 Set `"mode": "local"` for a box that runs the deploy on itself (no SSH) — it runs
-each step as `sh -c 'cd <projectDir> && …'` and skips the tracked-file stash. Two
-optional fields fold in the last of the hand-rolled `deploy.sh` behavior:
+each step as `sh -c 'cd <projectDir> && …'` and skips the tracked-file stash. These
+generic (not tunnel-specific) fields fold in the rest of the hand-rolled `deploy.sh`:
 
 - **`ecosystemFile`** — path to the PM2 ecosystem file (relative to `projectDir`).
-  When set, apps and the tunnel (re)start via
+  When set, `appNames` and `ensureApps` (re)start via
   `pm2 start <file> --only <name> 2>/dev/null || pm2 restart <name>`, so a
   not-yet-registered process starts on the first deploy and a running one restarts.
-- **`ensureTunnelOnDeploy`** — with `tunnelName` set, bring the cloudflared tunnel
-  up at the end of a deploy (tolerant — a tunnel hiccup never fails the deploy).
+- **`ensureApps`** — auxiliary PM2 processes ensured up (tolerant) AFTER the main
+  `appNames` restart: a cloudflared tunnel, a sidecar worker, anything that isn't
+  the health-gated app. A failure here never fails the deploy. (`tunnelName` stays
+  for ops-verb display only.)
+- **`preDeployChecks`** — `[{ name, command }]` gates run BEFORE anything is touched.
+  A non-zero exit aborts with nothing changed. For preconditions: free disk, DB
+  reachable, required secret present.
 
 ```json
 {
@@ -61,8 +66,11 @@ optional fields fold in the last of the hand-rolled `deploy.sh` behavior:
   "appNames": ["sano-app"],
   "dbBoundApps": ["sano-app"],
   "tunnelName": "sano-tunnel",
+  "ensureApps": ["sano-tunnel"],
   "ecosystemFile": "ecosystem.config.cjs",
-  "ensureTunnelOnDeploy": true,
+  "preDeployChecks": [
+    { "name": "disk", "command": "test \"$(df -Pk /srv/sano-os | awk 'NR==2{print $4}')\" -ge 512000" }
+  ],
   "port": 3003,
   "hooks": {
     "install": "pnpm install --frozen-lockfile",

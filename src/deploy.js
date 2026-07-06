@@ -99,6 +99,15 @@ function deploy(config, options = {}, ctx = {}) {
   const branch = resolveBranch(config, c);
   const steps = [];
 
+  // Pre-deploy checks: user-defined gates run BEFORE anything is touched (no stash,
+  // fetch, or pull yet). Each is a command on the target; a non-zero exit aborts the
+  // deploy with nothing changed. Use for preconditions — free disk, DB reachable,
+  // a required env var present. Generic: the kit runs them, the consumer supplies them.
+  for (const check of config.preDeployChecks) {
+    gate({ message: `Pre-deploy check: ${check.name}`, command: check.command }, config, c);
+    steps.push(`check:${check.name}`);
+  }
+
   if (stash) {
     // Tracked-only stash: never sweep untracked .ssh/.cloudflared into a stash —
     // that would break the tunnel and lose the key mid-deploy.
@@ -172,15 +181,14 @@ function deploy(config, options = {}, ctx = {}) {
     dbAppsPaused = false;
     steps.push('restart');
 
-    if (config.ensureTunnelOnDeploy && config.tunnelName) {
-      // Bring the cloudflared tunnel up if it isn't already (tolerant — a tunnel
-      // that's already running, or briefly flaps, must never fail an otherwise
-      // healthy deploy). Mirrors deploy.sh's `pm2 start ... --only <tunnel> ||
-      // pm2 restart <tunnel> || true` tail.
-      run(`Ensuring tunnel (${config.tunnelName})`,
-        pm2StartOrRestart(config.tunnelName, config), { tolerate: true });
-      steps.push('tunnel');
+    // Ensure auxiliary PM2 processes are up after the main restart — a cloudflared
+    // tunnel, a sidecar worker, anything that isn't the health-gated app. Generic
+    // and tolerant: a process that's already running, or briefly flaps, must never
+    // fail an otherwise-healthy deploy. Not a tunnel-specific concept.
+    for (const name of config.ensureApps) {
+      run(`Ensuring ${name}`, pm2StartOrRestart(name, config), { tolerate: true });
     }
+    if (config.ensureApps.length) steps.push('ensure');
 
     run('Persisting PM2 process list', 'pm2 save 2>/dev/null || true', { tolerate: true });
   }

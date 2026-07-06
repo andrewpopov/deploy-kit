@@ -142,37 +142,68 @@ describe('deploy pipeline', () => {
     expect(calls.some((c) => c.includes('--only'))).toBe(false);
   });
 
-  const tunnelConfig = mergeConfig(baseConfig, {
-    tunnelName: 'app-tunnel',
-    ensureTunnelOnDeploy: true,
+  const ensureConfig = mergeConfig(baseConfig, {
+    ensureApps: ['app-tunnel'],
     ecosystemFile: 'ecosystem.config.cjs',
   });
 
-  it('ensureTunnelOnDeploy brings the tunnel up after the app restart', () => {
+  it('ensureApps brings auxiliary processes up (tolerant) after the app restart', () => {
     const { runtime, calls } = makeRuntime();
-    const result = deploy(tunnelConfig, {}, ctxWith(runtime));
+    const result = deploy(ensureConfig, {}, ctxWith(runtime));
     expect(result.steps).toEqual(
-      ['stash', 'pull:master', 'install', 'backup', 'migrate', 'build', 'restart', 'tunnel', 'health'],
+      ['stash', 'pull:master', 'install', 'backup', 'migrate', 'build', 'restart', 'ensure', 'health'],
     );
     const joined = calls.join('\n');
     expect(joined).toContain('pm2 start ecosystem.config.cjs --only app-tunnel 2>/dev/null || pm2 restart app-tunnel');
-    // tunnel comes up after the apps, before the health gate
+    // ensured apps come up after the main app, before the health gate
     expect(joined.indexOf('--only app ')).toBeLessThan(joined.indexOf('--only app-tunnel'));
     expect(joined.indexOf('--only app-tunnel')).toBeLessThan(joined.indexOf('curl'));
   });
 
-  it('a tunnel-ensure failure does not abort an otherwise healthy deploy', () => {
+  it('an ensureApps failure does not abort an otherwise healthy deploy', () => {
     const { runtime } = makeRuntime({ fail: ['app-tunnel'] });
-    const result = deploy(tunnelConfig, {}, ctxWith(runtime));
+    const result = deploy(ensureConfig, {}, ctxWith(runtime));
     expect(result.healthy).toBe(true);
-    expect(result.steps).toContain('tunnel');
+    expect(result.steps).toContain('ensure');
     expect(result.steps).toContain('health');
   });
 
-  it('no tunnel step when ensureTunnelOnDeploy is off, even with a tunnelName', () => {
+  it('no ensure step when ensureApps is empty', () => {
     const { runtime } = makeRuntime();
     const result = deploy(mergeConfig(baseConfig, { tunnelName: 'app-tunnel' }), {}, ctxWith(runtime));
-    expect(result.steps).not.toContain('tunnel');
+    expect(result.steps).not.toContain('ensure');
+  });
+
+  it('ensures multiple auxiliary processes in order', () => {
+    const { runtime, calls } = makeRuntime();
+    deploy(mergeConfig(baseConfig, { ensureApps: ['aux1', 'aux2'] }), {}, ctxWith(runtime));
+    const joined = calls.join('\n');
+    expect(joined).toContain('pm2 restart aux1');
+    expect(joined).toContain('pm2 restart aux2');
+    expect(joined.indexOf('pm2 restart aux1')).toBeLessThan(joined.indexOf('pm2 restart aux2'));
+  });
+
+  const checkConfig = mergeConfig(baseConfig, {
+    preDeployChecks: [{ name: 'disk', command: 'test -d /srv' }],
+  });
+
+  it('preDeployChecks run first and gate the deploy', () => {
+    const { runtime, calls } = makeRuntime();
+    const result = deploy(checkConfig, {}, ctxWith(runtime));
+    expect(result.steps[0]).toBe('check:disk');
+    const joined = calls.join('\n');
+    // the check runs before any mutation (stash/fetch/pull)
+    expect(joined.indexOf('test -d /srv')).toBeLessThan(joined.indexOf('git fetch'));
+    expect(joined.indexOf('test -d /srv')).toBeLessThan(joined.indexOf('git stash'));
+  });
+
+  it('a failing preDeployCheck aborts before touching anything', () => {
+    const { runtime, calls } = makeRuntime({ fail: ['test -d /srv'] });
+    expect(() => deploy(checkConfig, {}, ctxWith(runtime))).toThrow(/Pre-deploy check: disk failed/);
+    const joined = calls.join('\n');
+    expect(joined).not.toContain('git fetch');
+    expect(joined).not.toContain('git stash');
+    expect(joined).not.toContain('npm ci');
   });
 
   it('skips deps/build/migrate when requested', () => {
