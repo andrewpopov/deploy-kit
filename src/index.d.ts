@@ -13,6 +13,19 @@ export interface PreDeployCheck {
   command: string;
 }
 
+export interface HealthCheck {
+  port?: number;
+  path?: string;
+  headers?: Record<string, string>;
+}
+
+export interface SshOptions {
+  connectTimeout?: number | null;
+  serverAliveInterval?: number | null;
+  serverAliveCountMax?: number | null;
+  options?: string[];
+}
+
 export interface DeployConfig {
   host: string | null;
   projectDir: string | null;
@@ -28,7 +41,11 @@ export interface DeployConfig {
   port: number;
   healthPath: string;
   healthHeaders?: Record<string, string>;
+  healthChecks?: HealthCheck[];
   health: { attempts: number; delaySeconds: number };
+  ssh?: SshOptions;
+  stepTimeoutSeconds?: number | null;
+  lock?: boolean;
   buildBeforeMigrate?: boolean;
   hooks: DeployHooks;
 }
@@ -38,8 +55,21 @@ export interface DeployOptions {
   skipBuild?: boolean;
   skipMigrate?: boolean;
   stash?: boolean;
-  force?: boolean;
+  stealLock?: boolean;
   buildBeforeMigrate?: boolean;
+}
+
+export interface RollbackOptions {
+  skipDeps?: boolean;
+  skipBuild?: boolean;
+  stealLock?: boolean;
+}
+
+export interface RollbackResult {
+  sha: string;
+  mode: DeployMode;
+  host: string | null;
+  healthy: boolean;
 }
 
 export interface DeployResult {
@@ -72,11 +102,16 @@ export interface Logger {
 
 export const CONFIG_FILENAME: string;
 export const DEFAULT_CONFIG: DeployConfig;
+export const REMOVED_KEYS: Record<string, string>;
 export function mergeConfig(base: DeployConfig, override?: Partial<DeployConfig>): DeployConfig;
+export function validateConfig(raw: unknown, options?: { source?: string }): string[];
 export function loadConfig(options?: {
   cwd?: string;
   override?: Partial<DeployConfig>;
   fsImpl?: unknown;
+  validate?: boolean;
+  strict?: boolean;
+  log?: Logger;
 }): DeployConfig;
 
 export const colors: Record<string, string>;
@@ -85,18 +120,25 @@ export function makeLogger(out?: (msg: string) => void, err?: (msg: string) => v
 export function normalizeRuntime(runtime?: Runtime): Required<Runtime>;
 export function buildTargetCommand(
   command: string,
-  config: Pick<DeployConfig, 'mode' | 'host' | 'projectDir'>,
+  config: Pick<DeployConfig, 'mode' | 'host' | 'projectDir'> & { ssh?: SshOptions },
 ): { file: string; args: string[] };
+export function sshHardeningArgs(ssh?: SshOptions): string[];
 export function runOnTarget(
   command: string,
   config: DeployConfig,
   options?: { capture?: boolean; runtime?: Runtime },
 ): { ok: boolean; output: string; error?: unknown };
-export function buildHealthCommand(config: DeployConfig): string;
+export function buildHealthCommand(config: DeployConfig, check?: HealthCheck): string;
 
 export function deploy(config: DeployConfig, options?: DeployOptions, ctx?: DeployContext): DeployResult;
+export function rollback(config: DeployConfig, options?: RollbackOptions, ctx?: DeployContext): RollbackResult;
 export function resolveBranch(config: DeployConfig, ctx: DeployContext): string;
 export function waitForHealth(config: DeployConfig, ctx: DeployContext): boolean;
+
+export function init(options?: { cwd?: string; fsImpl?: unknown; log?: Logger }): {
+  configPath: string;
+  wrote: boolean;
+};
 
 export interface RemoteOps {
   health(config: DeployConfig, ctx?: DeployContext): boolean;
