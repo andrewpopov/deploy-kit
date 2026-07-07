@@ -1,6 +1,6 @@
 {
   "name": "@andrewpopov/deploy-kit",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Hook-driven SSH/local deploy pipeline + remote PM2 ops CLI + Cloudflare tunnel launcher for the Pi service fleet",
   "main": "src/index.js",
   "types": "src/index.d.ts",
@@ -21,10 +21,12 @@
   "license": "MIT",
   "scripts": {
     "test": "vitest run",
-    "verify:pack": "node scripts/verify-pack.mjs"
+    "verify:pack": "node scripts/verify-pack.mjs",
+    "verify:types": "tsc --noEmit -p tsconfig.types.json"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "typescript": "^5.9.3",
     "vitest": "^4.0.18"
   }
 }
