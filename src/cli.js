@@ -3,7 +3,8 @@
 
 const { loadConfig } = require('./config');
 const { log } = require('./log');
-const { deploy } = require('./deploy');
+const { deploy, rollback } = require('./deploy');
+const { init } = require('./init');
 const remote = require('./remote');
 
 function parseOptions(args) {
@@ -16,8 +17,10 @@ function parseOptions(args) {
     else if (a === '--skip-build') options.skipBuild = true;
     else if (a === '--skip-deps') options.skipDeps = true;
     else if (a === '--skip-migrate') options.skipMigrate = true;
-    else if (a === '--force') options.force = true;
     else if (a === '--no-stash') options.stash = false;
+    else if (a === '--dry-run') options.dryRun = true;
+    else if (a === '--steal-lock') options.stealLock = true;
+    else if (a === '--no-lock') options.lock = false;
   }
   return options;
 }
@@ -27,11 +30,29 @@ const HELP = `deploy-kit — hook-driven deploy + remote PM2 ops
 Usage: deploy-kit <command> [options]   (reads .deploy-kit.config.json from cwd)
 
 Commands:
-  deploy [--skip-build|--skip-deps|--skip-migrate|--no-stash]
+  init                                     scaffold .deploy-kit.config.json + scripts
+  deploy [--skip-build|--skip-deps|--skip-migrate]
+         [--no-stash] [--dry-run] [--steal-lock] [--no-lock]
+  rollback [--skip-build|--skip-deps] [--steal-lock]
   status | health | dashboard | resources | git
   start | stop | restart
   logs [--lines N] [--follow] [--errors]
   help`;
+
+// A runtime that prints the exact command stream instead of executing it. Health
+// probes return 200 so a dry-run walks the full happy path.
+function dryRunContext() {
+  return {
+    sleep: () => {},
+    runtime: {
+      execFileSync: (file, args) => {
+        const rendered = [file, ...args].join(' ');
+        log.step(`[dry-run] ${rendered}`);
+        return /curl/.test(rendered) ? '200' : '';
+      },
+    },
+  };
+}
 
 function run(argv = process.argv.slice(2), { cwd = process.cwd() } = {}) {
   const command = argv[0];
@@ -39,13 +60,34 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd() } = {}) {
     console.log(HELP);
     return 0;
   }
-  const config = loadConfig({ cwd });
   const options = parseOptions(argv.slice(1));
+
+  if (command === 'init') {
+    init({ cwd });
+    return 0;
+  }
+
+  let config;
+  try {
+    config = loadConfig({ cwd });
+  } catch (error) {
+    log.error(error instanceof Error ? error.message : String(error));
+    return 1;
+  }
+  if (options.lock === false) config = { ...config, lock: false };
 
   switch (command) {
     case 'deploy':
       try {
-        deploy(config, options);
+        deploy(config, options, options.dryRun ? dryRunContext() : {});
+        return 0;
+      } catch (error) {
+        log.error(error instanceof Error ? error.message : String(error));
+        return 1;
+      }
+    case 'rollback':
+      try {
+        rollback(config, options, options.dryRun ? dryRunContext() : {});
         return 0;
       } catch (error) {
         log.error(error instanceof Error ? error.message : String(error));

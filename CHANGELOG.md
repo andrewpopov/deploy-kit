@@ -7,6 +7,45 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.5.0
+
+Maturation hardening (MATURATION.md P0/P1 + selected P2).
+
+- **ssh hardening (safety):** every `ssh` invocation now carries
+  `-o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3`
+  (configurable via `ssh: {}`, each opt-out with `null`) so a wedged Tailscale
+  route can't hang a deploy forever with db-bound apps paused. New
+  `stepTimeoutSeconds` (default null) kills a hung remote command.
+- **Config validation:** `loadConfig` now rejects unknown keys, wrong types, a
+  bad `mode`, and known-removed keys (e.g. `ensureTunnelOnDeploy`) with a
+  migration hint — no more silent no-ops. `strict:false` warns instead of
+  throwing; `validate:false` skips. Exposes `validateConfig`.
+- **Concurrent-deploy lock:** an atomic `mkdir /tmp/deploy-kit-<id>.lock` guards
+  the pipeline (released on exit/abort). `config.lock:false` or `--no-lock`
+  disables; `--steal-lock` forces past a held lock.
+- **`deploy-kit rollback`:** each deploy records the pre-pull SHA to
+  `.deploy-kit-prev-sha`; rollback does `git reset --hard <sha>` + rebuild +
+  restart + health-gate, and prints the matching db-backup restore hint (data is
+  never auto-restored).
+- **`deploy-kit init`:** scaffolds a `.deploy-kit.config.json` skeleton and
+  prints the recommended `package.json` scripts block.
+- **`--dry-run`:** prints the exact command stream without executing.
+- **Multi-endpoint health:** `healthChecks: [{ port, path, headers }]` gates
+  app+worker fleets; the scalar `port`/`healthPath` stays as sugar.
+- **Stash no longer accumulates:** the deploy-kit tracked-change stash is dropped
+  after a successful pull (only ever a deploy-kit stash).
+- **Offline-first install (STANDARDS.md Pi failure mode):** default `hooks.install`
+  is now `npm ci --prefer-offline || npm ci || npm install`.
+- **`hooks.restart`** is now in `DEFAULT_CONFIG` and documented (was read but
+  undeclared). Removed the dead `--force` flag.
+- **Fail-fast on bad health headers:** a single quote in a `healthHeaders` value
+  (which would break curl quoting) now throws instead of emitting a broken probe.
+- **Docs:** full config + CLI reference tables, a Troubleshooting section, and
+  per-adopter example configs; fixed the stale `#v0.1.0` install line.
+- **CI:** `verify:types` (`tsc --noEmit` contract check for `index.d.ts`), a
+  Node 22/24 `compat` matrix, and a `ci-success` aggregation job. `test` stays
+  the required context name.
+
 ## 0.4.0
 
 - **BREAKING:** replace tunnel-specific `ensureTunnelOnDeploy` (v0.3.0) with generic
