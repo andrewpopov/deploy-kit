@@ -1,16 +1,19 @@
 # @andrewpopov/deploy-kit
 
-Hook-driven deploy pipeline + remote PM2 ops CLI + Cloudflare tunnel launcher for
-the Raspberry-Pi service fleet (bewks, kira, smarthome, stoki, sano). Extracts the
-`deploy.sh` / `remote-agent.js` tooling that was copy-pasted across those repos
-(BWK-86).
+Hook-driven deploy pipeline, remote PM2 ops CLI, and Cloudflare tunnel launcher
+for self-hosted Node services — apps that run under PM2 on a single box (a
+Raspberry Pi, a home server, a small VPS) and deploy by `git pull`. One JSON
+config per app replaces a hand-rolled `deploy.sh`: the kit runs
+stash → pull → install → backup → migrate → build → restart → health-gate, with
+the safety behavior those scripts usually lack (the backup gates the migration,
+paused apps are resumed on any failure, deploys are locked and health-verified).
 
 ## Install
 
 Pin the latest tag (tags are immutable — always pin `vX.Y.Z`, never a branch):
 
 ```
-npm install github:andrewpopov/deploy-kit#v0.6.1
+npm install github:andrewpopov/deploy-kit#v0.7.1
 ```
 
 ## Quick start
@@ -99,11 +102,11 @@ unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 | `monitor.stateFile` | `string` | `<dir>/.deploy-kit-monitor-state.json` | both | 0.8 | Abs path to monitor state — a STABLE dir, never under `releases/`. |
 | `monitor.checkTimeoutSeconds` | `number` | `20` | both | 0.8 | Per-check wall-clock bound. |
 
-### mode: local + ecosystem/aux processes (sano)
+### mode: local
 
 Set `"mode": "local"` for a box that runs the deploy on itself (no SSH) — it runs
 each step as `sh -c 'cd <projectDir> && …'` and skips the tracked-file stash. See
-the sano example below.
+the local-mode example below.
 
 ### Release layout (artifact-first deploys)
 
@@ -211,7 +214,7 @@ const { loadConfig, deploy } = require('@andrewpopov/deploy-kit');
 deploy(loadConfig());
 ```
 
-## Safety behavior (preserved from the originals)
+## Safety behavior
 
 - **Backup before migrate** — a failed `hooks.backup` aborts before any schema change.
 - **SQLite-lock release** — `dbBoundApps` are `pm2 stop`ped before migrate and
@@ -235,10 +238,10 @@ for the backup hook.
 - **Health probe returns 301, deploy fails as unhealthy.** The app force-redirects
   plain http to https behind a TLS-terminating proxy. Set
   `"healthHeaders": {"X-Forwarded-Proto": "https"}` so the localhost curl gets the
-  real 200. (stoki, 0.3.1)
+  real 200. (Since 0.3.1.)
 - **First deploy of a brand-new PM2 process fails at restart.** `pm2 restart`
   requires the process to already exist. Set `ecosystemFile` so the deploy uses
-  `pm2 start <file> --only <name> || pm2 restart <name>`. (sano, 0.3.0)
+  `pm2 start <file> --only <name> || pm2 restart <name>`. (Since 0.3.0.)
 - **"Another deploy holds the lock".** A previous deploy is still running, or one
   died without releasing. Wait, or pass `--steal-lock` to force past a stale lock.
 - **Deploy hangs.** A wedged Tailscale/ssh route. The ssh `ConnectTimeout` bounds
@@ -251,16 +254,16 @@ for the backup hook.
 
 ## Examples
 
-**bewks — ssh, app + worker, both db-bound:**
+**ssh mode — app + worker, both db-bound:**
 
 ```json
 {
-  "host": "bewks@pi",
-  "projectDir": "/srv/bewks",
-  "appNames": ["bewks-app", "bewks-worker"],
-  "dbBoundApps": ["bewks-app", "bewks-worker"],
-  "tunnelName": "bewks-tunnel",
-  "ensureApps": ["bewks-tunnel"],
+  "host": "shop@pi",
+  "projectDir": "/srv/shop",
+  "appNames": ["shop-app", "shop-worker"],
+  "dbBoundApps": ["shop-app", "shop-worker"],
+  "tunnelName": "shop-tunnel",
+  "ensureApps": ["shop-tunnel"],
   "healthChecks": [{ "port": 3001, "path": "/worker/health" }],
   "hooks": {
     "backup": "npx db-backup backup --prod --allow-missing",
@@ -270,14 +273,14 @@ for the backup hook.
 }
 ```
 
-**stoki — build before migrate, proxy health headers:**
+**build before migrate, proxy health headers:**
 
 ```json
 {
-  "host": "stoki@pi",
-  "projectDir": "/srv/stoki",
-  "appNames": ["stoki-app"],
-  "dbBoundApps": ["stoki-app"],
+  "host": "blog@pi",
+  "projectDir": "/srv/blog",
+  "appNames": ["blog-app"],
+  "dbBoundApps": ["blog-app"],
   "buildBeforeMigrate": true,
   "healthHeaders": { "X-Forwarded-Proto": "https" },
   "hooks": {
@@ -288,26 +291,26 @@ for the backup hook.
 }
 ```
 
-**sano — local mode, ecosystem file, pre-deploy disk check:**
+**local mode — ecosystem file, pre-deploy disk check:**
 
 ```json
 {
   "mode": "local",
-  "projectDir": "/srv/sano-os",
+  "projectDir": "/srv/kiosk",
   "branch": "main",
-  "appNames": ["sano-app"],
-  "dbBoundApps": ["sano-app"],
-  "tunnelName": "sano-tunnel",
-  "ensureApps": ["sano-tunnel"],
+  "appNames": ["kiosk-app"],
+  "dbBoundApps": ["kiosk-app"],
+  "tunnelName": "kiosk-tunnel",
+  "ensureApps": ["kiosk-tunnel"],
   "ecosystemFile": "ecosystem.config.cjs",
   "preDeployChecks": [
-    { "name": "disk", "command": "test \"$(df -Pk /srv/sano-os | awk 'NR==2{print $4}')\" -ge 512000" }
+    { "name": "disk", "command": "test \"$(df -Pk /srv/kiosk | awk 'NR==2{print $4}')\" -ge 512000" }
   ],
   "port": 3003,
   "hooks": {
     "install": "pnpm install --frozen-lockfile",
     "backup": "bash scripts/backup-db.sh",
-    "migrate": "pnpm --filter @sano/api db:migrate",
+    "migrate": "pnpm --filter @kiosk/api db:migrate",
     "build": "pnpm build"
   }
 }

@@ -1,10 +1,10 @@
 # Shared Package Standards
 
-> **Canonical source:** `agent_tools/knowledge/shared-package-standards.md`.
-> This file is a synced copy; change the canonical doc first.
+> This file is a synced copy of a canonical standards doc maintained outside
+> this repo; change the canonical doc first.
 
-Reference for every `andrewpopov/*` package consumed across bewks, stoki,
-smarthome, sano-os, and kira (Kira epic BWK-84 / BWK-92). The pilot is
+Reference for every `andrewpopov/*` package consumed across the author's
+self-hosted apps. The pilot is
 `prisma-tools`; this repo follows the same standard (its `.github/workflows/ci.yml`
 and `scripts/verify-pack.mjs` are copied from the pilot with the require-smoke
 adjusted).
@@ -100,6 +100,6 @@ change PR — not a separate post-merge commit.
 ## The Pi deploy failure mode
 
 `npm ci` on the Raspberry Pi now reaches GitHub to resolve `github:` deps at
-deploy time. `deploy-kit` (BWK-86) must prefer lockfile/offline-cache installs
+deploy time. `deploy-kit` must prefer lockfile/offline-cache installs
 and degrade gracefully when GitHub is unreachable, so a GitHub outage cannot
 break a deploy that changes no dependencies.
