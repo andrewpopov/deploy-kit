@@ -28,6 +28,7 @@ function makeReleaseRuntime(over: any = {}) {
     currentLink: 'releases/00000000aaaa-20260709T090000Z',
     previousLink: 'releases/00000000bbbb-20260708T090000Z',
     tracked: '',
+    stateContent: '', // what `cat .deploy-kit-state.json` returns (interrupted-deploy guard)
     fail: [] as string[],
     ...over,
   };
@@ -45,6 +46,7 @@ function makeReleaseRuntime(over: any = {}) {
     }
     if (/pm2 stop /.test(cmd)) { if (!cfg.stopIneffective) stopped.add('app'); return ''; }
     if (/pm2 (startOrRestart|start|restart)/.test(cmd)) { stopped.clear(); return ''; }
+    if (cmd.includes('cat') && cmd.includes('deploy-kit-state.json')) return cfg.stateContent;
     if (cmd.includes('.deploy-kit-layout')) return cfg.marker;
     if (cmd.includes('mv --version')) return cfg.mvVersion;
     if (cmd.includes('df -kP')) return cfg.dfAvail; // fake stands in for the awk-extracted avail column
@@ -278,6 +280,17 @@ describe('release deploy — safety hardening (Codex review fixes)', () => {
       },
     };
     expect(() => release.rollbackRelease(relConfig(), {}, ctx(runtime))).toThrow(/restored the original release/);
+  });
+
+  it('refuses to start when a previous deploy was interrupted mid-disruptive-phase', () => {
+    const { runtime, calls } = makeReleaseRuntime({ stateContent: '{"phase":"migrated","releaseId":"a1b2c3d4e5f6-20260710T010000Z","backupId":"backup-x"}' });
+    expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow(/interrupted mid-"migrated"/);
+    expect(calls.some((cmd) => cmd.includes('worktree add'))).toBe(false);
+  });
+
+  it('rejects a corrupt current pointer that tries to traverse out of releases/', () => {
+    const { runtime } = makeReleaseRuntime({ currentLink: 'releases/..' });
+    expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow(/not a safe releases\/<id> target/);
   });
 
   it('prune removes the oldest release beyond keepReleases, protecting current/previous', () => {

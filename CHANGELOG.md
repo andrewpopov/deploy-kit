@@ -35,7 +35,9 @@ untouched until it adds a `layout` block.
   and the backup id rather than resuming stale code on a new schema. `SIGINT`/`SIGTERM`
   run the same machine, and each disruptive phase is **durably journaled**
   (atomic write) to `.deploy-kit-state.json` before the irreversible step, so a
-  process/SSH/power loss leaves an on-host record of what needs restoring.
+  process/SSH/power loss leaves an on-host record of what needs restoring. The
+  next deploy **refuses to start** if it finds an un-recovered interrupted phase
+  (loud "resolve by hand"); a successful recovery clears that state.
 - **The writer stop is gated and verified** (a zero-exit `pm2 stop` is not proof —
   the backup only runs once every `dbBoundApp` is confirmed not-online), the
   disruptive window refuses to open without a validated known-good `current`

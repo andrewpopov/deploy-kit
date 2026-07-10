@@ -20,6 +20,14 @@ const SETTLE_DELAY_SECONDS = 3;
 // happens in another directory (Codex). ~500 MiB.
 const MIN_FREE_KIB = 512 * 1024;
 
+// A materialized release id is `<sha>-<UTCtimestamp>`. This is the ONLY grammar a
+// release directory or symlink target may match — it forbids `.`/`..`/absolute
+// paths, so a pointer or listing entry can never traverse out of releases/ or be
+// shell-injected. `date -u +%Y%m%dT%H%M%SZ` is fixed-width, so lexical == chronological.
+const RELEASE_ID_BODY = '[0-9a-f]{7,40}-\\d{8}T\\d{6}Z';
+const RELEASE_ID_RE = new RegExp(`^${RELEASE_ID_BODY}$`);
+const RELEASE_TARGET_RE = new RegExp(`^releases\\/${RELEASE_ID_BODY}$`);
+
 function defaultSleep(seconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, seconds * 1000);
 }
@@ -171,10 +179,9 @@ function verifyActivation(config, paths, sha, releaseDir, ctx) {
   return { ok: true };
 }
 
-// A release pointer target must be exactly `releases/<safe-id>` — relative, no
-// traversal, no shell metacharacters — so it is safe to interpolate into `ln -s`
-// and cannot activate code outside the releases tree.
-const RELEASE_TARGET_RE = /^releases\/[A-Za-z0-9._-]+$/;
+// A release pointer target must be exactly `releases/<release-id>` (RELEASE_TARGET_RE
+// forbids `.`/`..`/absolute paths) so it is safe to interpolate into `ln -s` and
+// cannot activate code outside the releases tree.
 function assertSafeTarget(target, label) {
   if (!target || !RELEASE_TARGET_RE.test(target)) {
     throw new Error(`Refusing to use ${label} pointer "${target || '<empty>'}" — not a safe releases/<id> target.`);
@@ -235,6 +242,24 @@ function preflight(config, paths, ctx) {
   }
 }
 
+// Refuse to start a new deploy if the on-host journal shows a PREVIOUS deploy was
+// interrupted mid-disruptive-phase and never recovered (a hard process/SSH/power
+// loss). Turns "silently manual" into "loud, refuse until resolved" — full
+// auto-resume of an interrupted deploy is a tracked follow-up.
+function assertNoInterruptedDeploy(config, paths, ctx) {
+  const raw = capture(paths.root, `cat ${paths.stateFile} 2>/dev/null || true`, config, ctx);
+  if (!raw) return;
+  let state;
+  try { state = JSON.parse(raw); } catch { return; } // unreadable → best-effort, don't block
+  if (state && ['stopped', 'migrated', 'flipped'].includes(state.phase)) {
+    throw new Error(
+      `A previous deploy was interrupted mid-"${state.phase}" (release ${state.releaseId || '?'}, backup `
+      + `${state.backupId || 'none'}). Resolve it by hand — verify the DB/schema and the running release — then `
+      + `set "phase":"done" in ${paths.stateFile} (or remove it) before deploying again.`,
+    );
+  }
+}
+
 // The full artifact-first release deploy. See the failure-phase table in the ticket:
 // every phase records enough state that recover() can restore a known-good running
 // release, and the ONLY disruptive window is stop → backup → migrate → flip.
@@ -259,6 +284,15 @@ function deployRelease(config, options = {}, ctx = {}) {
     phase: st.phase, releaseId: st.releaseId, sha: st.sha, backupId: st.backupId,
     migrated: st.migrated, flipped: st.flipped, prevTarget: st.prevTarget,
   }, c);
+
+  // After a SUCCESSFUL recovery, overwrite the journaled disruptive phase so the
+  // next deploy isn't blocked by assertNoInterruptedDeploy — only a HARD interruption
+  // (no recovery ran) leaves a stopped/migrated/flipped phase on disk. Best-effort:
+  // a metadata write failing here must not mask the recovery that just succeeded.
+  const markRecovered = () => {
+    st.phase = 'recovered';
+    try { journal(); } catch { /* best effort */ }
+  };
 
   // Stop the DB-bound apps and PROVE they are actually stopped (a zero-exit
   // `pm2 stop` is not proof; writers left online would corrupt the backup/restore).
@@ -307,6 +341,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       case 'stopped':
         // writers stopped, nothing migrated/flipped — resume previous, verify.
         if (!resumePrevious().ok) fail('failed to bring the previous release back online after aborting pre-migration');
+        markRecovered();
         return;
       case 'migrated':
       case 'flipped':
@@ -331,6 +366,7 @@ function deployRelease(config, options = {}, ctx = {}) {
           log.warning(`Restored pre-migration DB backup ${st.backupId || ''}`);
         }
         if (!resumePrevious().ok) fail('the previous release did not come back healthy after DB/symlink recovery');
+        markRecovered();
         return;
       }
       default:
@@ -350,6 +386,7 @@ function deployRelease(config, options = {}, ctx = {}) {
   process.on('SIGTERM', sigHandlers.SIGTERM);
   try {
     preflight(config, paths, c);
+    assertNoInterruptedDeploy(config, paths, c);
     for (const check of config.preDeployChecks) {
       st.phase = 'preflight';
       const res = runInDir(paths.root, check.command, config, c, { tolerate: true });
@@ -357,6 +394,9 @@ function deployRelease(config, options = {}, ctx = {}) {
     }
 
     const pointers = readPointers(config, paths, c);
+    // A present current pointer must always be a valid release target (a corrupt
+    // pointer must never be trusted, disruptive deploy or not).
+    if (pointers.current) assertSafeTarget(pointers.current, 'current');
     st.prevTarget = pointers.current; // the release we will fall back to
 
     // ---- Phase: materialize (current untouched) ----
@@ -438,7 +478,11 @@ function deployRelease(config, options = {}, ctx = {}) {
       // line. Validate it to a safe charset before it is interpolated into restore.
       const lines = (res.output || '').split('\n').map((s) => s.trim()).filter(Boolean);
       st.backupId = lines.length ? lines[lines.length - 1] : null;
-      if (config.hooks.migrate && (!st.backupId || !/^[A-Za-z0-9._/-]+$/.test(st.backupId))) {
+      // Safe charset AND no absolute path / `..` traversal — the id may be used as a
+      // path by the restore hook, so an absolute or traversing value could restore
+      // the wrong file even though the single-quoting already blocks shell injection.
+      const safeBackupId = (id) => !!id && /^[A-Za-z0-9._/-]+$/.test(id) && !id.startsWith('/') && !id.split('/').includes('..');
+      if (config.hooks.migrate && !safeBackupId(st.backupId)) {
         throw new Error(`Backup hook did not emit a safe restorable id as its last line (got "${st.backupId || ''}"); refusing to migrate without a usable restore point`);
       }
       steps.push('backup');
@@ -522,12 +566,6 @@ function persistState(config, paths, state, ctx) {
   const res = runOnTarget(cmd, { ...config, projectDir: paths.root }, { runtime: ctx.runtime });
   if (!res.ok) throw new Error(`Failed to persist release metadata (${paths.stateFile})`);
 }
-
-// A materialized release id is `<sha>-<UTCtimestamp>`. Pruning only ever considers
-// directories matching this grammar (so an unexpected filename can't be shell-
-// injected into `rm`/`worktree remove`), and lexical sort == chronological because
-// the timestamp is fixed-width.
-const RELEASE_ID_RE = /^[0-9a-f]{7,40}-\d{8}T\d{6}Z$/;
 
 // Prune old releases down to keepReleases total, NEVER removing current/previous or
 // the just-activated release, only ever touching recognized ids under releases/, via
