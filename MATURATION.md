@@ -157,7 +157,7 @@ Observed in `src/`, roughly ordered by risk:
 ## 7. Adoption
 
 - **Adopters:** bewks `v0.2.1`, smarthome `v0.3.1`, stoki `v0.3.1`, sano-os
-  `v0.4.0`, kira. All five hand-rolled `deploy.sh`s are retired (BWK-86).
+  `v0.4.0`, kira. All five hand-rolled `deploy.sh`s are retired.
 - **Friction observed:** version skew (nobody bumps until they need a feature);
   every adopter re-invents the same `package.json` script block
   (`"deploy": "deploy-kit deploy"`, `remote:*` — compare bewks/smarthome/stoki,
