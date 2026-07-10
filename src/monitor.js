@@ -20,9 +20,15 @@ function stateFilePath(config) {
 // survive a lost state file.
 function readState(config, ctx) {
   const fresh = { version: STATE_VERSION, checks: {}, pendingEvent: null };
-  const res = runOnTarget(`cat ${stateFilePath(config)} 2>/dev/null || true`, config, { capture: true, runtime: ctx.runtime, timeoutSeconds: 10 });
+  const file = stateFilePath(config);
+  // Distinguish "file absent" (fresh state, fine) from a read ERROR (permission/I/O):
+  // an error must fail the run, never silently reset — that would drop an undelivered
+  // outbox event and all debounce history. Absent → the ABSENT marker; present → cat
+  // (a failed cat on a present file makes the command non-zero → res.ok false → throw).
+  const res = runOnTarget(`if [ ! -e '${file}' ]; then echo __DK_ABSENT__; else cat '${file}'; fi`, config, { capture: true, runtime: ctx.runtime, timeoutSeconds: 10 });
+  if (!res.ok) throw new Error(`monitor: could not read state file ${file} (refusing to overwrite it)`);
   const raw = (res.output || '').trim();
-  if (!raw) return fresh;
+  if (raw === '__DK_ABSENT__' || raw === '') return fresh;
   let parsed;
   try { parsed = JSON.parse(raw); } catch { ctx.log.warning('monitor: state file unparseable; starting fresh'); return fresh; }
   if (!parsed || parsed.version !== STATE_VERSION || typeof parsed.checks !== 'object') {
@@ -39,7 +45,7 @@ function writeState(config, ctx, state) {
   const file = stateFilePath(config);
   const tmp = `${file}.tmp.$$`;
   const json = JSON.stringify(state);
-  const res = runOnTarget(`cat > ${tmp} && chmod 600 ${tmp} && mv -f ${tmp} ${file}`, config, { runtime: ctx.runtime, input: json, timeoutSeconds: 10 });
+  const res = runOnTarget(`cat > '${tmp}' && chmod 600 '${tmp}' && mv -f '${tmp}' '${file}'`, config, { runtime: ctx.runtime, input: json, timeoutSeconds: 10 });
   if (!res.ok) throw new Error(`monitor: failed to persist state to ${file}`);
 }
 
@@ -72,10 +78,14 @@ function stepCheck(prev, result, opts) {
   const s = prev || { notif: 'healthy', failStreak: 0, recoverStreak: 0, lastAlertAtMs: 0, lastAlertedStatus: null };
   const st = result.status;
   const base = { notif: s.notif, failStreak: s.failStreak, recoverStreak: s.recoverStreak, lastAlertAtMs: s.lastAlertAtMs, lastAlertedStatus: s.lastAlertedStatus };
-  if (result.meta) base.meta = result.meta[result.id]; // persist e.g. restart baseline
+  // Carry the persisted meta (e.g. restart baseline) forward; a check that produced
+  // fresh meta this run overrides it. A transient unknown must NOT erase the baseline.
+  base.meta = (result.meta && result.meta[result.id] !== undefined) ? result.meta[result.id] : s.meta;
 
   if (st === 'unknown') {
-    return { next: { ...base, failStreak: 0, recoverStreak: 0 } }; // hold; surface but don't transition
+    // Hold: surface but don't transition, and PRESERVE the fail/recover streaks so an
+    // indeterminate run between two failures (or two recoveries) doesn't lose progress.
+    return { next: base };
   }
   if (st === 'ok') {
     const recoverStreak = s.recoverStreak + 1;
@@ -150,8 +160,10 @@ function monitor(config, options = {}, ctx = {}) {
         host: config.host || 'local',
         alerts: allAlerts,
       };
-      // Persist the pending event + new check states BEFORE sending, so a crash after
-      // delivery can't lose the alert and a crash before delivery retries next run.
+      // Persist the pending event + new check states BEFORE sending, so an undelivered
+      // alert is never lost and is retried next run. This is AT-LEAST-ONCE: a crash
+      // between a successful send and clearing pendingEvent re-sends next run — the
+      // event carries a stable `eventId` so a deduping sink can drop the repeat.
       writeState(config, c, { version: STATE_VERSION, checks: nextChecks, pendingEvent: event });
       const sent = deliverAlert(config, c, event);
       if (sent.ok) {

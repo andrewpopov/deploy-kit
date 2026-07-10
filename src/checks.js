@@ -94,14 +94,19 @@ function checkDisk(config, ctx, timeoutSeconds) {
   const id = `disk:${config.projectDir}`;
   const minKiB = d.minFreeKiB != null ? d.minFreeKiB : 512 * 1024;
   const minInodes = d.minFreeInodes != null ? d.minFreeInodes : 10000;
-  const availKiB = parseInt(cap(config, ctx, `LC_ALL=C df -kP ${config.projectDir} | awk 'NR==2{print $4}'`, timeoutSeconds).output, 10);
-  const ifreeRaw = cap(config, ctx, `LC_ALL=C df -iP ${config.projectDir} | awk 'NR==2{print $4}'`, timeoutSeconds).output;
-  const ifree = parseInt(ifreeRaw, 10);
-  if (!Number.isFinite(availKiB)) return [{ id, status: 'unknown', message: `disk: could not read free space on ${config.projectDir}` }];
+  const bytesRes = cap(config, ctx, `LC_ALL=C df -kP '${config.projectDir}' | awk 'NR==2{print $4}'`, timeoutSeconds);
+  const availKiB = parseInt((bytesRes.output || '').trim(), 10);
+  if (!bytesRes.ok || !Number.isFinite(availKiB)) return [{ id, status: 'unknown', message: `disk: could not read free space on ${config.projectDir}` }];
+  const inodeRes = cap(config, ctx, `LC_ALL=C df -iP '${config.projectDir}' | awk 'NR==2{print $4}'`, timeoutSeconds);
+  const ifreeRaw = (inodeRes.output || '').trim();
   const problems = [];
   if (availKiB < minKiB) problems.push(`${availKiB} KiB free < ${minKiB} KiB`);
-  // Some filesystems report '-' for inodes (unsupported) — treat as "not applicable", not a failure.
-  if (Number.isFinite(ifree) && ifree < minInodes) problems.push(`${ifree} inodes free < ${minInodes}`);
+  // Inodes: '-' means the FS doesn't report them (skip). A command failure or any
+  // non-numeric, non-'-' value is UNKNOWN — never silently treat it as healthy.
+  if (ifreeRaw !== '-') {
+    if (!inodeRes.ok || !/^\d+$/.test(ifreeRaw)) return [{ id, status: 'unknown', message: `disk: could not read free inodes on ${config.projectDir}` }];
+    if (parseInt(ifreeRaw, 10) < minInodes) problems.push(`${ifreeRaw} inodes free < ${minInodes}`);
+  }
   return [problems.length
     ? { id, status: 'crit', message: `disk pressure on ${config.projectDir}: ${problems.join('; ')}` }
     : { id, status: 'ok', message: `disk ok (${availKiB} KiB free)` }];
@@ -115,11 +120,13 @@ function checkBackup(config, ctx, nowMs, timeoutSeconds) {
   if (!b) return [];
   const id = `backup:${b.id || 'default'}`;
   const maxAgeHours = b.maxAgeHours != null ? b.maxAgeHours : 30;
-  // `stat -c %Y` prints the mtime epoch (GNU coreutils); a missing file exits non-zero.
-  const res = cap(config, ctx, `stat -c %Y ${b.stampFile} 2>/dev/null || echo MISSING`, timeoutSeconds);
+  // Distinguish MISSING (crit — no backup) from a stat ERROR (unknown — can't tell):
+  // absent ⇒ the marker; present ⇒ `stat -c %Y` (a stat failure on a present file
+  // makes the command non-zero → res.ok false → unknown), never a false "missing".
+  const res = cap(config, ctx, `if [ ! -e '${b.stampFile}' ]; then echo __DK_MISSING__; else stat -c %Y '${b.stampFile}'; fi`, timeoutSeconds);
   const out = (res.output || '').trim();
   if (!res.ok) return [{ id, status: 'unknown', message: `backup: could not stat ${b.stampFile}` }];
-  if (out === 'MISSING' || out === '') return [{ id, status: 'crit', message: `backup stamp ${b.stampFile} is missing` }];
+  if (out === '__DK_MISSING__') return [{ id, status: 'crit', message: `backup stamp ${b.stampFile} is missing` }];
   const mtimeMs = parseInt(out, 10) * 1000;
   if (!Number.isFinite(mtimeMs)) return [{ id, status: 'unknown', message: `backup: unparseable stamp mtime (${out})` }];
   if (mtimeMs > nowMs + 60000) return [{ id, status: 'unknown', message: `backup stamp mtime is in the future (clock skew?)` }];
@@ -139,15 +146,19 @@ function checkPublicProbes(config, ctx) {
   return probes.map((pr) => {
     const id = `public:${pr.id}`;
     const maxTime = pr.maxTimeSeconds != null ? pr.maxTimeSeconds : Math.max(2, Math.min(to - 1, 10));
+    // Headers are validated free of single quotes at config time, so single-quoting
+    // is safe here. Values are never echoed in messages (may hold secrets).
     const headerArgs = Object.entries(pr.headers || {}).map(([k, v]) => `-H '${k}: ${v}'`).join(' ');
-    const code = (cap(config, ctx, `curl -sS -o /dev/null -w '%{http_code}' --max-time ${maxTime} ${headerArgs} '${pr.url}'`, to).output || '').trim();
+    const codeRes = cap(config, ctx, `curl -sS -o /dev/null -w '%{http_code}' --max-time ${maxTime} ${headerArgs} '${pr.url}'`, to);
+    const code = (codeRes.output || '').trim();
     const expected = pr.expectStatus != null ? (Array.isArray(pr.expectStatus) ? pr.expectStatus : [pr.expectStatus]) : [200];
-    if (!expected.map(String).includes(code)) {
+    // A curl failure/timeout (non-zero exit) is crit even if it printed a code (e.g. 000).
+    if (!codeRes.ok || !expected.map(String).includes(code)) {
       return { id, status: 'crit', message: `probe ${pr.id}: HTTP ${code || 'no-response'} (expected ${expected.join('/')})` };
     }
     if (pr.expectBodyIncludes) {
-      const body = cap(config, ctx, `curl -sS --max-time ${maxTime} ${headerArgs} '${pr.url}'`, to).output || '';
-      if (!body.includes(pr.expectBodyIncludes)) return { id, status: 'crit', message: `probe ${pr.id}: body missing expected marker` };
+      const bodyRes = cap(config, ctx, `curl -fsS --max-time ${maxTime} ${headerArgs} '${pr.url}'`, to);
+      if (!bodyRes.ok || !(bodyRes.output || '').includes(pr.expectBodyIncludes)) return { id, status: 'crit', message: `probe ${pr.id}: body check failed` };
     }
     return { id, status: 'ok', message: `probe ${pr.id}: HTTP ${code}` };
   });

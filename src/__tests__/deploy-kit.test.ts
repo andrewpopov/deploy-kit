@@ -733,4 +733,12 @@ describe('monitor config validation', () => {
     expect(probs).toMatch(/unknown monitor key "bogus"/);
     expect(probs).toMatch(/monitor\.failAfterRuns.*positive integer/);
   });
+  it('rejects shell metacharacters in stateFile and backup.stampFile (injection)', () => {
+    expect(withMon({ ...okMon, stateFile: '/var/lib/x; rm -rf /' }).join('\n')).toMatch(/stateFile.*shell metacharacters/);
+    expect(withMon({ ...okMon, backup: { id: 'db', stampFile: '/var/lib/$(id)', maxAgeHours: 30 } }).join('\n')).toMatch(/stampFile.*shell metacharacters/);
+  });
+  it('rejects a single quote in a probe header (would break curl quoting)', () => {
+    const bad = { ...okMon, publicProbes: [{ id: 'api', url: 'https://app/health', headers: { Authorization: "Bearer x' ; id" } }] };
+    expect(withMon(bad).join('\n')).toMatch(/headers\["Authorization"\].*single quote/);
+  });
 });

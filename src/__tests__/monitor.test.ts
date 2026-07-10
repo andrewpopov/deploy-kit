@@ -76,12 +76,20 @@ describe('monitor state machine (stepCheck)', () => {
     expect(s2.alert).toMatchObject({ kind: 'alert', status: 'crit' });
     expect(s2.next.notif).toBe('alerted');
   });
-  it('unknown HOLDS: no recovery, no confirmed failure, streaks cleared', () => {
-    const alerted = { notif: 'alerted', failStreak: 2, recoverStreak: 0, lastAlertAtMs: NOW, lastAlertedStatus: 'crit' };
-    const u = stepCheck(alerted as any, { id: 'x', status: 'unknown', message: '?' }, opts);
+  it('unknown HOLDS + PRESERVES streaks (failure → unknown → failure still reaches threshold)', () => {
+    const s1 = stepCheck(undefined, { id: 'x', status: 'crit', message: 'd' }, opts); // failStreak 1
+    const u = stepCheck(s1.next, { id: 'x', status: 'unknown', message: '?' }, opts);  // hold
     expect(u.alert).toBeUndefined();
-    expect(u.next.notif).toBe('alerted'); // still alerted, NOT recovered
-    expect(u.next.recoverStreak).toBe(0);
+    expect(u.next.failStreak).toBe(1);   // preserved, not reset
+    expect(u.next.notif).toBe('healthy');
+    const s2 = stepCheck(u.next, { id: 'x', status: 'crit', message: 'd' }, opts);      // failStreak 2 → alert
+    expect(s2.alert).toMatchObject({ kind: 'alert' });
+  });
+  it('unknown does not recover an alerted check and carries the restart baseline forward', () => {
+    const alerted = { notif: 'alerted', failStreak: 2, recoverStreak: 0, lastAlertAtMs: NOW, lastAlertedStatus: 'crit', meta: { restart: 42 } };
+    const u = stepCheck(alerted as any, { id: 'restart:app', status: 'unknown', message: '?' }, opts);
+    expect(u.next.notif).toBe('alerted');        // no false recovery
+    expect(u.next.meta).toEqual({ restart: 42 }); // baseline preserved through unknown
   });
   it('recovers only after recoverAfterRuns consecutive ok', () => {
     const alerted = { notif: 'alerted', failStreak: 2, recoverStreak: 0, lastAlertAtMs: NOW, lastAlertedStatus: 'crit' };
@@ -177,6 +185,19 @@ describe('monitor() run', () => {
     expect(rt.delivered).toEqual([]);
     // pm2 unknown → results carry 'unknown', exit not CRITICAL from pm2 alone
     expect(res.results.find((r: any) => r.id === 'pm2:app').status).toBe('unknown');
+  });
+
+  it('refuses to overwrite state on a read ERROR (permission/I/O), not a missing file', () => {
+    const rt = makeMonitorRuntime();
+    const orig = rt.runtime.execFileSync;
+    // Fail the state READ (present-file cat path) — must NOT reset+overwrite.
+    (rt.runtime as any).execFileSync = (f: string, a: string[], o: any) => {
+      const cmd = a[a.length - 1];
+      if (cmd.includes('__DK_ABSENT__') || (cmd.includes('cat ') && cmd.includes('monitor-state.json') && !cmd.includes('cat >'))) throw new Error('permission denied');
+      return orig(f, a, o);
+    };
+    expect(() => monitor(monConfig(), {}, ctx(rt))).toThrow(/could not read state file/);
+    expect(rt.delivered).toEqual([]); // nothing written/sent
   });
 
   it('retires state for a check that is no longer configured (no false recovery)', () => {

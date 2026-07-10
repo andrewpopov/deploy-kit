@@ -194,7 +194,14 @@ function validateMonitor(m, source) {
       } else if (!pr.url.startsWith('https://') && pr.url !== undefined) {
         // http allowed but flagged intentionally — most probes should be https.
       }
-      if (pr.headers != null && (typeof pr.headers !== 'object' || Array.isArray(pr.headers))) p.push(`${source}: ${w}.headers must be an object`);
+      if (pr.headers != null) {
+        if (typeof pr.headers !== 'object' || Array.isArray(pr.headers)) p.push(`${source}: ${w}.headers must be an object`);
+        else for (const [hk, hv] of Object.entries(pr.headers)) {
+          // Header key/value are single-quoted into the curl command; a single quote
+          // would escape the quoting and inject. Reject it (matches buildHealthCommand).
+          if (String(hk).includes("'") || String(hv).includes("'")) p.push(`${source}: ${w}.headers["${hk}"] must not contain a single quote`);
+        }
+      }
     });
   }
   if (m.checks != null) {
@@ -207,8 +214,11 @@ function validateMonitor(m, source) {
       if (c.level != null && c.level !== 'warn' && c.level !== 'crit') p.push(`${source}: ${w}.level must be "warn" or "crit"`);
     });
   }
+  // Absolute path with NO shell metacharacters — it is interpolated into `stat`/`cat`
+  // commands on the target (defense-in-depth alongside the single-quoting there).
+  const safeAbsPath = (v) => typeof v === 'string' && v.startsWith('/') && !/[^A-Za-z0-9_./-]/.test(v);
   if (m.backup != null) {
-    if (typeof m.backup !== 'object' || typeof m.backup.stampFile !== 'string' || !m.backup.stampFile.startsWith('/')) p.push(`${source}: "monitor.backup.stampFile" must be an absolute path`);
+    if (typeof m.backup !== 'object' || !safeAbsPath(m.backup.stampFile)) p.push(`${source}: "monitor.backup.stampFile" must be an absolute path free of shell metacharacters`);
     if (m.backup && m.backup.maxAgeHours != null && !(typeof m.backup.maxAgeHours === 'number' && m.backup.maxAgeHours > 0)) p.push(`${source}: "monitor.backup.maxAgeHours" must be a positive number`);
   }
   if (m.disk != null) {
@@ -222,7 +232,7 @@ function validateMonitor(m, source) {
     if (m[k] != null && !isPosInt(m[k])) p.push(`${source}: "monitor.${k}" must be a positive integer`);
   }
   if (m.reAlertAfterMinutes != null && !(typeof m.reAlertAfterMinutes === 'number' && m.reAlertAfterMinutes >= 0)) p.push(`${source}: "monitor.reAlertAfterMinutes" must be a non-negative number`);
-  if (m.stateFile != null && (typeof m.stateFile !== 'string' || !m.stateFile.startsWith('/'))) p.push(`${source}: "monitor.stateFile" must be an absolute path`);
+  if (m.stateFile != null && !safeAbsPath(m.stateFile)) p.push(`${source}: "monitor.stateFile" must be an absolute path free of shell metacharacters`);
   if (m.tunnel != null && typeof m.tunnel !== 'boolean') p.push(`${source}: "monitor.tunnel" must be a boolean`);
   return p;
 }
