@@ -207,6 +207,23 @@ export function runOnTarget(
 ): { ok: boolean; output: string; error?: unknown };
 export function buildHealthCommand(config: DeployConfig, check?: HealthCheck): string;
 
+export interface MonitorCheckResult {
+  id: string;
+  status: 'ok' | 'warn' | 'crit' | 'unknown';
+  message: string;
+}
+export interface MonitorResult {
+  /** 0 = all ok/warn · 1 = a critical condition · 2 = monitor/config/delivery failure. */
+  exitCode: 0 | 1 | 2;
+  results: MonitorCheckResult[];
+  alerts: { id: string; kind: 'alert' | 'recovery' | 'escalation' | 'reminder'; status: string; message: string }[];
+}
+export function monitor(
+  config: DeployConfig,
+  options?: { stealLock?: boolean },
+  ctx?: DeployContext & { now?: () => number; genId?: (nowMs: number) => string },
+): MonitorResult;
+
 export function deploy(config: DeployConfig, options?: DeployOptions, ctx?: DeployContext): DeployResult;
 export function rollback(config: DeployConfig, options?: RollbackOptions, ctx?: DeployContext): RollbackResult;
 export function resolveBranch(config: DeployConfig, ctx: DeployContext): string;
