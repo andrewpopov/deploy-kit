@@ -20,18 +20,21 @@ function makeReleaseRuntime(over: any = {}) {
     ts: '20260710T090000Z',
     sha: SHA,
     builtSha: SHA,
-    canonical: '/srv/app/releases/a1b2c3d4e5f6-20260710T090000Z',
+    canonical: '/srv/app/releases/a1b2c3d4e5f6a1b2-20260710T090000Z',
     runningSha: SHA,
-    pm2: [{ name: 'app', pid: 111, pm2_env: { status: 'online', restart_time: 5 } }],
+    restartTime: 5,
     backupId: 'backup-2026-07-10',
-    releasesList: 'a1b2c3d4e5f6-20260710T090000Z\nold1-20260709T090000Z\nold0-20260708T090000Z',
-    currentLink: 'releases/old1-20260709T090000Z',
-    previousLink: 'releases/old0-20260708T090000Z',
+    releasesList: 'a1b2c3d4e5f6a1b2-20260710T090000Z\n00000000aaaa-20260709T090000Z\n00000000bbbb-20260708T090000Z',
+    currentLink: 'releases/00000000aaaa-20260709T090000Z',
+    previousLink: 'releases/00000000bbbb-20260708T090000Z',
     tracked: '',
     fail: [] as string[],
     ...over,
   };
   const calls: string[] = [];
+  // Model PM2 stop/start so the GATED, verified writer-stop can be exercised: a
+  // `pm2 stop` marks apps stopped; a start/restart brings them back online.
+  const stopped = new Set<string>();
   const execFileSync = (_file: string, args: string[]) => {
     const cmd = args[args.length - 1];
     calls.push(cmd);
@@ -40,6 +43,8 @@ function makeReleaseRuntime(over: any = {}) {
       err.stdout = '';
       throw err;
     }
+    if (/pm2 stop /.test(cmd)) { if (!cfg.stopIneffective) stopped.add('app'); return ''; }
+    if (/pm2 (startOrRestart|start|restart)/.test(cmd)) { stopped.clear(); return ''; }
     if (cmd.includes('.deploy-kit-layout')) return cfg.marker;
     if (cmd.includes('mv --version')) return cfg.mvVersion;
     if (cmd.includes('df -kP')) return cfg.dfAvail; // fake stands in for the awk-extracted avail column
@@ -47,7 +52,9 @@ function makeReleaseRuntime(over: any = {}) {
     if (cmd.includes('rev-parse HEAD')) return cfg.builtSha;
     if (cmd.includes('rev-parse')) return cfg.sha;
     if (cmd.includes('readlink -f')) return cfg.canonical;
-    if (cmd.includes('pm2 jlist')) return JSON.stringify(cfg.pm2);
+    if (cmd.includes('pm2 jlist')) {
+      return JSON.stringify([{ name: 'app', pid: 111, pm2_env: { status: stopped.has('app') ? 'stopped' : 'online', restart_time: cfg.restartTime } }]);
+    }
     if (cmd.includes('readlink ') && cmd.includes('/current')) return cfg.currentLink;
     if (cmd.includes('readlink ') && cmd.includes('/previous')) return cfg.previousLink;
     if (cmd.includes('ls -1')) return cfg.releasesList;
@@ -126,6 +133,54 @@ describe('release deploy — happy path', () => {
     const result = kit.deploy(relConfig(), {}, ctx(runtime));
     expect(result.release).toBe('a1b2c3d4e5f6-20260710T090000Z');
   });
+
+  it('accepts a PID whose cwd is a SUBDIR of the release (real ecosystem shape)', () => {
+    // smarthome-api runs with cwd <release>/packages/api, not the release root.
+    const over: any = {};
+    const rt = makeReleaseRuntime();
+    const subdir = `${rt.cfg.canonical}/packages/api`;
+    const runtime = {
+      execFileSync: (_f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        if (cmd.includes('readlink -f /proc/')) return subdir;
+        return (rt.runtime.execFileSync as any)(_f, args);
+      },
+    };
+    void over;
+    expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).not.toThrow();
+  });
+
+  it('verifyActivation rejects a PID whose cwd is OUTSIDE the new release (stale process)', () => {
+    const rt = makeReleaseRuntime();
+    const runtime = {
+      execFileSync: (_f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        if (cmd.includes('readlink -f /proc/')) return '/srv/app/releases/old1-20260709T090000Z';
+        return (rt.runtime.execFileSync as any)(_f, args);
+      },
+    };
+    const v = release.verifyActivation(relConfig(), release.releasePaths(relConfig()), SHA, rt.cfg.canonical, ctx(runtime));
+    expect(v.ok).toBe(false);
+    expect(v.reason).toMatch(/not under/);
+  });
+
+  it('verifyActivation fails a crash loop (restart counts climbing across the settle window)', () => {
+    let n = 0;
+    const rt = makeReleaseRuntime();
+    const runtime = {
+      execFileSync: (_f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        if (cmd.includes('pm2 jlist')) {
+          n += 1;
+          return JSON.stringify([{ name: 'app', pid: 111, pm2_env: { status: 'online', restart_time: 5 + n } }]);
+        }
+        return (rt.runtime.execFileSync as any)(_f, args);
+      },
+    };
+    const v = release.verifyActivation(relConfig(), release.releasePaths(relConfig()), SHA, rt.cfg.canonical, ctx(runtime));
+    expect(v.ok).toBe(false);
+    expect(v.reason).toMatch(/crash loop/);
+  });
 });
 
 describe('release deploy — failure recovery by phase', () => {
@@ -164,7 +219,7 @@ describe('release deploy — failure recovery by phase', () => {
     const { runtime, calls } = makeReleaseRuntime({ fail: ['run-migrate'] });
     expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow();
     expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(true);
-    expect(calls.some((cmd) => cmd.includes('DEPLOY_KIT_BACKUP_ID=backup-2026-07-10'))).toBe(true);
+    expect(calls.some((cmd) => cmd.includes("DEPLOY_KIT_BACKUP_ID='backup-2026-07-10'"))).toBe(true);
     expect(calls.some((cmd) => cmd.includes('pm2 startOrRestart'))).toBe(true);
   });
 
@@ -176,10 +231,69 @@ describe('release deploy — failure recovery by phase', () => {
     expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(true);
   });
 
-  it('escalates to MANUAL RECOVERY REQUIRED when a migration failed and no restore hook exists', () => {
-    const cfg = relConfig({ hooks: { install: 'npm ci', build: 'npm run build', backup: 'run-backup', migrate: 'run-migrate', restore: null } });
-    const { runtime } = makeReleaseRuntime({ fail: ['run-migrate'] });
-    expect(() => release.deployRelease(cfg, {}, ctx(runtime))).toThrow(/MANUAL RECOVERY REQUIRED/);
+  it('escalates to MANUAL RECOVERY REQUIRED when a migration failed AND the restore also fails', () => {
+    const { runtime } = makeReleaseRuntime({ fail: ['run-migrate', 'run-restore'] });
+    expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow(/MANUAL RECOVERY REQUIRED/);
+  });
+
+  it('preflight refuses a migrate hook with no backup or no restore hook', () => {
+    const noBackup = relConfig({ hooks: { install: 'npm ci', build: 'npm run build', migrate: 'run-migrate', backup: null, restore: 'run-restore' } });
+    expect(() => release.deployRelease(noBackup, {}, ctx(makeReleaseRuntime().runtime))).toThrow(/requires a .backup. hook/);
+    const noRestore = relConfig({ hooks: { install: 'npm ci', build: 'npm run build', migrate: 'run-migrate', backup: 'run-backup', restore: null } });
+    expect(() => release.deployRelease(noRestore, {}, ctx(makeReleaseRuntime().runtime))).toThrow(/requires a .restore. hook/);
+  });
+});
+
+describe('release deploy — safety hardening (Codex review fixes)', () => {
+  it('aborts if DB writers cannot be CONFIRMED stopped (never backs up over live writers)', () => {
+    const { runtime, calls } = makeReleaseRuntime({ stopIneffective: true });
+    expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow(/could not confirm|Could not confirm/i);
+    expect(calls.some((cmd) => cmd.includes('run-backup'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('run-migrate'))).toBe(false);
+  });
+
+  it('durably journals state (atomic write) before the atomic flip', () => {
+    const rt = makeReleaseRuntime();
+    release.deployRelease(relConfig(), {}, ctx(rt.runtime));
+    const c = rt.calls;
+    const firstStateWrite = c.findIndex((cmd) => /deploy-kit-state\.json\.tmp.*&& mv -f/.test(cmd));
+    const flip = c.findIndex((cmd) => /mv -Tf .*\/current/.test(cmd));
+    expect(firstStateWrite).toBeGreaterThanOrEqual(0);
+    expect(firstStateWrite).toBeLessThan(flip);
+  });
+
+  it('rollback flips back to the original release when the target is unhealthy', () => {
+    let verifyCwdCalls = 0;
+    const rt = makeReleaseRuntime();
+    const runtime = {
+      execFileSync: (_f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        // First activation-verify (the rollback target) sees a stale cwd → unhealthy;
+        // the flip-back verify (original) sees a good cwd → healthy.
+        if (cmd.includes('readlink -f /proc/')) {
+          verifyCwdCalls += 1;
+          return verifyCwdCalls <= 1 ? '/srv/app/releases/99999999cccc-20260101T000000Z' : rt.cfg.canonical;
+        }
+        return (rt.runtime.execFileSync as any)(_f, args);
+      },
+    };
+    expect(() => release.rollbackRelease(relConfig(), {}, ctx(runtime))).toThrow(/restored the original release/);
+  });
+
+  it('prune removes the oldest release beyond keepReleases, protecting current/previous', () => {
+    const rt = makeReleaseRuntime({
+      releasesList: '00000000aaaa-20260709T090000Z\n00000000bbbb-20260708T090000Z\n00000000cccc-20260707T090000Z\nnot-a-release-dir',
+      currentLink: 'releases/00000000aaaa-20260709T090000Z',
+      previousLink: 'releases/00000000bbbb-20260708T090000Z',
+    });
+    const cfg = relConfig({ layout: { type: 'releases', keepReleases: 2, sharedPaths: ['.env'], releaseChecks: [], runningShaCommand: 'get-running-sha' } });
+    const noop = () => {};
+    const pruneCtx = { runtime: rt.runtime, sleep: noop, log: { step: noop, warning: noop, success: noop, info: noop, error: noop, header: noop, divider: noop } };
+    release.prune(cfg, release.releasePaths(cfg), '00000000aaaa-20260709T090000Z', pruneCtx);
+    // oldest recognized (cccc) is removed; the unrecognized dir is left alone.
+    expect(rt.calls.some((cmd) => cmd.includes('worktree remove --force /srv/app/releases/00000000cccc-20260707T090000Z'))).toBe(true);
+    expect(rt.calls.some((cmd) => cmd.includes('not-a-release-dir'))).toBe(false);
+    expect(rt.calls.some((cmd) => cmd.includes('worktree remove --force /srv/app/releases/00000000bbbb'))).toBe(false);
   });
 });
 
@@ -218,7 +332,7 @@ describe('release rollback', () => {
   it('flips current back to the previous release with no reinstall/rebuild', () => {
     const { runtime, calls } = makeReleaseRuntime();
     const result = release.rollbackRelease(relConfig(), {}, ctx(runtime));
-    expect(result.release).toBe('releases/old0-20260708T090000Z');
+    expect(result.release).toBe('releases/00000000bbbb-20260708T090000Z');
     expect(calls.some((cmd) => /mv -Tf .*\/current/.test(cmd))).toBe(true);
     expect(calls.some((cmd) => cmd.includes('npm ci'))).toBe(false);
     expect(calls.some((cmd) => cmd.includes('npm run build'))).toBe(false);

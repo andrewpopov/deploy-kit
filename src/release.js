@@ -127,13 +127,19 @@ function verifyActivation(config, paths, sha, releaseDir, ctx) {
   if (!pm2) return { ok: false, reason: 'could not read `pm2 jlist`' };
 
   const canonicalRelease = capture(paths.root, `readlink -f ${releaseDir}`, config, ctx);
+  // Fail closed: without a resolved release path the cwd comparison below is
+  // meaningless (an empty canonical + empty cwd would spuriously "match").
+  if (!canonicalRelease) return { ok: false, reason: `could not resolve release path ${releaseDir}` };
   for (const name of config.appNames) {
     const proc = pm2[name];
     if (!proc || !proc.online) return { ok: false, reason: `PM2 process ${name} is not online` };
     if (proc.pid == null) return { ok: false, reason: `PM2 process ${name} has no pid` };
     const cwd = capture(paths.root, `readlink -f /proc/${proc.pid}/cwd`, config, ctx);
-    if (cwd !== canonicalRelease) {
-      return { ok: false, reason: `${name} (pid ${proc.pid}) cwd is ${cwd || '<unknown>'}, expected ${canonicalRelease}` };
+    // The process may run from a subdirectory of the release (e.g. an API whose
+    // ecosystem cwd is <release>/packages/api), so assert cwd is WITHIN the new
+    // release, not exactly equal to its root.
+    if (!cwd || (cwd !== canonicalRelease && !cwd.startsWith(`${canonicalRelease}/`))) {
+      return { ok: false, reason: `${name} (pid ${proc.pid}) cwd is ${cwd || '<unknown>'}, not under ${canonicalRelease}` };
     }
   }
 
@@ -165,8 +171,20 @@ function verifyActivation(config, paths, sha, releaseDir, ctx) {
   return { ok: true };
 }
 
+// A release pointer target must be exactly `releases/<safe-id>` — relative, no
+// traversal, no shell metacharacters — so it is safe to interpolate into `ln -s`
+// and cannot activate code outside the releases tree.
+const RELEASE_TARGET_RE = /^releases\/[A-Za-z0-9._-]+$/;
+function assertSafeTarget(target, label) {
+  if (!target || !RELEASE_TARGET_RE.test(target)) {
+    throw new Error(`Refusing to use ${label} pointer "${target || '<empty>'}" — not a safe releases/<id> target.`);
+  }
+  return target;
+}
+
 // Read the current/previous release targets (relative, e.g. "releases/<id>") from
-// the symlinks — never inferred from directory listings.
+// the symlinks — never inferred from directory listings. Targets are NOT validated
+// here (a caller that needs a safe target calls assertSafeTarget).
 function readPointers(config, paths, ctx) {
   const current = capture(paths.root, `readlink ${paths.currentLink} 2>/dev/null || true`, config, ctx);
   const previous = capture(paths.root, `readlink ${paths.previousLink} 2>/dev/null || true`, config, ctx);
@@ -195,12 +213,24 @@ function preflight(config, paths, ctx) {
   if (!config.ecosystemFile) {
     throw new Error('Release deploy requires `ecosystemFile` (the stable PM2 ecosystem with literal cwd:<root>/current).');
   }
+  // Auto-recovery after a failed migration needs a consistent pre-migration backup
+  // AND a way to restore it — otherwise a mid-migration failure can only be resolved
+  // by hand. Require both when a migration hook is configured under the release layout.
+  if (config.hooks.migrate) {
+    if (!config.hooks.backup) throw new Error('Release deploy with a `migrate` hook requires a `backup` hook (no consistent pre-migration snapshot otherwise).');
+    if (!config.hooks.restore) throw new Error('Release deploy with a `migrate` hook requires a `restore` hook (recovery from a failed migration would otherwise be manual-only).');
+  }
   const mvGnu = capture(paths.root, 'mv --version 2>/dev/null | head -1', config, ctx);
   if (!/GNU|coreutils/i.test(mvGnu)) {
     throw new Error('Release deploy requires GNU coreutils `mv` (for the atomic `mv -T` symlink swap); not detected on target.');
   }
+  // A full filesystem during `npm ci` can corrupt the live SQLite app, so an
+  // UNREADABLE disk result must also abort — fail closed, not open.
   const avail = parseInt(capture(paths.root, `df -kP ${paths.root} | awk 'NR==2{print $4}'`, config, ctx), 10);
-  if (Number.isFinite(avail) && avail < MIN_FREE_KIB) {
+  if (!Number.isFinite(avail)) {
+    throw new Error(`Could not read free disk on ${paths.root} (df returned no usable value); refusing to deploy.`);
+  }
+  if (avail < MIN_FREE_KIB) {
     throw new Error(`Insufficient free disk on ${paths.root}: ${avail} KiB free, need >= ${MIN_FREE_KIB} KiB.`);
   }
 }
@@ -219,7 +249,27 @@ function deployRelease(config, options = {}, ctx = {}) {
 
   const steps = [];
   // Mutable state the recovery machine reads. phase names match the failure table.
-  const st = { phase: 'preflight', dbAppsPaused: false, flipped: false, prevTarget: null, releaseDir: null, sha: null, backupId: null, migrated: false };
+  const st = { phase: 'preflight', dbAppsPaused: false, flipped: false, prevTarget: null, releaseDir: null, releaseId: null, sha: null, backupId: null, migrated: false };
+
+  // Durably journal the disruptive-phase state BEFORE each irreversible op, so a
+  // process/SSH/power loss leaves an on-host record of whether the DB was migrated
+  // and which backup restores it (recovery on the next invocation is a follow-up;
+  // this at least makes the truth recoverable instead of lost in process memory).
+  const journal = () => persistState(config, paths, {
+    phase: st.phase, releaseId: st.releaseId, sha: st.sha, backupId: st.backupId,
+    migrated: st.migrated, flipped: st.flipped, prevTarget: st.prevTarget,
+  }, c);
+
+  // Stop the DB-bound apps and PROVE they are actually stopped (a zero-exit
+  // `pm2 stop` is not proof; writers left online would corrupt the backup/restore).
+  // Returns true only when every dbBoundApp is confirmed not-online.
+  const stopWritersConfirmed = () => {
+    if (!config.dbBoundApps.length) return true;
+    runInDir(paths.root, `pm2 stop ${config.dbBoundApps.join(' ')}`, config, c, { tolerate: true });
+    const snap = readPm2(config, paths, c);
+    if (!snap) return false;
+    return config.dbBoundApps.every((n) => !snap[n] || !snap[n].online);
+  };
 
   const resumePrevious = () => {
     // Bring the previous release's apps back and verify it is actually healthy —
@@ -230,7 +280,8 @@ function deployRelease(config, options = {}, ctx = {}) {
 
   const restoreDb = () => {
     if (!config.hooks.restore) return false;
-    const env = st.backupId ? `DEPLOY_KIT_BACKUP_ID=${st.backupId} ` : '';
+    // backupId is validated to a safe charset before migrate; single-quote anyway.
+    const env = st.backupId ? `DEPLOY_KIT_BACKUP_ID='${st.backupId}' ` : '';
     const res = runInDir(paths.root, `${env}${config.hooks.restore}`, config, c, { tolerate: true });
     return res.ok;
   };
@@ -260,8 +311,15 @@ function deployRelease(config, options = {}, ctx = {}) {
       case 'migrated':
       case 'flipped':
       case 'verify': {
-        // Schema changed and/or symlink flipped. Flip back first if needed, restore
-        // the DB (old code may not run against the new schema), then resume previous.
+        // Schema changed and/or symlink flipped. Order matters: the candidate may be
+        // running and writing to the DB, so STOP all writers and confirm they are down
+        // BEFORE restoring — otherwise the restore races live writes (Codex #1). Then
+        // flip current back and resume the previous release.
+        if (st.migrated) {
+          if (!stopWritersConfirmed()) {
+            fail('a migration ran but DB writers could not be confirmed stopped; do NOT restore over live writers — resolve by hand');
+          }
+        }
         if (st.flipped && st.prevTarget) {
           log.warning(`Flipping current back to ${st.prevTarget}`);
           activateSymlink(config, paths, st.prevTarget, c, { tolerate: true });
@@ -310,6 +368,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     if (!/^[0-9a-f]{40}$/.test(st.sha)) throw new Error(`Could not resolve ${config.remote}/${branch} to a SHA (got "${st.sha}")`);
     const ts = capture(paths.root, 'date -u +%Y%m%dT%H%M%SZ', config, c);
     const releaseId = `${st.sha.slice(0, 12)}-${ts}`;
+    st.releaseId = releaseId;
     st.releaseDir = `${paths.releasesDir}/${releaseId}`;
     log.step(`Materializing release ${releaseId} at ${st.sha.slice(0, 12)}`);
     runInDir(paths.root, `git --git-dir=${paths.repoGit} worktree add --detach ${st.releaseDir} ${st.sha}`, config, c);
@@ -355,18 +414,33 @@ function deployRelease(config, options = {}, ctx = {}) {
     steps.push('validate');
 
     // ================= disruptive window opens =================
+    // From here a failure can leave production stopped or the schema changed, so we
+    // MUST have a validated known-good release to fall back to. Refuse to proceed if
+    // `current` is missing or not a safe releases/<id> target.
+    const opensDisruptive = !skipMigrate && (config.dbBoundApps.length || config.hooks.migrate);
+    if (opensDisruptive) assertSafeTarget(st.prevTarget, 'current (known-good)');
+
     if (!skipMigrate && config.dbBoundApps.length) {
-      // Codex ordering: stop writers FIRST, THEN back up (consistent snapshot), THEN migrate.
+      // Codex ordering: stop writers FIRST, THEN back up (consistent snapshot), THEN
+      // migrate. The stop is GATED and verified — writers left online would corrupt
+      // the backup and defeat the consistent-snapshot guarantee.
       st.phase = 'stopped';
+      journal();
       log.step(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`);
-      runInDir(paths.root, `pm2 stop ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, config, c, { tolerate: true });
+      if (!stopWritersConfirmed()) throw new Error(`Could not confirm DB-bound apps (${config.dbBoundApps.join(', ')}) stopped before backup/migrate`);
       st.dbAppsPaused = true;
     }
     if (!skipMigrate && config.hooks.backup) {
       log.step('Backing up the database (writers stopped)');
       const res = runInDir(st.releaseDir, config.hooks.backup, config, c, { capture: true });
       if (!res.ok) throw new Error('Pre-migration database backup failed');
-      st.backupId = (res.output || '').trim().split('\n').pop() || null;
+      // The backup hook must print a restorable id/path as its last non-empty stdout
+      // line. Validate it to a safe charset before it is interpolated into restore.
+      const lines = (res.output || '').split('\n').map((s) => s.trim()).filter(Boolean);
+      st.backupId = lines.length ? lines[lines.length - 1] : null;
+      if (config.hooks.migrate && (!st.backupId || !/^[A-Za-z0-9._/-]+$/.test(st.backupId))) {
+        throw new Error(`Backup hook did not emit a safe restorable id as its last line (got "${st.backupId || ''}"); refusing to migrate without a usable restore point`);
+      }
       steps.push('backup');
     }
     if (!skipMigrate && config.hooks.migrate) {
@@ -375,6 +449,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       // resume the previous (possibly-incompatible) code.
       st.phase = 'migrated';
       st.migrated = true;
+      journal();
       log.step('Running database migrations');
       runInDir(st.releaseDir, config.hooks.migrate, config, c);
       steps.push('migrate');
@@ -382,8 +457,13 @@ function deployRelease(config, options = {}, ctx = {}) {
 
     // ---- Phase: flip (atomic activation) ----
     st.phase = 'flipped';
-    // Record the known-good pointer, then flip.
-    if (st.prevTarget) activateSymlink(config, paths, st.prevTarget, c, { link: paths.previousLink });
+    journal();
+    // Point `previous` at the old current (the known-good fallback) before flipping
+    // `current` forward. Only when the old target is a safe releases/<id> value — a
+    // pure code deploy with no prior current just skips the previous update.
+    if (st.prevTarget && RELEASE_TARGET_RE.test(st.prevTarget)) {
+      activateSymlink(config, paths, st.prevTarget, c, { link: paths.previousLink });
+    }
     activateSymlink(config, paths, `releases/${releaseId}`, c);
     st.flipped = true;
     steps.push('flip');
@@ -399,7 +479,8 @@ function deployRelease(config, options = {}, ctx = {}) {
     steps.push('health');
 
     // ---- Phase: metadata + prune (success; still holding the lock) ----
-    writeState(config, paths, { current: `releases/${releaseId}`, previous: st.prevTarget, sha: st.sha, backupId: st.backupId, ts }, c);
+    st.phase = 'done';
+    persistState(config, paths, { phase: 'done', current: `releases/${releaseId}`, previous: st.prevTarget, sha: st.sha, backupId: st.backupId, migrated: st.migrated, ts }, c);
     prune(config, paths, releaseId, c);
     steps.push('prune');
 
@@ -430,27 +511,42 @@ function activateSymlink(config, paths, relTarget, ctx, { link, tolerate = false
   }
 }
 
-// Persist explicit release metadata (never inferred). Written only after a verified
-// activation, while the lock is held.
-function writeState(config, paths, state, ctx) {
+// Persist explicit release metadata (never inferred) ATOMICALLY: write a same-dir
+// temp file then `mv -f` over the state file, so an interruption can never leave a
+// truncated/empty state. Gated — a failed write aborts rather than silently
+// reporting success. Used both for durable journaling and the final success record.
+function persistState(config, paths, state, ctx) {
   const json = JSON.stringify({ ...state, layoutVersion: LAYOUT_VERSION }).replace(/'/g, "'\\''");
-  runOnTarget(`printf '%s' '${json}' > ${paths.stateFile}`, { ...config, projectDir: paths.root }, { runtime: ctx.runtime });
+  const tmp = `${paths.stateFile}.tmp.$$`;
+  const cmd = `printf '%s' '${json}' > ${tmp} && mv -f ${tmp} ${paths.stateFile}`;
+  const res = runOnTarget(cmd, { ...config, projectDir: paths.root }, { runtime: ctx.runtime });
+  if (!res.ok) throw new Error(`Failed to persist release metadata (${paths.stateFile})`);
 }
 
-// Prune releases beyond keepReleases. Never removes current/previous or the just-
-// activated release; only ever touches paths under releases/; uses git-aware
-// removal. Runs post-activation holding the lock.
+// A materialized release id is `<sha>-<UTCtimestamp>`. Pruning only ever considers
+// directories matching this grammar (so an unexpected filename can't be shell-
+// injected into `rm`/`worktree remove`), and lexical sort == chronological because
+// the timestamp is fixed-width.
+const RELEASE_ID_RE = /^[0-9a-f]{7,40}-\d{8}T\d{6}Z$/;
+
+// Prune old releases down to keepReleases total, NEVER removing current/previous or
+// the just-activated release, only ever touching recognized ids under releases/, via
+// git-aware removal. Runs post-activation holding the lock.
 function prune(config, paths, keepId, ctx) {
-  const keep = config.layout.keepReleases || 4;
+  const keepN = Math.max(1, config.layout.keepReleases || 4);
   const pointers = readPointers(config, paths, ctx);
-  const protectedIds = new Set([keepId,
-    pointers.current && pointers.current.replace('releases/', ''),
-    pointers.previous && pointers.previous.replace('releases/', '')].filter(Boolean));
+  const idOf = (t) => (t && t.startsWith('releases/') ? t.slice('releases/'.length) : null);
+  const protectedIds = new Set([keepId, idOf(pointers.current), idOf(pointers.previous)].filter(Boolean));
   const listing = capture(paths.root, `ls -1 ${paths.releasesDir} 2>/dev/null || true`, config, ctx);
-  const all = listing.split('\n').map((s) => s.trim()).filter(Boolean).sort(); // ts is fixed-width → lexical == chronological
-  const removable = all.filter((id) => !protectedIds.has(id));
-  const excess = removable.slice(0, Math.max(0, removable.length - Math.max(0, keep - 1)));
-  for (const id of excess) {
+  const entries = listing.split('\n').map((s) => s.trim()).filter(Boolean);
+  const matching = entries.filter((id) => RELEASE_ID_RE.test(id)).sort().reverse(); // newest first
+  for (const id of entries) if (!RELEASE_ID_RE.test(id)) ctx.log.warning(`Prune: leaving unrecognized entry in releases/: ${id}`);
+
+  // Retain protected ids plus the newest releases up to keepN total; delete the rest.
+  const retain = new Set(protectedIds);
+  for (const id of matching) { if (retain.size >= keepN) break; retain.add(id); }
+  const toRemove = matching.filter((id) => !retain.has(id));
+  for (const id of toRemove) {
     const dir = `${paths.releasesDir}/${id}`;
     ctx.log.step(`Pruning old release ${id}`);
     runOnTarget(`git --git-dir=${paths.repoGit} worktree remove --force ${dir} 2>/dev/null || rm -rf ${dir}`, { ...config, projectDir: paths.root }, { runtime: ctx.runtime });
@@ -473,16 +569,29 @@ function rollbackRelease(config, options = {}, ctx = {}) {
     preflight(config, paths, c);
     const pointers = readPointers(config, paths, c);
     if (!pointers.previous) throw new Error(`No previous release recorded (${paths.previousLink}); cannot roll back.`);
-    const target = capture(paths.root, `readlink -f ${paths.previousLink}`, config, c);
-    if (!target) throw new Error('previous symlink does not resolve to a release directory.');
+    assertSafeTarget(pointers.previous, 'previous');
+    // Remember what current pointed at so a failed rollback can flip back to it
+    // instead of leaving a broken `previous` release serving traffic.
+    const originalCurrent = pointers.current;
 
     log.step(`Flipping current back to ${pointers.previous}`);
     activateSymlink(config, paths, pointers.previous, c);
-    runInDir(paths.root, pm2Activate(config, paths), config, c);
+    runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
     runInDir(paths.root, 'pm2 save 2>/dev/null || true', config, c, { tolerate: true });
 
     const v = verifyActivation(config, paths, null, `${paths.root}/${pointers.previous}`, c);
-    if (!v.ok) throw new Error(`Rollback flip verification failed: ${v.reason}`);
+    if (!v.ok) {
+      // The target release did not come up. Restore the release that WAS running.
+      log.error(`Rollback target unhealthy (${v.reason}); flipping back to ${originalCurrent}`);
+      if (originalCurrent && RELEASE_TARGET_RE.test(originalCurrent)) {
+        activateSymlink(config, paths, originalCurrent, c, { tolerate: true });
+        runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
+        const back = verifyActivation(config, paths, null, `${paths.root}/${originalCurrent}`, c);
+        if (!back.ok) throw new Error(`MANUAL RECOVERY REQUIRED — rollback target unhealthy AND the original release did not come back (${back.reason}).`);
+        throw new Error(`Rollback aborted: target ${pointers.previous} was unhealthy (${v.reason}); restored the original release ${originalCurrent}.`);
+      }
+      throw new Error(`MANUAL RECOVERY REQUIRED — rollback target unhealthy (${v.reason}) and no safe original release to restore.`);
+    }
 
     log.success(`Rolled back to ${pointers.previous}`);
     if (config.hooks.backup) {

@@ -195,6 +195,12 @@ function validateLayout(layout, source) {
         if (/[^A-Za-z0-9_./-]/.test(p)) {
           problems.push(`${source}: "layout.sharedPaths[${i}]" ("${p}") must not contain spaces or shell metacharacters`);
         }
+        // node_modules must NEVER be shared: a candidate `npm ci` would then mutate
+        // the dependency tree the live process is loading — the exact hazard this
+        // whole layout exists to remove. Reject it at any depth.
+        if (p.split('/').includes('node_modules')) {
+          problems.push(`${source}: "layout.sharedPaths[${i}]" ("${p}") must not share node_modules (it would be mutated by the candidate install)`);
+        }
         const norm = p.replace(/\/+$/, '');
         for (const other of seen) {
           if (norm === other || norm.startsWith(`${other}/`) || other.startsWith(`${norm}/`)) {

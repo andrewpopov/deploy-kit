@@ -29,10 +29,18 @@ untouched until it adds a `layout` block.
   window — so an old process answering 200 can't mask a failed flip.
 - **DB-aware recovery state machine.** Recovery is phase-specific: a failed
   install/build/validate just quarantines the candidate (current never touched);
-  a failure after the schema changed restores the pre-migration backup
-  (`hooks.restore`, given `DEPLOY_KIT_BACKUP_ID`) and resumes the previous release
-  — or aborts with a loud `MANUAL RECOVERY REQUIRED` and the backup id rather than
-  resuming stale code on a new schema. `SIGINT`/`SIGTERM` run the same machine.
+  a failure after the schema changed **stops and confirms all DB writers are down**,
+  restores the pre-migration backup (`hooks.restore`, given `DEPLOY_KIT_BACKUP_ID`)
+  and resumes the previous release — or aborts with a loud `MANUAL RECOVERY REQUIRED`
+  and the backup id rather than resuming stale code on a new schema. `SIGINT`/`SIGTERM`
+  run the same machine, and each disruptive phase is **durably journaled**
+  (atomic write) to `.deploy-kit-state.json` before the irreversible step, so a
+  process/SSH/power loss leaves an on-host record of what needs restoring.
+- **The writer stop is gated and verified** (a zero-exit `pm2 stop` is not proof —
+  the backup only runs once every `dbBoundApp` is confirmed not-online), the
+  disruptive window refuses to open without a validated known-good `current`
+  pointer to fall back to, and `rollback` flips back to the running release if its
+  target comes up unhealthy.
 - **`rollback` under `layout`** is an instant symlink flip to the `previous`
   release (already built — no reinstall/rebuild), with a warning that a schema
   rollback is a separate, explicit data-loss decision.
