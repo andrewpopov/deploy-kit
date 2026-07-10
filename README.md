@@ -10,7 +10,7 @@ the Raspberry-Pi service fleet (bewks, kira, smarthome, stoki, sano). Extracts t
 Pin the latest tag (tags are immutable — always pin `vX.Y.Z`, never a branch):
 
 ```
-npm install github:andrewpopov/deploy-kit#v0.6.0
+npm install github:andrewpopov/deploy-kit#v0.6.1
 ```
 
 ## Quick start
