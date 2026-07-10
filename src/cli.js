@@ -49,6 +49,7 @@ Commands:
   deploy [--skip-build|--skip-deps|--skip-migrate]
          [--no-stash] [--dry-run] [--steal-lock] [--no-lock]
   rollback [--skip-build|--skip-deps] [--steal-lock]
+  monitor                                  run fleet checks + alert on transitions (cron)
   status | health | dashboard | resources | git
   start | stop | restart
   logs [--lines N] [--follow] [--errors]
@@ -113,6 +114,17 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd() } = {}) {
       } catch (error) {
         log.error(error instanceof Error ? error.message : String(error));
         return 1;
+      }
+    case 'monitor':
+      try {
+        if (!config.monitor) {
+          log.error('No `monitor` config block — add one to enable `deploy-kit monitor` (see MonitorConfig).');
+          return 2;
+        }
+        return require('./monitor').monitor(config, options).exitCode; // 0 ok/warn · 1 crit · 2 monitor error
+      } catch (error) {
+        log.error(error instanceof Error ? error.message : String(error));
+        return 2;
       }
     case 'status': return remote.status(config) ? 0 : 1;
     case 'health': return remote.health(config) ? 0 : 1;

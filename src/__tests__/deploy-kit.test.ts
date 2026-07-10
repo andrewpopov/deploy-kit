@@ -374,7 +374,7 @@ describe('stepTimeoutSeconds', () => {
     };
     const result = runOnTarget('npm ci', { ...baseConfig, stepTimeoutSeconds: 900 }, { runtime });
     expect(result.ok).toBe(false);
-    expect(result.error.message).toMatch(/exceeded the 900s stepTimeoutSeconds bound/);
+    expect(result.error.message).toMatch(/exceeded the 900s timeout bound/);
     expect(result.error.message).toMatch(/npm ci/);
   });
 });
@@ -673,5 +673,72 @@ describe('cli argument safety (BWK-136)', () => {
     // Whatever the version, an unrecognised safety flag must now be fatal.
     expect(() => cli.parseOptions(['--dry-run-please'])).toThrow(/Unknown argument/);
     expect(cli.parseOptions(['--dry-run']).dryRun).toBe(true);
+  });
+});
+
+describe('exec: stdin input seam (injection-safe data passing)', () => {
+  it('feeds `input` to the command via execFileSync options, not the shell string', () => {
+    let seenOpts: any = null;
+    let seenCmd = '';
+    const runtime = {
+      execFileSync: (_f: string, args: string[], opts: any) => { seenCmd = args[args.length - 1]; seenOpts = opts; return ''; },
+    };
+    const payload = `{"msg":"has 'quotes' and\nnewlines & $(danger)"}`;
+    runOnTarget('send-alert', baseConfig, { runtime, input: payload });
+    expect(seenOpts.input).toBe(payload);          // data goes through stdin
+    expect(seenCmd).not.toContain('danger');        // never interpolated into the command
+    expect(seenCmd).toContain('send-alert');
+  });
+  it('per-call timeoutSeconds overrides the config bound', () => {
+    let seenOpts: any = null;
+    const runtime = { execFileSync: (_f: string, _a: string[], opts: any) => { seenOpts = opts; return ''; } };
+    runOnTarget('x', mergeConfig(baseConfig, { stepTimeoutSeconds: 1800 }), { runtime, timeoutSeconds: 5 });
+    expect(seenOpts.timeout).toBe(5000);
+  });
+});
+
+describe('monitor config validation', () => {
+  const withMon = (mon: any) => validateConfig({ ...baseConfig, monitor: mon }, { source: 'cfg' });
+  const okMon = {
+    disk: { minFreeKiB: 524288, minFreeInodes: 10000 },
+    backup: { id: 'db', stampFile: '/var/lib/app/backups/.last-success', maxAgeHours: 30 },
+    restartStorm: { maxDelta: 3 },
+    tunnel: true,
+    publicProbes: [{ id: 'api', url: 'https://app.example.com/health', expectStatus: 200 }],
+    checks: [{ id: 'providers', command: 'curl -sf localhost:3002/ready', level: 'warn' }],
+    alert: { command: 'curl -sf -d @- https://app/notify', run: 'controller' },
+    failAfterRuns: 2, recoverAfterRuns: 2, reAlertAfterMinutes: 15,
+    stateFile: '/var/lib/app/deploy-kit-monitor-state.json',
+    checkTimeoutSeconds: 20,
+  };
+  it('accepts a fully-specified valid monitor block', () => {
+    expect(withMon(okMon)).toEqual([]);
+  });
+  it('requires an alert sink command', () => {
+    const { alert, ...noAlert } = okMon;
+    expect(withMon(noAlert).join('\n')).toMatch(/monitor\.alert\.command.* is required/);
+  });
+  it('rejects a bad alert.run location', () => {
+    expect(withMon({ ...okMon, alert: { command: 'x', run: 'nowhere' } }).join('\n')).toMatch(/alert\.run.*controller.*target/);
+  });
+  it('rejects duplicate probe/check ids (state would collide)', () => {
+    const dup = { ...okMon, checks: [{ id: 'api', command: 'x' }] }; // 'api' already used by a probe
+    expect(withMon(dup).join('\n')).toMatch(/duplicate monitor id "api"/);
+  });
+  it('rejects a probe URL with shell metacharacters', () => {
+    expect(withMon({ ...okMon, publicProbes: [{ id: 'x', url: 'https://a/$(rm -rf)' }] }).join('\n')).toMatch(/url must be an http\(s\) URL/);
+  });
+  it('rejects an unknown monitor key and a bad threshold', () => {
+    const probs = withMon({ ...okMon, bogus: 1, failAfterRuns: 0 }).join('\n');
+    expect(probs).toMatch(/unknown monitor key "bogus"/);
+    expect(probs).toMatch(/monitor\.failAfterRuns.*positive integer/);
+  });
+  it('rejects shell metacharacters in stateFile and backup.stampFile (injection)', () => {
+    expect(withMon({ ...okMon, stateFile: '/var/lib/x; rm -rf /' }).join('\n')).toMatch(/stateFile.*shell metacharacters/);
+    expect(withMon({ ...okMon, backup: { id: 'db', stampFile: '/var/lib/$(id)', maxAgeHours: 30 } }).join('\n')).toMatch(/stampFile.*shell metacharacters/);
+  });
+  it('rejects a single quote in a probe header (would break curl quoting)', () => {
+    const bad = { ...okMon, publicProbes: [{ id: 'api', url: 'https://app/health', headers: { Authorization: "Bearer x' ; id" } }] };
+    expect(withMon(bad).join('\n')).toMatch(/headers\["Authorization"\].*single quote/);
   });
 });

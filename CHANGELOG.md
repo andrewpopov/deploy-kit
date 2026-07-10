@@ -7,6 +7,38 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.8.0
+
+Shared fleet monitoring + alerting (SMH-116, absorbs the app-agnostic parts of
+SMH-152/155). Opt-in; every existing app is untouched until it adds a `monitor` block.
+
+- **New — `deploy-kit monitor`** and a `monitor: {…}` config block. Runs generic ops
+  checks on a cron and routes ACTIONABLE alerts through a policy-free sink. Built-in
+  checks (each opt-out by omitting its key; pm2 always on): **pm2** app-online (per
+  app), **restart-storm** (pm2 restart-count jump beyond `maxDelta`, reset-safe),
+  **disk** (free bytes OR inodes), **backup** freshness (stamp mtime), **tunnel**
+  process, **public** endpoint probes (curl status/body — proves DNS+ingress+TLS+
+  routing), and **custom** app commands (the seam for app-specific signals like
+  provider/scheduler readiness — statically-severitied, so a provider outage never
+  flaps liveness).
+- **Alerting is safe by construction.** Every check yields a stable id and a status of
+  `ok|warn|crit|unknown` — `unknown` (can't determine: ssh/command failure, unparseable
+  output) never counts as ok or a recovery. Cross-run **debounce** (`failAfterRuns`/
+  `recoverAfterRuns`) rides out flapping; alerts are **batched** into one event per run
+  (so one incident isn't four correlated alerts); an **outbox** persists the pending
+  event before sending and retains it for retry on failure (at-least-once, with a stable
+  `eventId` for sink-side dedup). A run **lock** (separate from the deploy lock) stops
+  overlapping crons; state is versioned and written atomically over stdin.
+- **Policy-free + injection-safe.** The alert sink is a command that receives the batch
+  as JSON on **stdin** (`run: 'controller'|'target'` picks where it runs — controller is
+  robust when the monitored app is what's down); deploy-kit ships no transport. Probe
+  URLs/headers and state/stamp paths are validated (https, unique safe ids, no shell
+  metacharacters, no single-quoted-header escape) and never shell-concatenated.
+- **New exec capability:** `runOnTarget` accepts `input` (fed to the command's stdin,
+  ssh-forwarded) and a per-call `timeoutSeconds` — the injection-safe way to pass
+  arbitrary data to a target command. Exit codes: `0` ok/warn · `1` crit · `2` monitor
+  error. Design + code independently reviewed by Codex (design + implementation).
+
 ## 0.7.1
 
 Two release-layout fixes, both caught by the mandatory throwaway-PM2 test on the

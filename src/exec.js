@@ -40,19 +40,33 @@ function buildTargetCommand(command, { mode, host, projectDir, ssh }) {
 
 // Run one command on the target. Returns { ok, output }. With capture:false the
 // child inherits stdio (live logs); with capture:true stdout is returned.
-function runOnTarget(command, config, { capture = false, runtime } = {}) {
+//
+// `input` (a string) is fed to the command's STDIN — the injection-safe way to
+// hand arbitrary data (a JSON alert payload, a message) to a target command without
+// interpolating it into the shell string. ssh forwards stdin to the remote command,
+// so it works in both modes. `timeoutSeconds` overrides the per-command bound for
+// this call (monitor checks want short bounds, not the 30-minute deploy default).
+function runOnTarget(command, config, { capture = false, runtime, input, timeoutSeconds } = {}) {
   const { execFileSync } = normalizeRuntime(runtime);
   const { file, args } = buildTargetCommand(command, config);
+  const hasInput = input != null;
   const execOptions = {
     encoding: 'utf8',
-    stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
+    // stdin is a pipe when we're feeding `input`, otherwise ignored (capture) or
+    // inherited (live). stdout/stderr are captured or inherited as before.
+    stdio: [hasInput ? 'pipe' : (capture ? 'ignore' : 'inherit'),
+      capture ? 'pipe' : 'inherit',
+      capture ? 'pipe' : 'inherit'],
   };
+  if (hasInput) execOptions.input = input;
   // Kill a hung remote command instead of blocking the pipeline forever. deploy.js
   // holds an atomic lock for the whole run, so a step that never returns blocks
   // every subsequent deploy until someone runs --steal-lock. Enabled by default;
-  // an explicit `stepTimeoutSeconds: null` opts out.
-  if (config.stepTimeoutSeconds) {
-    execOptions.timeout = config.stepTimeoutSeconds * 1000;
+  // an explicit `stepTimeoutSeconds: null` opts out. A per-call `timeoutSeconds`
+  // wins when given (0/null → no bound).
+  const bound = timeoutSeconds !== undefined ? timeoutSeconds : config.stepTimeoutSeconds;
+  if (bound) {
+    execOptions.timeout = bound * 1000;
     execOptions.killSignal = 'SIGKILL';
   }
   try {
@@ -63,7 +77,7 @@ function runOnTarget(command, config, { capture = false, runtime } = {}) {
     // operator nothing about which step hung or what the bound was.
     if (error && error.code === 'ETIMEDOUT') {
       error.message =
-        `Step exceeded the ${config.stepTimeoutSeconds}s stepTimeoutSeconds bound and was killed: ${command}`;
+        `Step exceeded the ${bound}s timeout bound and was killed: ${command}`;
     }
     return { ok: false, output: capture ? String(error.stdout || '') : '', error };
   }
