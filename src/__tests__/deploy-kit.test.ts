@@ -616,10 +616,12 @@ describe('tunnel', () => {
 });
 
 describe('cli', () => {
-  it('parseOptions parses flags and --lines arity, and no longer knows --force', () => {
+  it('parseOptions parses flags and --lines arity, and REJECTS the removed --force', () => {
     const o = cli.parseOptions(['--lines', '99', '--follow', '--errors', '--skip-build', '--dry-run', '--steal-lock', '--no-lock', '--no-stash']);
     expect(o).toMatchObject({ lines: 99, follow: true, errors: true, skipBuild: true, dryRun: true, stealLock: true, lock: false, stash: false });
-    expect(cli.parseOptions(['--force'])).not.toHaveProperty('force');
+    // `--force` was removed. Silently ignoring it let a caller believe it still
+    // did something; it now throws, exactly as a removed CONFIG key does (BWK-136).
+    expect(() => cli.parseOptions(['--force'])).toThrow(/Unknown argument: --force/);
   });
   it('help returns 0 for empty/help/-h', () => {
     expect(cli.run([], { cwd: '/x' })).toBe(0);
@@ -640,5 +642,36 @@ describe('cli', () => {
     } finally {
       fsMod.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('cli argument safety (BWK-136)', () => {
+  it('rejects an unknown flag instead of silently ignoring it', () => {
+    // Silently ignoring an unknown flag is dangerous exactly for the flag an
+    // operator reaches for when being careful. A typo'd --dry-rn would otherwise
+    // run a full production deploy while they believe nothing will happen.
+    expect(() => cli.parseOptions(['--dry-rn'])).toThrow(/Unknown argument: --dry-rn/);
+    expect(() => cli.parseOptions(['--totally-bogus'])).toThrow(/Unknown argument/);
+    // The error names the valid options.
+    expect(() => cli.parseOptions(['--nope'])).toThrow(/--dry-run/);
+  });
+
+  it('still accepts every documented flag', () => {
+    expect(cli.parseOptions(['--dry-run'])).toMatchObject({ dryRun: true });
+    expect(cli.parseOptions(['--skip-build', '--skip-deps', '--skip-migrate'])).toMatchObject({
+      skipBuild: true, skipDeps: true, skipMigrate: true,
+    });
+    expect(cli.parseOptions(['--no-stash'])).toMatchObject({ stash: false });
+    expect(cli.parseOptions(['--no-lock'])).toMatchObject({ lock: false });
+    expect(cli.parseOptions(['--steal-lock'])).toMatchObject({ stealLock: true });
+    expect(cli.parseOptions(['--lines', '20'])).toMatchObject({ lines: 20 });
+    expect(cli.parseOptions(['--follow', '--errors'])).toMatchObject({ follow: true, errors: true });
+  });
+
+  it('a mistyped --dry-run can never degrade into a real deploy', () => {
+    // The incident: deploy-kit 0.3.1 had no --dry-run, ignored it, and deployed.
+    // Whatever the version, an unrecognised safety flag must now be fatal.
+    expect(() => cli.parseOptions(['--dry-run-please'])).toThrow(/Unknown argument/);
+    expect(cli.parseOptions(['--dry-run']).dryRun).toBe(true);
   });
 });

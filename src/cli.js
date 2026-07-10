@@ -7,6 +7,16 @@ const { deploy, rollback } = require('./deploy');
 const { init } = require('./init');
 const remote = require('./remote');
 
+const KNOWN_FLAGS = [
+  '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
+  '--skip-migrate', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
+];
+
+// Reject anything we do not recognise. Silently ignoring an unknown flag is
+// dangerous precisely for the flag an operator reaches for when being careful:
+// a typo'd `--dry-rn`, or `--dry-run` passed to a version that predates it,
+// would otherwise run a FULL PRODUCTION DEPLOY while the operator believes
+// nothing will happen. That happened on 2026-07-10 (BWK-136).
 function parseOptions(args) {
   const options = { lines: 50 };
   for (let i = 0; i < args.length; i += 1) {
@@ -21,6 +31,11 @@ function parseOptions(args) {
     else if (a === '--dry-run') options.dryRun = true;
     else if (a === '--steal-lock') options.stealLock = true;
     else if (a === '--no-lock') options.lock = false;
+    else {
+      throw new Error(
+        `Unknown argument: ${a}\nValid options: ${KNOWN_FLAGS.join(', ')}`
+      );
+    }
   }
   return options;
 }
@@ -61,6 +76,12 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd() } = {}) {
     return 0;
   }
   const options = parseOptions(argv.slice(1));
+  // Surface the resolved version: a stale node_modules (manifest pinned newer
+  // than what is installed) is otherwise invisible until a flag silently
+  // misbehaves. See BRAIN-18 — `npm install` does not re-resolve a github: tag.
+  if (!options.dryRun) {
+    log.info(`deploy-kit v${require('../package.json').version}`);
+  }
 
   if (command === 'init') {
     init({ cwd });
@@ -110,7 +131,14 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd() } = {}) {
 }
 
 if (require.main === module) {
-  process.exit(run());
+  try {
+    process.exit(run());
+  } catch (error) {
+    // A bad argument is an operator mistake, not a crash. Print it the way an
+    // unknown COMMAND is printed, and exit non-zero.
+    log.error(error.message);
+    process.exit(1);
+  }
 }
 
 module.exports = { run, parseOptions };

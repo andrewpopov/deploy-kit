@@ -7,6 +7,31 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.6.1
+
+**Fix — an unknown flag was silently ignored. A typo could run a real production
+deploy.**
+
+`parseOptions` matched the flags it knew and dropped everything else on the
+floor. That is dangerous for exactly the flag an operator reaches for when being
+careful: a typo'd `--dry-rn`, or `--dry-run` passed to a version that predates
+it, ran a **full production deploy** while the operator believed nothing would
+happen.
+
+This is not hypothetical. On 2026-07-10 a checkout whose `node_modules` held
+0.3.1 while its manifest pinned v0.6.0 (see BRAIN-18: `npm install` never
+re-resolves a `github:` tag) ran `deploy-kit deploy --dry-run` and deployed for
+real. Two failures compounded: an unknown flag was ignored, and a **safety** flag
+that did not exist in the installed version degraded to the **unsafe** behaviour.
+
+- Any unrecognised argument now throws, naming the valid options. This includes
+  the long-removed `--force`, which was previously ignored — the same treatment a
+  removed *config* key already gets.
+- A bad argument prints like an unknown command and exits 1, rather than dumping
+  a stack trace.
+- Every real run now logs `deploy-kit v<version>` first, so a stale install is
+  visible in the deploy log instead of only surfacing when a flag misbehaves.
+
 ## 0.6.0
 
 Conformance with the shared package standards
