@@ -23,7 +23,7 @@ function makeReleaseRuntime(over: any = {}) {
     canonical: '/srv/app/releases/a1b2c3d4e5f6a1b2-20260710T090000Z',
     runningSha: SHA,
     restartTime: 5,
-    backupId: 'backup-2026-07-10',
+    backupId: '/var/lib/smarthome/backups/smarthome-20260710T090000Z.db.gpg', // absolute path, the real shape
     releasesList: 'a1b2c3d4e5f6a1b2-20260710T090000Z\n00000000aaaa-20260709T090000Z\n00000000bbbb-20260708T090000Z',
     currentLink: 'releases/00000000aaaa-20260709T090000Z',
     previousLink: 'releases/00000000bbbb-20260708T090000Z',
@@ -120,6 +120,23 @@ describe('release deploy — happy path', () => {
     expect(idx('pm2 stop app')).toBeLessThan(idx('run-backup'));
     expect(idx('run-backup')).toBeLessThan(idx('run-migrate'));
     expect(idx('run-migrate')).toBeLessThan(calls.findIndex((cmd) => /mv -Tf .*\/current/.test(cmd)));
+  });
+
+  it('resolves the SHA from refs/heads/<branch> when origin/<branch> does not exist (bare clone)', () => {
+    // `git clone --bare` maps heads->heads: origin/master does NOT resolve (rev-parse
+    // echoes the literal arg), but refs/heads/master does. Deploy must still succeed.
+    const rt = makeReleaseRuntime();
+    const runtime = {
+      execFileSync: (_f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        if (cmd.includes('rev-parse origin/master')) return 'origin/master'; // unresolved
+        if (cmd.includes('rev-parse refs/heads/master')) return SHA;
+        return (rt.runtime.execFileSync as any)(_f, args);
+      },
+    };
+    const result = release.deployRelease(relConfig(), {}, ctx(runtime));
+    expect(result.sha).toBe(SHA);
+    expect(result.steps).toContain('flip');
   });
 
   it('restarts from the stable ecosystem (never a baked release path) and verifies cwd', () => {
@@ -221,7 +238,7 @@ describe('release deploy — failure recovery by phase', () => {
     const { runtime, calls } = makeReleaseRuntime({ fail: ['run-migrate'] });
     expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow();
     expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(true);
-    expect(calls.some((cmd) => cmd.includes("DEPLOY_KIT_BACKUP_ID='backup-2026-07-10'"))).toBe(true);
+    expect(calls.some((cmd) => cmd.includes("DEPLOY_KIT_BACKUP_ID='/var/lib/smarthome/backups/smarthome-20260710T090000Z.db.gpg'"))).toBe(true);
     expect(calls.some((cmd) => cmd.includes('pm2 startOrRestart'))).toBe(true);
   });
 

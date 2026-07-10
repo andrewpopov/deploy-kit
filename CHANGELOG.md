@@ -7,6 +7,25 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.7.1
+
+Two release-layout fixes, both caught by the mandatory throwaway-PM2 test on the
+actual Pi (bigpi) before the smarthome cutover — exactly why that gate exists.
+
+- **SHA resolution failed against a `git clone --bare` repo.** A bare clone maps
+  the remote's heads to LOCAL heads (`refs/heads/*`, no `refs/remotes/origin/*`),
+  so `git rev-parse origin/<branch>` did not resolve and the deploy aborted in the
+  `materialize` phase with *"Could not resolve origin/master to a SHA (got
+  'origin/master')"*. Now try `origin/<branch>` first, then fall back to
+  `refs/heads/<branch>`, covering both bare-clone and mirror layouts.
+- **The backup id validation wrongly rejected absolute paths.** A backup id is
+  normally an absolute path to the backup file (e.g.
+  `/var/lib/smarthome/backups/smarthome-<ts>.db.gpg`), but the v0.7.0 safe-id check
+  rejected any id starting with `/`, so every migrating deploy aborted in the
+  `stopped` phase with *"Backup hook did not emit a safe restorable id"*. Absolute
+  is now allowed; the check still rejects shell metacharacters (safe charset) and
+  `..` traversal, and the id is single-quoted into the restore command.
+
 ## 0.7.0
 
 Artifact-first release-layout deploys (SMH-112). Opt-in; every existing app is

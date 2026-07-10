@@ -404,8 +404,18 @@ function deployRelease(config, options = {}, ctx = {}) {
     log.step('Fetching into the bare repo');
     runInDir(paths.root, `git --git-dir=${paths.repoGit} fetch --prune ${config.remote}`, config, c);
     const branch = config.branch || 'master';
-    st.sha = capture(paths.root, `git --git-dir=${paths.repoGit} rev-parse ${config.remote}/${branch}`, config, c);
-    if (!/^[0-9a-f]{40}$/.test(st.sha)) throw new Error(`Could not resolve ${config.remote}/${branch} to a SHA (got "${st.sha}")`);
+    // Resolve the exact SHA. A repo created with `git clone --bare` maps the remote's
+    // heads to LOCAL heads (refs/heads/*, no refs/remotes/origin/*), so `origin/master`
+    // does not resolve there; a mirror clone does have `origin/master`. Try the
+    // remote-tracking ref first, then fall back to the local branch head — covering
+    // both bare-clone and mirror layouts. `git rev-parse` echoes the arg on failure,
+    // so validate the 40-hex result rather than trusting the exit code.
+    const resolveSha = (ref) => capture(paths.root, `git --git-dir=${paths.repoGit} rev-parse ${ref}`, config, c);
+    st.sha = resolveSha(`${config.remote}/${branch}`);
+    if (!/^[0-9a-f]{40}$/.test(st.sha)) st.sha = resolveSha(`refs/heads/${branch}`);
+    if (!/^[0-9a-f]{40}$/.test(st.sha)) {
+      throw new Error(`Could not resolve ${config.remote}/${branch} (or refs/heads/${branch}) to a SHA in ${paths.repoGit} (got "${st.sha}")`);
+    }
     const ts = capture(paths.root, 'date -u +%Y%m%dT%H%M%SZ', config, c);
     const releaseId = `${st.sha.slice(0, 12)}-${ts}`;
     st.releaseId = releaseId;
@@ -481,7 +491,11 @@ function deployRelease(config, options = {}, ctx = {}) {
       // Safe charset AND no absolute path / `..` traversal — the id may be used as a
       // path by the restore hook, so an absolute or traversing value could restore
       // the wrong file even though the single-quoting already blocks shell injection.
-      const safeBackupId = (id) => !!id && /^[A-Za-z0-9._/-]+$/.test(id) && !id.startsWith('/') && !id.split('/').includes('..');
+      // A backup id is typically an ABSOLUTE path to the backup file (e.g.
+      // /var/lib/smarthome/backups/smarthome-<ts>.db.gpg), so absolute is allowed.
+      // Reject only shell metacharacters (safe charset) and `..` traversal — the id
+      // is produced by our own backup hook and single-quoted into the restore command.
+      const safeBackupId = (id) => !!id && /^[A-Za-z0-9._/-]+$/.test(id) && !id.split('/').includes('..');
       if (config.hooks.migrate && !safeBackupId(st.backupId)) {
         throw new Error(`Backup hook did not emit a safe restorable id as its last line (got "${st.backupId || ''}"); refusing to migrate without a usable restore point`);
       }
