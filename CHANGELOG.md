@@ -7,6 +7,59 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.7.0
+
+Artifact-first release-layout deploys (SMH-112). Opt-in; every existing app is
+untouched until it adds a `layout` block.
+
+- **New — `layout: { type: 'releases', … }` (opt-in).** Switches an app from the
+  legacy in-place deploy (which runs `npm ci` + build **on the live worktree**,
+  the cause of smarthome's repeated `@prisma/client did not initialize yet`
+  crash-storms) to a Capistrano-style release layout. Each deploy materialises an
+  immutable release under `releases/<sha>-<ts>` from a **bare repo + detached
+  worktree**, installs and builds **inside that release** while the old `current`
+  keeps serving, validates it, and only then opens the disruptive window: stop
+  writers → backup → migrate → **atomic `current` symlink flip** (`mv -Tf`, a
+  namespace-atomic rename on ext4) → restart from a stable PM2 ecosystem. `npm ci`
+  and build never mutate the tree the live process runs from.
+- **Activation is verified, not assumed.** A deploy only succeeds when the health
+  endpoint returns 200, **every** managed PID's `/proc/<pid>/cwd` resolves to the
+  new release, the running app reports the deployed SHA (`layout.runningShaCommand`),
+  PM2 shows every app online, and restart counts stay flat across a settling
+  window — so an old process answering 200 can't mask a failed flip.
+- **DB-aware recovery state machine.** Recovery is phase-specific: a failed
+  install/build/validate just quarantines the candidate (current never touched);
+  a failure after the schema changed **stops and confirms all DB writers are down**,
+  restores the pre-migration backup (`hooks.restore`, given `DEPLOY_KIT_BACKUP_ID`)
+  and resumes the previous release — or aborts with a loud `MANUAL RECOVERY REQUIRED`
+  and the backup id rather than resuming stale code on a new schema. `SIGINT`/`SIGTERM`
+  run the same machine, and each disruptive phase is **durably journaled**
+  (atomic write) to `.deploy-kit-state.json` before the irreversible step, so a
+  process/SSH/power loss leaves an on-host record of what needs restoring. The
+  next deploy **refuses to start** if it finds an un-recovered interrupted phase
+  (loud "resolve by hand"); a successful recovery clears that state.
+- **The writer stop is gated and verified** (a zero-exit `pm2 stop` is not proof —
+  the backup only runs once every `dbBoundApp` is confirmed not-online), the
+  disruptive window refuses to open without a validated known-good `current`
+  pointer to fall back to, and `rollback` flips back to the running release if its
+  target comes up unhealthy.
+- **`rollback` under `layout`** is an instant symlink flip to the `previous`
+  release (already built — no reinstall/rebuild), with a warning that a schema
+  rollback is a separate, explicit data-loss decision.
+- **Safety rails.** Release deploy refuses a host with no completed layout marker
+  (`.deploy-kit-layout`, versioned) and never restructures a live root; a legacy
+  deploy/rollback refuses a host that **is** on the release layout; `sharedPaths`
+  are validated relative/non-overlapping and rejected if they'd hide a tracked
+  file; a free-disk and GNU-`mv` preflight fails closed. Explicit release metadata
+  (`.deploy-kit-state.json`) and pruning that only ever touches `releases/` and
+  never removes `current`/`previous`.
+- **New — `hooks.restore`** (nullable): restore the pre-migration DB backup during
+  release-layout recovery. `null` = no auto-restore.
+
+The one-time host migration (restructuring `/srv/<app>` into
+`releases/`+`shared/`+`current`) is a separate, explicit, reversible operation per
+app — deploy-kit does not perform it. smarthome is the pilot.
+
 ## 0.6.1
 
 **Fix — an unknown flag was silently ignored. A typo could run a real production

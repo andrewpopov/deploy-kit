@@ -6,6 +6,30 @@ export interface DeployHooks {
   migrate?: string | null;
   build?: string | null;
   restart?: string | null;
+  /** Restore the pre-migration DB backup during release-layout recovery. Receives
+   * the captured backup id as DEPLOY_KIT_BACKUP_ID. null = no auto-restore. */
+  restore?: string | null;
+}
+
+export interface ReleaseCheck {
+  name: string;
+  command: string;
+}
+
+/** Opt-in artifact-first release layout (SMH-112). Absent = legacy in-place deploy. */
+export interface ReleaseLayout {
+  type: 'releases';
+  /** Releases to retain when pruning (>= 1). Default 4. */
+  keepReleases?: number;
+  /** Relative paths symlinked from shared/ into every release (dirs, .env, uploads —
+   * never node_modules or a bare SQLite file with WAL/SHM sidecars). */
+  sharedPaths?: string[];
+  /** Commands run INSIDE the candidate release before activation (prisma client
+   * loads, entrypoint present). A non-zero exit quarantines the candidate. */
+  releaseChecks?: ReleaseCheck[];
+  /** Command that returns the SHA the live app reports; asserted == deployed SHA
+   * after the flip so an old process answering 200 can't mask a failed activation. */
+  runningShaCommand?: string;
 }
 
 export interface PreDeployCheck {
@@ -50,6 +74,8 @@ export interface DeployConfig {
   stepTimeoutSeconds?: number | null;
   lock?: boolean;
   buildBeforeMigrate?: boolean;
+  /** Opt-in artifact-first release layout (SMH-112). Absent/null = legacy in-place. */
+  layout?: ReleaseLayout | null;
   hooks: DeployHooks;
 }
 
@@ -81,6 +107,10 @@ export interface DeployResult {
   host: string | null;
   steps: string[];
   healthy: boolean;
+  /** Resolved deployed commit SHA (release layout only). */
+  sha?: string;
+  /** Activated release id, `<sha12>-<ts>` (release layout only). */
+  release?: string;
 }
 
 export interface Runtime {

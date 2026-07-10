@@ -59,6 +59,29 @@ const DEFAULT_CONFIG = {
   // Build before the backup/stop/migrate block (apps stay up during build) so the
   // paused window is just migration. Default false = build after migrate (paused).
   buildBeforeMigrate: false,
+  // Deploy layout. null (default) = legacy in-place deploy on the live worktree —
+  // exactly the behavior every app has today. An opt-in typed block switches an app
+  // to artifact-first release deploys (SMH-112): each deploy builds an immutable
+  // release under releases/, then an atomic `current` symlink flip activates it, so
+  // `npm ci`/build never mutate the tree the live process is running from. The host
+  // must be migrated to the release layout first (a completed layout marker); the
+  // kit refuses release-mode deploy otherwise and never restructures a live root.
+  //   layout: {
+  //     type: 'releases',
+  //     keepReleases: 4,                 // releases to retain when pruning (>=1)
+  //     sharedPaths: ['.env', 'packages/api/prisma/data'],  // relative; symlinked
+  //                                       // from shared/ into every release (dirs,
+  //                                       // .env, uploads — NEVER node_modules or a
+  //                                       // bare SQLite file with WAL/SHM sidecars)
+  //     releaseChecks: [{ name, command }],  // run INSIDE the candidate release
+  //                                       // before activation (prisma client loads,
+  //                                       // entrypoint present) — a non-zero exit
+  //                                       // quarantines the candidate, current stays.
+  //     runningShaCommand: 'curl -s localhost:PORT/health | jq -r .buildSha',
+  //                                       // returns the SHA the live app reports;
+  //                                       // asserted == the deployed SHA post-flip.
+  //   }
+  layout: null,
   // The framework-specific seams. Each is a shell command run on the target.
   hooks: {
     // Prefer the offline cache first so a GitHub outage can't break a deploy that
@@ -71,6 +94,11 @@ const DEFAULT_CONFIG = {
     // start-or-restart idiom (see pm2StartOrRestart). Set this only when a repo
     // needs a bespoke restart (e.g. a wrapper script).
     restart: null,
+    // Restore the pre-migration DB backup during release-layout recovery (SMH-112).
+    // Receives the captured backup id as DEPLOY_KIT_BACKUP_ID. null = no auto-restore;
+    // recovery after a failed migration then aborts loudly with MANUAL RECOVERY
+    // REQUIRED and the backup id, rather than resuming stale code on a new schema.
+    restore: null,
   },
 };
 
@@ -104,8 +132,87 @@ const KEY_TYPES = {
   stepTimeoutSeconds: 'number?',
   lock: 'boolean',
   buildBeforeMigrate: 'boolean',
+  layout: 'object?',
   hooks: 'object',
 };
+
+// Keys allowed inside a `layout` block, with their validators. Absence of most is
+// fine (deploy normalizes defaults); `type` is the only required key.
+const LAYOUT_KEYS = ['type', 'keepReleases', 'sharedPaths', 'releaseChecks', 'runningShaCommand'];
+
+// Validate the opt-in `layout` block. Returns human-readable problem strings.
+// Enforces Codex's shared-path safety rules at config time: relative, cannot
+// escape the release, and no two paths overlap (one being a prefix of another
+// would let one symlink hide the other).
+function validateLayout(layout, source) {
+  const problems = [];
+  for (const key of Object.keys(layout)) {
+    if (!LAYOUT_KEYS.includes(key)) {
+      problems.push(`${source}: unknown layout key "${key}" (valid: ${LAYOUT_KEYS.join(', ')})`);
+    }
+  }
+  if (layout.type !== 'releases') {
+    problems.push(`${source}: "layout.type" must be "releases" (the only supported layout)`);
+  }
+  if (layout.keepReleases != null) {
+    const n = layout.keepReleases;
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 1) {
+      problems.push(`${source}: "layout.keepReleases" must be an integer >= 1`);
+    }
+  }
+  if (layout.runningShaCommand != null && typeof layout.runningShaCommand !== 'string') {
+    problems.push(`${source}: "layout.runningShaCommand" must be a string`);
+  }
+  if (layout.releaseChecks != null) {
+    if (!Array.isArray(layout.releaseChecks)) {
+      problems.push(`${source}: "layout.releaseChecks" must be an array`);
+    } else {
+      layout.releaseChecks.forEach((c, i) => {
+        if (c == null || typeof c !== 'object' || typeof c.name !== 'string' || typeof c.command !== 'string') {
+          problems.push(`${source}: "layout.releaseChecks[${i}]" must be { name, command }`);
+        }
+      });
+    }
+  }
+  if (layout.sharedPaths != null) {
+    if (!Array.isArray(layout.sharedPaths)) {
+      problems.push(`${source}: "layout.sharedPaths" must be an array`);
+    } else {
+      const seen = [];
+      layout.sharedPaths.forEach((p, i) => {
+        if (typeof p !== 'string' || p.length === 0) {
+          problems.push(`${source}: "layout.sharedPaths[${i}]" must be a non-empty string`);
+          return;
+        }
+        // Relative, no escape, no shell metacharacters — these are interpolated into
+        // `ln`/`mkdir` on the target and must never point outside the release tree.
+        if (p.startsWith('/')) {
+          problems.push(`${source}: "layout.sharedPaths[${i}]" ("${p}") must be relative (no leading "/")`);
+        }
+        if (p.split('/').includes('..')) {
+          problems.push(`${source}: "layout.sharedPaths[${i}]" ("${p}") must not contain ".." segments`);
+        }
+        if (/[^A-Za-z0-9_./-]/.test(p)) {
+          problems.push(`${source}: "layout.sharedPaths[${i}]" ("${p}") must not contain spaces or shell metacharacters`);
+        }
+        // node_modules must NEVER be shared: a candidate `npm ci` would then mutate
+        // the dependency tree the live process is loading — the exact hazard this
+        // whole layout exists to remove. Reject it at any depth.
+        if (p.split('/').includes('node_modules')) {
+          problems.push(`${source}: "layout.sharedPaths[${i}]" ("${p}") must not share node_modules (it would be mutated by the candidate install)`);
+        }
+        const norm = p.replace(/\/+$/, '');
+        for (const other of seen) {
+          if (norm === other || norm.startsWith(`${other}/`) || other.startsWith(`${norm}/`)) {
+            problems.push(`${source}: "layout.sharedPaths" entries "${other}" and "${p}" overlap`);
+          }
+        }
+        seen.push(norm);
+      });
+    }
+  }
+  return problems;
+}
 
 function typeMatches(value, spec) {
   const nullable = spec.endsWith('?');
@@ -139,6 +246,10 @@ function validateConfig(raw, { source = 'config' } = {}) {
   }
   if (raw.mode != null && raw.mode !== 'ssh' && raw.mode !== 'local') {
     problems.push(`${source}: "mode" must be "ssh" or "local"`);
+  }
+  // `layout` type is checked above (object?); if present, validate its inner shape.
+  if (raw.layout != null && typeof raw.layout === 'object' && !Array.isArray(raw.layout)) {
+    problems.push(...validateLayout(raw.layout, source));
   }
   // projectDir is interpolated raw into `cd <dir> && …` on the target, so it must
   // be an absolute path free of shell metacharacters/spaces — reject a typo here

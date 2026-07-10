@@ -1,6 +1,7 @@
 'use strict';
 
 const { runOnTarget, buildHealthCommand } = require('./exec');
+const { lockDir, prevShaFile, acquireLock } = require('./lock');
 const { log: defaultLog } = require('./log');
 
 function defaultSleep(seconds) {
@@ -8,23 +9,29 @@ function defaultSleep(seconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-// Stable per-target id from the projectDir (falls back to appNames/host).
-// Sanitized to a filesystem-safe token so two deploys of the same target
-// contend for the same lock but different targets don't. Also keeps the
-// interpolated /tmp paths below free of shell metacharacters.
-function lockId(config) {
-  const raw = config.projectDir || config.appNames.join('-') || config.host || 'default';
-  return raw.replace(/[^A-Za-z0-9_.-]/g, '-').replace(/^-+|-+$/g, '') || 'default';
+// Path to the host layout marker. A legacy deploy/rollback must refuse to run
+// against a host that has been migrated to the release layout (SMH-112) — pulling
+// and building in a bare/releases root would be destructive. Cheap single probe.
+function layoutMarkerFile(config) {
+  return `${config.projectDir}/.deploy-kit-layout`;
 }
 
-function lockDir(config) {
-  return `/tmp/deploy-kit-${lockId(config)}.lock`;
-}
-
-// Where the pre-pull SHA is recorded for `rollback`. Kept in /tmp (not the
-// worktree) so it never shows as an untracked file or collides with a repo path.
-function prevShaFile(config) {
-  return `/tmp/deploy-kit-${lockId(config)}.prev-sha`;
+// Abort a legacy (non-release-layout) deploy/rollback if the host is already on
+// the release layout but the config forgot its `layout` block. Fails closed.
+function assertNotReleaseHost(config, ctx) {
+  if (!config.projectDir) return;
+  const res = runOnTarget(
+    `test -f ${layoutMarkerFile(config)} && echo RELEASE || true`,
+    config,
+    { capture: true, runtime: ctx.runtime },
+  );
+  if ((res.output || '').trim() === 'RELEASE') {
+    throw new Error(
+      `Host ${config.projectDir} is on the release layout (found .deploy-kit-layout) but this config has no `
+      + `"layout" block. Refusing to run a legacy in-place deploy against a release-layout host. Add the `
+      + `layout config, or run against the correct target.`,
+    );
+  }
 }
 
 // Resolve the deploy branch: explicit config wins, else the target's origin/HEAD,
@@ -94,25 +101,6 @@ function gate(step, config, ctx, { onFail } = {}) {
   }
 }
 
-// Take the target lock (atomic mkdir). Returns a release fn. --steal-lock forces
-// past a stale lock; config.lock:false disables locking entirely.
-function acquireLock(config, ctx, { steal = false } = {}) {
-  const noop = () => {};
-  if (config.lock === false) return noop;
-  const dir = lockDir(config);
-  if (steal) {
-    runOnTarget(`mkdir -p ${dir}`, config, { runtime: ctx.runtime });
-  } else {
-    const got = runOnTarget(`mkdir ${dir} 2>/dev/null`, config, { runtime: ctx.runtime });
-    if (!got.ok) {
-      throw new Error(
-        `Another deploy holds the lock (${dir}). Wait for it to finish, or pass --steal-lock.`,
-      );
-    }
-  }
-  return () => runOnTarget(`rmdir ${dir} 2>/dev/null || true`, config, { runtime: ctx.runtime });
-}
-
 // Run the full pipeline on the target. Returns a structured summary. Throws on
 // any gated failure (caller/CLI maps that to a non-zero exit).
 //
@@ -121,6 +109,11 @@ function acquireLock(config, ctx, { steal = false } = {}) {
 //   install → BACKUP(gate) → stop db-bound apps (release SQLite lock) →
 //   migrate(gate, restart on fail) → build → restart apps → health(gate)
 function deploy(config, options = {}, ctx = {}) {
+  // Artifact-first release layout (SMH-112) is a separate pipeline. Lazy-require to
+  // avoid a top-level cycle (release.js pulls shared helpers, not this module).
+  if (config.layout && config.layout.type === 'releases') {
+    return require('./release').deployRelease(config, options, ctx);
+  }
   const log = ctx.log || defaultLog;
   const sleep = ctx.sleep || defaultSleep;
   const runtime = ctx.runtime;
@@ -151,6 +144,9 @@ function deploy(config, options = {}, ctx = {}) {
 
   const release = acquireLock(config, c, { steal: stealLock });
   try {
+    // Fail closed if the host was migrated to the release layout but this config
+    // still asks for a legacy in-place deploy.
+    assertNotReleaseHost(config, c);
     // Pre-deploy checks: user-defined gates run BEFORE anything is touched (no stash,
     // fetch, or pull yet). Each is a command on the target; a non-zero exit aborts the
     // deploy with nothing changed. Use for preconditions — free disk, DB reachable,
@@ -276,6 +272,11 @@ function deploy(config, options = {}, ctx = {}) {
 // touched — we print the matching `db-backup restore` command instead of
 // auto-restoring, since a schema rollback is the operator's call.
 function rollback(config, options = {}, ctx = {}) {
+  // Release-layout rollback is a symlink flip to the previous release, not a git
+  // reset — a different pipeline. Legacy rollback must refuse a release-layout host.
+  if (config.layout && config.layout.type === 'releases') {
+    return require('./release').rollbackRelease(config, options, ctx);
+  }
   const log = ctx.log || defaultLog;
   const runtime = ctx.runtime;
   const c = { ...ctx, log, sleep: ctx.sleep || defaultSleep, runtime };
@@ -286,6 +287,9 @@ function rollback(config, options = {}, ctx = {}) {
   // rewrite the file between our read and the lock, resetting to the wrong SHA.
   const release = acquireLock(config, c, { steal: options.stealLock === true });
   try {
+    // Fail closed if the host is on the release layout (legacy git-reset rollback
+    // would be destructive there).
+    assertNotReleaseHost(config, c);
     const prev = runOnTarget(`cat ${prevShaFile(config)} 2>/dev/null || true`, config, { capture: true, runtime });
     const sha = (prev.output || '').trim();
     if (!/^[0-9a-f]{7,40}$/.test(sha)) {
