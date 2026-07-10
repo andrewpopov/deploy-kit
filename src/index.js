@@ -7,6 +7,7 @@ const deployMod = require('./deploy');
 const remote = require('./remote');
 const tunnel = require('./tunnel');
 const initMod = require('./init');
+const monitorMod = require('./monitor');
 
 // Destructure into locals so module.exports uses shorthand keys — Node's
 // cjs-module-lexer only detects named exports for identifier/shorthand forms,
@@ -21,6 +22,7 @@ const {
 const { deploy, rollback, resolveBranch, waitForHealth } = deployMod;
 const { startTunnel } = tunnel;
 const { init } = initMod;
+const { monitor } = monitorMod;
 
 module.exports = {
   // config
@@ -46,6 +48,8 @@ module.exports = {
   waitForHealth,
   // remote ops
   remote,
+  // monitoring
+  monitor,
   // tunnel
   startTunnel,
   // scaffold

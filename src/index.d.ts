@@ -6,6 +6,30 @@ export interface DeployHooks {
   migrate?: string | null;
   build?: string | null;
   restart?: string | null;
+  /** Restore the pre-migration DB backup during release-layout recovery. Receives
+   * the captured backup id as DEPLOY_KIT_BACKUP_ID. null = no auto-restore. */
+  restore?: string | null;
+}
+
+export interface ReleaseCheck {
+  name: string;
+  command: string;
+}
+
+/** Opt-in artifact-first release layout (SMH-112). Absent = legacy in-place deploy. */
+export interface ReleaseLayout {
+  type: 'releases';
+  /** Releases to retain when pruning (>= 1). Default 4. */
+  keepReleases?: number;
+  /** Relative paths symlinked from shared/ into every release (dirs, .env, uploads —
+   * never node_modules or a bare SQLite file with WAL/SHM sidecars). */
+  sharedPaths?: string[];
+  /** Commands run INSIDE the candidate release before activation (prisma client
+   * loads, entrypoint present). A non-zero exit quarantines the candidate. */
+  releaseChecks?: ReleaseCheck[];
+  /** Command that returns the SHA the live app reports; asserted == deployed SHA
+   * after the flip so an old process answering 200 can't mask a failed activation. */
+  runningShaCommand?: string;
 }
 
 export interface PreDeployCheck {
@@ -24,6 +48,48 @@ export interface SshOptions {
   serverAliveInterval?: number | null;
   serverAliveCountMax?: number | null;
   options?: string[];
+}
+
+export interface MonitorPublicProbe {
+  /** Stable unique id (alnum . _ -); the per-check state key. */
+  id: string;
+  /** http(s) URL, no shell metacharacters. */
+  url: string;
+  expectStatus?: number | number[];
+  expectBodyIncludes?: string;
+  headers?: Record<string, string>;
+  maxTimeSeconds?: number;
+}
+
+export interface MonitorCustomCheck {
+  /** Stable unique id (alnum . _ -). */
+  id: string;
+  /** Command run on the target; non-zero exit ⇒ alert at `level`. */
+  command: string;
+  /** Static severity (severity can't be derived from an exit code). Default 'crit'. */
+  level?: 'warn' | 'crit';
+}
+
+/** Opt-in fleet monitoring + alerting (SMH-116). Absent = disabled. */
+export interface MonitorConfig {
+  disk?: { minFreeKiB?: number; minFreeInodes?: number };
+  backup?: { id?: string; stampFile: string; maxAgeHours?: number };
+  restartStorm?: { maxDelta?: number };
+  tunnel?: boolean;
+  publicProbes?: MonitorPublicProbe[];
+  checks?: MonitorCustomCheck[];
+  /** Policy-free alert sink; the batched alert JSON is delivered on stdin.
+   * `run` selects where it executes ('controller' = the machine running deploy-kit,
+   * 'target' = the monitored host). Default 'controller'. */
+  alert: { command: string; run?: 'controller' | 'target' };
+  /** Cross-run debounce: consecutive runs a check must fail/recover before alerting. */
+  failAfterRuns?: number;
+  recoverAfterRuns?: number;
+  /** Re-fire a still-failing alert after this many minutes (0 = quiet). */
+  reAlertAfterMinutes?: number;
+  /** Absolute path to the monitor state file — a STABLE dir, never under releases/. */
+  stateFile?: string;
+  checkTimeoutSeconds?: number;
 }
 
 export interface DeployConfig {
@@ -50,6 +116,10 @@ export interface DeployConfig {
   stepTimeoutSeconds?: number | null;
   lock?: boolean;
   buildBeforeMigrate?: boolean;
+  /** Opt-in artifact-first release layout (SMH-112). Absent/null = legacy in-place. */
+  layout?: ReleaseLayout | null;
+  /** Opt-in fleet monitoring + alerting (SMH-116). Absent/null = disabled. */
+  monitor?: MonitorConfig | null;
   hooks: DeployHooks;
 }
 
@@ -81,6 +151,10 @@ export interface DeployResult {
   host: string | null;
   steps: string[];
   healthy: boolean;
+  /** Resolved deployed commit SHA (release layout only). */
+  sha?: string;
+  /** Activated release id, `<sha12>-<ts>` (release layout only). */
+  release?: string;
 }
 
 export interface Runtime {
@@ -132,6 +206,23 @@ export function runOnTarget(
   options?: { capture?: boolean; runtime?: Runtime },
 ): { ok: boolean; output: string; error?: unknown };
 export function buildHealthCommand(config: DeployConfig, check?: HealthCheck): string;
+
+export interface MonitorCheckResult {
+  id: string;
+  status: 'ok' | 'warn' | 'crit' | 'unknown';
+  message: string;
+}
+export interface MonitorResult {
+  /** 0 = all ok/warn · 1 = a critical condition · 2 = monitor/config/delivery failure. */
+  exitCode: 0 | 1 | 2;
+  results: MonitorCheckResult[];
+  alerts: { id: string; kind: 'alert' | 'recovery' | 'escalation' | 'reminder'; status: string; message: string }[];
+}
+export function monitor(
+  config: DeployConfig,
+  options?: { stealLock?: boolean },
+  ctx?: DeployContext & { now?: () => number; genId?: (nowMs: number) => string },
+): MonitorResult;
 
 export function deploy(config: DeployConfig, options?: DeployOptions, ctx?: DeployContext): DeployResult;
 export function rollback(config: DeployConfig, options?: RollbackOptions, ctx?: DeployContext): RollbackResult;

@@ -7,6 +7,110 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.8.0
+
+Shared fleet monitoring + alerting (SMH-116, absorbs the app-agnostic parts of
+SMH-152/155). Opt-in; every existing app is untouched until it adds a `monitor` block.
+
+- **New — `deploy-kit monitor`** and a `monitor: {…}` config block. Runs generic ops
+  checks on a cron and routes ACTIONABLE alerts through a policy-free sink. Built-in
+  checks (each opt-out by omitting its key; pm2 always on): **pm2** app-online (per
+  app), **restart-storm** (pm2 restart-count jump beyond `maxDelta`, reset-safe),
+  **disk** (free bytes OR inodes), **backup** freshness (stamp mtime), **tunnel**
+  process, **public** endpoint probes (curl status/body — proves DNS+ingress+TLS+
+  routing), and **custom** app commands (the seam for app-specific signals like
+  provider/scheduler readiness — statically-severitied, so a provider outage never
+  flaps liveness).
+- **Alerting is safe by construction.** Every check yields a stable id and a status of
+  `ok|warn|crit|unknown` — `unknown` (can't determine: ssh/command failure, unparseable
+  output) never counts as ok or a recovery. Cross-run **debounce** (`failAfterRuns`/
+  `recoverAfterRuns`) rides out flapping; alerts are **batched** into one event per run
+  (so one incident isn't four correlated alerts); an **outbox** persists the pending
+  event before sending and retains it for retry on failure (at-least-once, with a stable
+  `eventId` for sink-side dedup). A run **lock** (separate from the deploy lock) stops
+  overlapping crons; state is versioned and written atomically over stdin.
+- **Policy-free + injection-safe.** The alert sink is a command that receives the batch
+  as JSON on **stdin** (`run: 'controller'|'target'` picks where it runs — controller is
+  robust when the monitored app is what's down); deploy-kit ships no transport. Probe
+  URLs/headers and state/stamp paths are validated (https, unique safe ids, no shell
+  metacharacters, no single-quoted-header escape) and never shell-concatenated.
+- **New exec capability:** `runOnTarget` accepts `input` (fed to the command's stdin,
+  ssh-forwarded) and a per-call `timeoutSeconds` — the injection-safe way to pass
+  arbitrary data to a target command. Exit codes: `0` ok/warn · `1` crit · `2` monitor
+  error. Design + code independently reviewed by Codex (design + implementation).
+
+## 0.7.1
+
+Two release-layout fixes, both caught by the mandatory throwaway-PM2 test on the
+actual Pi (bigpi) before the smarthome cutover — exactly why that gate exists.
+
+- **SHA resolution failed against a `git clone --bare` repo.** A bare clone maps
+  the remote's heads to LOCAL heads (`refs/heads/*`, no `refs/remotes/origin/*`),
+  so `git rev-parse origin/<branch>` did not resolve and the deploy aborted in the
+  `materialize` phase with *"Could not resolve origin/master to a SHA (got
+  'origin/master')"*. Now try `origin/<branch>` first, then fall back to
+  `refs/heads/<branch>`, covering both bare-clone and mirror layouts.
+- **The backup id validation wrongly rejected absolute paths.** A backup id is
+  normally an absolute path to the backup file (e.g.
+  `/var/lib/smarthome/backups/smarthome-<ts>.db.gpg`), but the v0.7.0 safe-id check
+  rejected any id starting with `/`, so every migrating deploy aborted in the
+  `stopped` phase with *"Backup hook did not emit a safe restorable id"*. Absolute
+  is now allowed; the check still rejects shell metacharacters (safe charset) and
+  `..` traversal, and the id is single-quoted into the restore command.
+
+## 0.7.0
+
+Artifact-first release-layout deploys (SMH-112). Opt-in; every existing app is
+untouched until it adds a `layout` block.
+
+- **New — `layout: { type: 'releases', … }` (opt-in).** Switches an app from the
+  legacy in-place deploy (which runs `npm ci` + build **on the live worktree**,
+  the cause of smarthome's repeated `@prisma/client did not initialize yet`
+  crash-storms) to a Capistrano-style release layout. Each deploy materialises an
+  immutable release under `releases/<sha>-<ts>` from a **bare repo + detached
+  worktree**, installs and builds **inside that release** while the old `current`
+  keeps serving, validates it, and only then opens the disruptive window: stop
+  writers → backup → migrate → **atomic `current` symlink flip** (`mv -Tf`, a
+  namespace-atomic rename on ext4) → restart from a stable PM2 ecosystem. `npm ci`
+  and build never mutate the tree the live process runs from.
+- **Activation is verified, not assumed.** A deploy only succeeds when the health
+  endpoint returns 200, **every** managed PID's `/proc/<pid>/cwd` resolves to the
+  new release, the running app reports the deployed SHA (`layout.runningShaCommand`),
+  PM2 shows every app online, and restart counts stay flat across a settling
+  window — so an old process answering 200 can't mask a failed flip.
+- **DB-aware recovery state machine.** Recovery is phase-specific: a failed
+  install/build/validate just quarantines the candidate (current never touched);
+  a failure after the schema changed **stops and confirms all DB writers are down**,
+  restores the pre-migration backup (`hooks.restore`, given `DEPLOY_KIT_BACKUP_ID`)
+  and resumes the previous release — or aborts with a loud `MANUAL RECOVERY REQUIRED`
+  and the backup id rather than resuming stale code on a new schema. `SIGINT`/`SIGTERM`
+  run the same machine, and each disruptive phase is **durably journaled**
+  (atomic write) to `.deploy-kit-state.json` before the irreversible step, so a
+  process/SSH/power loss leaves an on-host record of what needs restoring. The
+  next deploy **refuses to start** if it finds an un-recovered interrupted phase
+  (loud "resolve by hand"); a successful recovery clears that state.
+- **The writer stop is gated and verified** (a zero-exit `pm2 stop` is not proof —
+  the backup only runs once every `dbBoundApp` is confirmed not-online), the
+  disruptive window refuses to open without a validated known-good `current`
+  pointer to fall back to, and `rollback` flips back to the running release if its
+  target comes up unhealthy.
+- **`rollback` under `layout`** is an instant symlink flip to the `previous`
+  release (already built — no reinstall/rebuild), with a warning that a schema
+  rollback is a separate, explicit data-loss decision.
+- **Safety rails.** Release deploy refuses a host with no completed layout marker
+  (`.deploy-kit-layout`, versioned) and never restructures a live root; a legacy
+  deploy/rollback refuses a host that **is** on the release layout; `sharedPaths`
+  are validated relative/non-overlapping and rejected if they'd hide a tracked
+  file; a free-disk and GNU-`mv` preflight fails closed. Explicit release metadata
+  (`.deploy-kit-state.json`) and pruning that only ever touches `releases/` and
+  never removes `current`/`previous`.
+- **New — `hooks.restore`** (nullable): restore the pre-migration DB backup during
+  release-layout recovery. `null` = no auto-restore.
+
+The one-time host migration (restructuring `/srv/<app>` into
+`releases/`+`shared/`+`current`) is a separate, explicit, reversible operation per
+app — deploy-kit does not perform it. smarthome is the pilot.
+
 ## 0.6.1
 
 **Fix — an unknown flag was silently ignored. A typo could run a real production
