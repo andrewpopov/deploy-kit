@@ -82,6 +82,23 @@ const DEFAULT_CONFIG = {
   //                                       // asserted == the deployed SHA post-flip.
   //   }
   layout: null,
+  // Fleet monitoring + alerting (SMH-116). null (default) = disabled (no-op), so
+  // apps are unaffected until they opt in (like `layout`). An opt-in block runs
+  // generic ops checks on a cron and routes ACTIONABLE alerts through a policy-free
+  // sink with cross-run debounce and batched delivery. See MONITOR.md / index.d.ts.
+  //   monitor: {
+  //     disk: { minFreeKiB: 524288, minFreeInodes: 10000 },   // omit to skip
+  //     backup: { id: 'db', stampFile: '/var/lib/app/backups/.last-success', maxAgeHours: 30 },
+  //     restartStorm: { maxDelta: 3 },                          // alert if restarts jump > maxDelta/run
+  //     tunnel: true,                                           // assert tunnelName pm2 proc online
+  //     publicProbes: [ { id: 'api', url: 'https://app/health', expectStatus: 200 } ],
+  //     checks: [ { id: 'providers', command: 'curl -sf localhost:PORT/ready', level: 'warn' } ],
+  //     alert: { command: 'curl -sf -d @- https://app/notify', run: 'controller' }, // gets JSON on stdin
+  //     failAfterRuns: 2, recoverAfterRuns: 2, reAlertAfterMinutes: 0,
+  //     stateFile: '/var/lib/app/deploy-kit-monitor-state.json',   // stable dir, NOT under releases
+  //     checkTimeoutSeconds: 20,
+  //   }
+  monitor: null,
   // The framework-specific seams. Each is a shell command run on the target.
   hooks: {
     // Prefer the offline cache first so a GitHub outage can't break a deploy that
@@ -133,8 +150,82 @@ const KEY_TYPES = {
   lock: 'boolean',
   buildBeforeMigrate: 'boolean',
   layout: 'object?',
+  monitor: 'object?',
   hooks: 'object',
 };
+
+// A safe identifier for a state key / display: alnum, dot, dash, underscore. Used
+// for probe/check/backup ids so they can't collide, escape, or be shell-injected.
+const SAFE_ID_RE = /^[A-Za-z0-9._-]+$/;
+const MONITOR_KEYS = ['disk', 'backup', 'restartStorm', 'tunnel', 'publicProbes', 'checks', 'alert', 'failAfterRuns', 'recoverAfterRuns', 'reAlertAfterMinutes', 'stateFile', 'checkTimeoutSeconds'];
+
+function isPosInt(v) { return typeof v === 'number' && Number.isInteger(v) && v > 0; }
+
+// Validate the opt-in `monitor` block. Enforces the invariants the state machine and
+// alert delivery depend on: an alert sink with a valid run-location, unique safe ids
+// for every probe/check (so per-check state can't collide), https-only probe urls
+// free of shell metacharacters, and sane thresholds.
+function validateMonitor(m, source) {
+  const p = [];
+  for (const k of Object.keys(m)) {
+    if (!MONITOR_KEYS.includes(k)) p.push(`${source}: unknown monitor key "${k}" (valid: ${MONITOR_KEYS.join(', ')})`);
+  }
+  // alert sink is required — a monitor with no way to alert is pointless.
+  if (m.alert == null || typeof m.alert !== 'object' || typeof m.alert.command !== 'string' || !m.alert.command) {
+    p.push(`${source}: "monitor.alert.command" (a shell command; gets the alert JSON on stdin) is required`);
+  } else if (m.alert.run != null && m.alert.run !== 'controller' && m.alert.run !== 'target') {
+    p.push(`${source}: "monitor.alert.run" must be "controller" or "target"`);
+  }
+  const seen = new Set();
+  const uniqueId = (id, where) => {
+    if (typeof id !== 'string' || !SAFE_ID_RE.test(id)) { p.push(`${source}: ${where} needs a safe "id" (alnum . _ -)`); return; }
+    if (seen.has(id)) p.push(`${source}: duplicate monitor id "${id}" (${where})`);
+    seen.add(id);
+  };
+  if (m.publicProbes != null) {
+    if (!Array.isArray(m.publicProbes)) p.push(`${source}: "monitor.publicProbes" must be an array`);
+    else m.publicProbes.forEach((pr, i) => {
+      const w = `publicProbes[${i}]`;
+      if (pr == null || typeof pr !== 'object') { p.push(`${source}: ${w} must be an object`); return; }
+      uniqueId(pr.id, w);
+      // https-only (or explicit http), no shell metacharacters — the url is interpolated into curl.
+      if (typeof pr.url !== 'string' || !/^https?:\/\/[^\s'"`$;&|<>()]+$/.test(pr.url)) {
+        p.push(`${source}: ${w}.url must be an http(s) URL with no shell metacharacters`);
+      } else if (!pr.url.startsWith('https://') && pr.url !== undefined) {
+        // http allowed but flagged intentionally — most probes should be https.
+      }
+      if (pr.headers != null && (typeof pr.headers !== 'object' || Array.isArray(pr.headers))) p.push(`${source}: ${w}.headers must be an object`);
+    });
+  }
+  if (m.checks != null) {
+    if (!Array.isArray(m.checks)) p.push(`${source}: "monitor.checks" must be an array`);
+    else m.checks.forEach((c, i) => {
+      const w = `checks[${i}]`;
+      if (c == null || typeof c !== 'object') { p.push(`${source}: ${w} must be an object`); return; }
+      uniqueId(c.id, w);
+      if (typeof c.command !== 'string' || !c.command) p.push(`${source}: ${w}.command must be a non-empty string`);
+      if (c.level != null && c.level !== 'warn' && c.level !== 'crit') p.push(`${source}: ${w}.level must be "warn" or "crit"`);
+    });
+  }
+  if (m.backup != null) {
+    if (typeof m.backup !== 'object' || typeof m.backup.stampFile !== 'string' || !m.backup.stampFile.startsWith('/')) p.push(`${source}: "monitor.backup.stampFile" must be an absolute path`);
+    if (m.backup && m.backup.maxAgeHours != null && !(typeof m.backup.maxAgeHours === 'number' && m.backup.maxAgeHours > 0)) p.push(`${source}: "monitor.backup.maxAgeHours" must be a positive number`);
+  }
+  if (m.disk != null) {
+    if (m.disk.minFreeKiB != null && !isPosInt(m.disk.minFreeKiB)) p.push(`${source}: "monitor.disk.minFreeKiB" must be a positive integer`);
+    if (m.disk.minFreeInodes != null && !isPosInt(m.disk.minFreeInodes)) p.push(`${source}: "monitor.disk.minFreeInodes" must be a positive integer`);
+  }
+  if (m.restartStorm != null && m.restartStorm.maxDelta != null && !(typeof m.restartStorm.maxDelta === 'number' && Number.isInteger(m.restartStorm.maxDelta) && m.restartStorm.maxDelta >= 0)) {
+    p.push(`${source}: "monitor.restartStorm.maxDelta" must be a non-negative integer`);
+  }
+  for (const k of ['failAfterRuns', 'recoverAfterRuns', 'checkTimeoutSeconds']) {
+    if (m[k] != null && !isPosInt(m[k])) p.push(`${source}: "monitor.${k}" must be a positive integer`);
+  }
+  if (m.reAlertAfterMinutes != null && !(typeof m.reAlertAfterMinutes === 'number' && m.reAlertAfterMinutes >= 0)) p.push(`${source}: "monitor.reAlertAfterMinutes" must be a non-negative number`);
+  if (m.stateFile != null && (typeof m.stateFile !== 'string' || !m.stateFile.startsWith('/'))) p.push(`${source}: "monitor.stateFile" must be an absolute path`);
+  if (m.tunnel != null && typeof m.tunnel !== 'boolean') p.push(`${source}: "monitor.tunnel" must be a boolean`);
+  return p;
+}
 
 // Keys allowed inside a `layout` block, with their validators. Absence of most is
 // fine (deploy normalizes defaults); `type` is the only required key.
@@ -250,6 +341,9 @@ function validateConfig(raw, { source = 'config' } = {}) {
   // `layout` type is checked above (object?); if present, validate its inner shape.
   if (raw.layout != null && typeof raw.layout === 'object' && !Array.isArray(raw.layout)) {
     problems.push(...validateLayout(raw.layout, source));
+  }
+  if (raw.monitor != null && typeof raw.monitor === 'object' && !Array.isArray(raw.monitor)) {
+    problems.push(...validateMonitor(raw.monitor, source));
   }
   // projectDir is interpolated raw into `cd <dir> && …` on the target, so it must
   // be an absolute path free of shell metacharacters/spaces — reject a typo here

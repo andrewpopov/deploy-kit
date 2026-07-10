@@ -50,6 +50,48 @@ export interface SshOptions {
   options?: string[];
 }
 
+export interface MonitorPublicProbe {
+  /** Stable unique id (alnum . _ -); the per-check state key. */
+  id: string;
+  /** http(s) URL, no shell metacharacters. */
+  url: string;
+  expectStatus?: number | number[];
+  expectBodyIncludes?: string;
+  headers?: Record<string, string>;
+  maxTimeSeconds?: number;
+}
+
+export interface MonitorCustomCheck {
+  /** Stable unique id (alnum . _ -). */
+  id: string;
+  /** Command run on the target; non-zero exit ⇒ alert at `level`. */
+  command: string;
+  /** Static severity (severity can't be derived from an exit code). Default 'crit'. */
+  level?: 'warn' | 'crit';
+}
+
+/** Opt-in fleet monitoring + alerting (SMH-116). Absent = disabled. */
+export interface MonitorConfig {
+  disk?: { minFreeKiB?: number; minFreeInodes?: number };
+  backup?: { id?: string; stampFile: string; maxAgeHours?: number };
+  restartStorm?: { maxDelta?: number };
+  tunnel?: boolean;
+  publicProbes?: MonitorPublicProbe[];
+  checks?: MonitorCustomCheck[];
+  /** Policy-free alert sink; the batched alert JSON is delivered on stdin.
+   * `run` selects where it executes ('controller' = the machine running deploy-kit,
+   * 'target' = the monitored host). Default 'controller'. */
+  alert: { command: string; run?: 'controller' | 'target' };
+  /** Cross-run debounce: consecutive runs a check must fail/recover before alerting. */
+  failAfterRuns?: number;
+  recoverAfterRuns?: number;
+  /** Re-fire a still-failing alert after this many minutes (0 = quiet). */
+  reAlertAfterMinutes?: number;
+  /** Absolute path to the monitor state file — a STABLE dir, never under releases/. */
+  stateFile?: string;
+  checkTimeoutSeconds?: number;
+}
+
 export interface DeployConfig {
   host: string | null;
   projectDir: string | null;
@@ -76,6 +118,8 @@ export interface DeployConfig {
   buildBeforeMigrate?: boolean;
   /** Opt-in artifact-first release layout (SMH-112). Absent/null = legacy in-place. */
   layout?: ReleaseLayout | null;
+  /** Opt-in fleet monitoring + alerting (SMH-116). Absent/null = disabled. */
+  monitor?: MonitorConfig | null;
   hooks: DeployHooks;
 }
 
