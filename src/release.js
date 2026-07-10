@@ -402,14 +402,18 @@ function deployRelease(config, options = {}, ctx = {}) {
     // ---- Phase: materialize (current untouched) ----
     st.phase = 'materialize';
     log.step('Fetching into the bare repo');
-    runInDir(paths.root, `git --git-dir=${paths.repoGit} fetch --prune ${config.remote}`, config, c);
+    // Fetch with an EXPLICIT refspec updating local heads. A repo created with
+    // `git clone --bare` configures NO `remote.origin.fetch`, so a plain `fetch origin`
+    // only moves FETCH_HEAD — `refs/heads/<branch>` stays frozen at clone time and the
+    // deploy silently builds a STALE sha once the remote advances. `+refs/heads/*:refs/
+    // heads/*` force-updates every local head to the remote (releases are detached, so
+    // no worktree has a branch checked out). It also updates a mirror clone's heads
+    // harmlessly. --prune keeps deleted branches from lingering.
+    runInDir(paths.root, `git --git-dir=${paths.repoGit} fetch --prune ${config.remote} '+refs/heads/*:refs/heads/*'`, config, c);
     const branch = config.branch || 'master';
-    // Resolve the exact SHA. A repo created with `git clone --bare` maps the remote's
-    // heads to LOCAL heads (refs/heads/*, no refs/remotes/origin/*), so `origin/master`
-    // does not resolve there; a mirror clone does have `origin/master`. Try the
-    // remote-tracking ref first, then fall back to the local branch head — covering
-    // both bare-clone and mirror layouts. `git rev-parse` echoes the arg on failure,
-    // so validate the 40-hex result rather than trusting the exit code.
+    // Resolve the exact SHA: try the remote-tracking ref (mirror clones have it), then
+    // the local head (now current after the refspec fetch above). `git rev-parse` echoes
+    // the arg on failure, so validate the 40-hex result rather than trusting exit code.
     const resolveSha = (ref) => capture(paths.root, `git --git-dir=${paths.repoGit} rev-parse ${ref}`, config, c);
     st.sha = resolveSha(`${config.remote}/${branch}`);
     if (!/^[0-9a-f]{40}$/.test(st.sha)) st.sha = resolveSha(`refs/heads/${branch}`);
