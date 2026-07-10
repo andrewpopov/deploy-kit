@@ -7,6 +7,33 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.6.0
+
+Conformance with the shared package standards
+(`agent_tools/knowledge/shared-package-standards.md`), standard 3: **a timeout
+that defaults to off is not a bound.**
+
+- **Fix — `stepTimeoutSeconds` now defaults to 1800 (30 minutes) instead of
+  `null`.** `src/exec.js` applied a process timeout only when the key was set,
+  and none of the five consumers (cairn, savoro, smarthome, bewks, sano-os) set
+  it. Every deploy step — `npm ci`, build, `prisma migrate`, `pm2 restart`, the
+  health probe — ran unbounded on the Pi, directly beneath the code comment
+  *"Kill a hung remote command instead of blocking the pipeline forever."*
+
+  The harm is worse than a slow deploy: `deploy()` takes an atomic lock for the
+  whole pipeline, so a step that never returns holds that lock forever and blocks
+  every **subsequent** deploy until someone runs `--steal-lock`.
+
+  30 minutes per step is deliberately generous — `npm ci` and a Next.js build on
+  a Raspberry Pi are legitimately slow, and a bound nobody can hit is a bound
+  nobody disables. Consumers can tighten it, or set `stepTimeoutSeconds: null` to
+  opt out entirely.
+- A killed step now uses `killSignal: 'SIGKILL'` and reports the step and the
+  bound rather than a bare `ETIMEDOUT`.
+- `src/tunnel.js` is documented as the deliberate exception: that `execFileSync`
+  **is** the long-running `cloudflared tunnel run` process, so bounding it would
+  kill the tunnel it just started.
+
 ## 0.5.0
 
 Maturation hardening (MATURATION.md P0/P1 + selected P2).

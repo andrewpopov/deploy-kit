@@ -5,7 +5,7 @@ const require = createRequire(__filename);
 const kit = require('../index.js') as typeof import('../index');
 const {
   buildTargetCommand, sshHardeningArgs, loadConfig, mergeConfig, validateConfig,
-  DEFAULT_CONFIG, deploy, rollback, remote, buildHealthCommand, startTunnel, init,
+  DEFAULT_CONFIG, deploy, rollback, remote, buildHealthCommand, startTunnel, init, runOnTarget,
 } = kit;
 const cli = require('../cli.js') as { run: Function; parseOptions: Function };
 
@@ -332,13 +332,50 @@ describe('stepTimeoutSeconds', () => {
     deploy(mergeConfig(baseConfig, { stepTimeoutSeconds: 30 }), { stash: false }, { runtime, sleep: () => {} });
     expect(seenTimeout).toBe(30000);
   });
-  it('sets no timeout by default', () => {
+  it('bounds every step by default (standard 3: a timeout that defaults to off is not a bound)', () => {
+    // deploy.js holds an atomic lock for the whole run, so a step that never
+    // returns blocks every subsequent deploy until someone runs --steal-lock.
+    let seenTimeout: any = 'unset';
+    let seenKill: any = 'unset';
+    const runtime = {
+      execFileSync: (_f: string, a: string[], opts: any) => {
+        seenTimeout = opts?.timeout;
+        seenKill = opts?.killSignal;
+        return a[a.length - 1].includes('curl') ? '200' : '';
+      },
+    };
+    deploy(baseConfig, { stash: false }, { runtime, sleep: () => {} });
+    expect(seenTimeout).toBe(1800 * 1000);
+    expect(seenKill).toBe('SIGKILL');
+  });
+
+  it('an explicit stepTimeoutSeconds: null opts out of the bound', () => {
     let seenTimeout: any = 'unset';
     const runtime = {
       execFileSync: (_f: string, a: string[], opts: any) => { seenTimeout = opts?.timeout; return a[a.length - 1].includes('curl') ? '200' : ''; },
     };
-    deploy(baseConfig, { stash: false }, { runtime, sleep: () => {} });
+    deploy({ ...baseConfig, stepTimeoutSeconds: null }, { stash: false }, { runtime, sleep: () => {} });
     expect(seenTimeout).toBeUndefined();
+  });
+
+  it('a consumer can tighten the bound', () => {
+    let seenTimeout: any = 'unset';
+    const runtime = {
+      execFileSync: (_f: string, a: string[], opts: any) => { seenTimeout = opts?.timeout; return a[a.length - 1].includes('curl') ? '200' : ''; },
+    };
+    deploy({ ...baseConfig, stepTimeoutSeconds: 60 }, { stash: false }, { runtime, sleep: () => {} });
+    expect(seenTimeout).toBe(60_000);
+  });
+
+  it('a timed-out step names the bound and the command instead of a raw errno', () => {
+    const timedOut: any = Object.assign(new Error('spawnSync ETIMEDOUT'), { code: 'ETIMEDOUT' });
+    const runtime = {
+      execFileSync: () => { throw timedOut; },
+    };
+    const result = runOnTarget('npm ci', { ...baseConfig, stepTimeoutSeconds: 900 }, { runtime });
+    expect(result.ok).toBe(false);
+    expect(result.error.message).toMatch(/exceeded the 900s stepTimeoutSeconds bound/);
+    expect(result.error.message).toMatch(/npm ci/);
   });
 });
 

@@ -44,6 +44,9 @@ export interface DeployConfig {
   healthChecks?: HealthCheck[];
   health: { attempts: number; delaySeconds: number };
   ssh?: SshOptions;
+  /** Per-step wall-clock bound in seconds. Defaults to 1800 (30 min). A hung
+   * step would otherwise hold the deploy lock forever, blocking every later
+   * deploy. Explicit `null` opts out. */
   stepTimeoutSeconds?: number | null;
   lock?: boolean;
   buildBeforeMigrate?: boolean;
