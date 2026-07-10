@@ -83,12 +83,57 @@ unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 | `hooks.migrate` | `string \| null` | `null` | both | 0.1 | Migration command; runs with `dbBoundApps` paused. |
 | `hooks.build` | `string \| null` | `null` | both | 0.1 | Build command. |
 | `hooks.restart` | `string \| null` | `null` | both | 0.3 | Override the app (re)start command. `null` → the `ecosystemFile`-aware start-or-restart idiom. |
+| `hooks.restore` | `string \| null` | `null` | both | 0.7 | Restore the pre-migration DB backup during release-layout recovery (gets `DEPLOY_KIT_BACKUP_ID`). `null` = no auto-restore. |
+| `layout` | `{type:'releases',…} \| null` | `null` | both | 0.7 | Opt-in artifact-first release layout (see below). `null` = legacy in-place deploy. |
+| `layout.keepReleases` | `number` | `4` | both | 0.7 | Releases retained when pruning (≥1). |
+| `layout.sharedPaths` | `string[]` | `[]` | both | 0.7 | Relative paths symlinked from `shared/` into every release (dirs, `.env`, uploads — never `node_modules` or a bare SQLite file). Validated relative + non-overlapping. |
+| `layout.releaseChecks` | `{name,command}[]` | `[]` | both | 0.7 | Commands run INSIDE the candidate release before activation (prisma client loads, entrypoint present). Non-zero quarantines the candidate. |
+| `layout.runningShaCommand` | `string \| null` | `null` | both | 0.7 | Returns the SHA the live app reports; asserted == deployed SHA post-flip. |
 
 ### mode: local + ecosystem/aux processes (sano)
 
 Set `"mode": "local"` for a box that runs the deploy on itself (no SSH) — it runs
 each step as `sh -c 'cd <projectDir> && …'` and skips the tracked-file stash. See
 the sano example below.
+
+### Release layout (artifact-first deploys)
+
+The default (legacy) deploy runs `pull → npm ci → migrate → build → restart` **on
+the live worktree** — `npm ci` and build mutate the very `node_modules`/generated
+tree the running process is loading, which is how a mid-deploy restart hits
+`@prisma/client did not initialize yet` and crash-loops. Adding a `layout` block
+switches an app to an immutable-release layout where install and build never touch
+the live tree:
+
+```
+/srv/<app>/
+  repo.git/                 # bare repo (fetch target; never runnable)
+  releases/<sha>-<ts>/      # one detached worktree per deploy, self-contained
+  shared/                   # persistent state symlinked into each release
+    .env  cache/npm  data/  ecosystem.config.cjs   # (literal cwd: …/current)
+  current  -> releases/<active>     # atomic symlink; PM2 cwd points here
+  previous -> releases/<known-good>
+  .deploy-kit-layout        # versioned marker (host is migrated)
+  .deploy-kit-state.json    # explicit release metadata
+```
+
+A `deploy` then: fetches into `repo.git`, resolves the exact SHA, `worktree add
+--detach`es a new release, symlinks `sharedPaths` in, runs `hooks.install`
+(`npm_config_cache` → `shared/cache/npm`) and `hooks.build` **inside the release**
+while `current` still serves, validates it (`releaseChecks` + SHA match), and only
+then opens the disruptive window — stop `dbBoundApps` → `hooks.backup` → `hooks.migrate`
+→ atomic `mv -Tf` flip of `current` → `pm2 startOrRestart` from the stable
+`ecosystemFile`. Activation is confirmed against `/proc/<pid>/cwd`, the app-reported
+SHA (`layout.runningShaCommand`), PM2 online state, and a restart-count settling
+window before the deploy is called healthy. `rollback` is an instant flip back to
+`previous` (already built). A failed deploy recovers per phase and, if a migration
+had already run, restores the backup (`hooks.restore`) or stops with `MANUAL
+RECOVERY REQUIRED` — it never resumes stale code against a migrated schema.
+
+Release deploy **requires a migrated host** (the `.deploy-kit-layout` marker) and a
+stable `ecosystemFile` whose `cwd` is the literal `…/current`. deploy-kit never
+performs the one-time host restructure — that is a separate, per-app, reversible
+migration. A legacy deploy against a migrated host (or vice-versa) fails closed.
 
 ## Use
 
