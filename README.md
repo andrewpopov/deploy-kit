@@ -89,6 +89,15 @@ unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 | `layout.sharedPaths` | `string[]` | `[]` | both | 0.7 | Relative paths symlinked from `shared/` into every release (dirs, `.env`, uploads — never `node_modules` or a bare SQLite file). Validated relative + non-overlapping. |
 | `layout.releaseChecks` | `{name,command}[]` | `[]` | both | 0.7 | Commands run INSIDE the candidate release before activation (prisma client loads, entrypoint present). Non-zero quarantines the candidate. |
 | `layout.runningShaCommand` | `string \| null` | `null` | both | 0.7 | Returns the SHA the live app reports; asserted == deployed SHA post-flip. |
+| `monitor` | `{…} \| null` | `null` | both | 0.8 | Opt-in fleet monitoring + alerting (see below). `null` = disabled. |
+| `monitor.alert` | `{command, run?}` | — | both | 0.8 | Required. Policy-free sink; gets the batched alert JSON on stdin. `run`: `controller` (default) or `target`. |
+| `monitor.publicProbes` | `{id,url,…}[]` | `[]` | both | 0.8 | External endpoint probes (unique `id`, https url). Proves DNS+ingress+TLS+routing. |
+| `monitor.checks` | `{id,command,level?}[]` | `[]` | both | 0.8 | App-supplied checks; non-zero exit ⇒ alert at `level` (static severity). |
+| `monitor.disk` / `.backup` / `.restartStorm` / `.tunnel` | see below | off | both | 0.8 | Built-in host checks (omit a key to skip it). |
+| `monitor.failAfterRuns` / `.recoverAfterRuns` | `number` | `2` | both | 0.8 | Cross-run debounce before alert / recovery. |
+| `monitor.reAlertAfterMinutes` | `number` | `0` | both | 0.8 | Re-fire a still-failing alert after N minutes (0 = quiet). |
+| `monitor.stateFile` | `string` | `<dir>/.deploy-kit-monitor-state.json` | both | 0.8 | Abs path to monitor state — a STABLE dir, never under `releases/`. |
+| `monitor.checkTimeoutSeconds` | `number` | `20` | both | 0.8 | Per-check wall-clock bound. |
 
 ### mode: local + ecosystem/aux processes (sano)
 
@@ -135,6 +144,41 @@ stable `ecosystemFile` whose `cwd` is the literal `…/current`. deploy-kit neve
 performs the one-time host restructure — that is a separate, per-app, reversible
 migration. A legacy deploy against a migrated host (or vice-versa) fails closed.
 
+### Monitoring (`deploy-kit monitor`)
+
+Add a `monitor` block to turn on cron-driven ops monitoring + alerting. It runs the
+generic checks every fleet host needs (so five apps don't each re-implement them) and
+routes actionable alerts through a sink you supply:
+
+```json
+"monitor": {
+  "disk": { "minFreeKiB": 524288, "minFreeInodes": 10000 },
+  "backup": { "id": "db", "stampFile": "/var/lib/app/backups/.last-success", "maxAgeHours": 30 },
+  "restartStorm": { "maxDelta": 3 },
+  "tunnel": true,
+  "publicProbes": [{ "id": "api", "url": "https://app.example.com/health", "expectStatus": 200 }],
+  "checks": [{ "id": "ready", "command": "curl -fsS localhost:3002/ready", "level": "warn" }],
+  "alert": { "command": "curl -fsS -X POST -d @- https://app.example.com/internal/alert", "run": "controller" },
+  "failAfterRuns": 2, "recoverAfterRuns": 2, "reAlertAfterMinutes": 60,
+  "stateFile": "/var/lib/app/deploy-kit-monitor-state.json"
+}
+```
+
+Run it on a cron: `*/5 * * * * cd /path/to/app && npx deploy-kit monitor`. Each run
+locks, reads state, runs every enabled check, and applies a per-check state machine:
+a check must be non-`ok` for `failAfterRuns` consecutive runs before it alerts and `ok`
+for `recoverAfterRuns` before it clears, so flapping is ridden out. A status of
+`unknown` (ssh/command failure, unparseable output) never counts as ok or a recovery —
+it holds. All transitions in a run are **batched into one alert event** (one incident
+isn't four correlated pages), delivered to `alert.command` as JSON on **stdin**; the
+event is persisted to `stateFile` *before* sending and retained for retry if delivery
+fails (at-least-once; the `eventId` lets your sink dedupe). `alert.run: 'controller'`
+runs the sink on the machine running deploy-kit (robust when the monitored app is what's
+down); `'target'` runs it on the host. Exit codes: `0` ok/warn · `1` a critical
+condition · `2` a monitor/config/delivery failure. Provider/scheduler-specific signals
+belong in `checks[]` (statically-severitied) so they alert without flapping liveness —
+keep the app's own `/live` vs `/ready` split app-side.
+
 ## Use
 
 ```
@@ -155,6 +199,7 @@ npx deploy-kit logs [--lines N] [--follow] [--errors]
 | `init` | — | Write a `.deploy-kit.config.json` skeleton (never overwrites) + print the scripts block. |
 | `deploy` | `--skip-build` `--skip-deps` `--skip-migrate` `--no-stash` `--dry-run` `--steal-lock` `--no-lock` | Run the full pipeline. |
 | `rollback` | `--skip-build` `--skip-deps` `--steal-lock` | Reset to the recorded pre-deploy SHA, rebuild, restart, health-gate. |
+| `monitor` | `--steal-lock` | Run the `monitor` checks, alert on transitions, exit `0`/`1`/`2`. For a cron. |
 | `status` / `health` / `resources` / `git` / `dashboard` | — | Read-only target inspection. |
 | `start` / `stop` / `restart` | — | PM2 lifecycle over `appNames`. |
 | `logs` | `--lines N` `--follow` `--errors` | Tail PM2 logs for `appNames`. |
