@@ -48,9 +48,11 @@ const DEFAULT_CONFIG = {
     serverAliveCountMax: 3, // -o ServerAliveCountMax; null to omit
     options: [], // extra raw `-o Key=Value` strings appended verbatim
   },
-  // Per-command wall-clock timeout in seconds. null = no limit (a long build/install
-  // is allowed to run). When set, a hung remote command is killed and its step fails.
-  stepTimeoutSeconds: null,
+  // Per-command wall-clock timeout in seconds. A hung step is killed and its step
+  // fails, rather than holding the deploy lock forever and blocking every later
+  // deploy. Generous by default: `npm ci` and `next build` on a Pi are slow, and a
+  // bound nobody can hit is a bound nobody disables. Explicit `null` opts out.
+  stepTimeoutSeconds: 1800,
   // Take an atomic lock on the target (mkdir) so two concurrent deploys can't
   // interleave pm2 stop/start + git pulls. false disables; --steal-lock overrides.
   lock: true,

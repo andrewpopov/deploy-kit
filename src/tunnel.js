@@ -21,6 +21,9 @@ function startTunnel(options = {}, ctx = {}) {
 
   const args = ['tunnel', '--config', configPath, 'run', tunnelName];
   log.step(`Starting tunnel ${tunnelName} (${configPath})`);
+  // Deliberately unbounded (the one exception to the bound-every-command rule):
+  // this call IS the long-running tunnel process, not a step that should finish.
+  // A timeout here would kill the tunnel it just started.
   execFileSync(cloudflaredBin, args, { stdio: 'inherit' });
   return { tunnelName, configPath, args };
 }

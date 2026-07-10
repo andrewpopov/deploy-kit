@@ -47,12 +47,24 @@ function runOnTarget(command, config, { capture = false, runtime } = {}) {
     encoding: 'utf8',
     stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
   };
-  // Kill a hung remote command instead of blocking the pipeline forever.
-  if (config.stepTimeoutSeconds) execOptions.timeout = config.stepTimeoutSeconds * 1000;
+  // Kill a hung remote command instead of blocking the pipeline forever. deploy.js
+  // holds an atomic lock for the whole run, so a step that never returns blocks
+  // every subsequent deploy until someone runs --steal-lock. Enabled by default;
+  // an explicit `stepTimeoutSeconds: null` opts out.
+  if (config.stepTimeoutSeconds) {
+    execOptions.timeout = config.stepTimeoutSeconds * 1000;
+    execOptions.killSignal = 'SIGKILL';
+  }
   try {
     const output = execFileSync(file, args, execOptions);
     return { ok: true, output: capture ? String(output || '') : '' };
   } catch (error) {
+    // execFileSync surfaces a timeout as ETIMEDOUT; on its own that tells the
+    // operator nothing about which step hung or what the bound was.
+    if (error && error.code === 'ETIMEDOUT') {
+      error.message =
+        `Step exceeded the ${config.stepTimeoutSeconds}s stepTimeoutSeconds bound and was killed: ${command}`;
+    }
     return { ok: false, output: capture ? String(error.stdout || '') : '', error };
   }
 }
