@@ -411,12 +411,16 @@ function deployRelease(config, options = {}, ctx = {}) {
     // harmlessly. --prune keeps deleted branches from lingering.
     runInDir(paths.root, `git --git-dir=${paths.repoGit} fetch --prune ${config.remote} '+refs/heads/*:refs/heads/*'`, config, c);
     const branch = config.branch || 'master';
-    // Resolve the exact SHA: try the remote-tracking ref (mirror clones have it), then
-    // the local head (now current after the refspec fetch above). `git rev-parse` echoes
-    // the arg on failure, so validate the 40-hex result rather than trusting exit code.
+    // Resolve the exact SHA from `refs/heads/<branch>` FIRST — that is the ref the
+    // explicit `+refs/heads/*:refs/heads/*` fetch above just force-updated, so it is
+    // always current. A remote-tracking `origin/<branch>` (present if repo.git has a
+    // heads→remotes/origin refspec) is only updated by a PLAIN `git fetch`, NOT by our
+    // heads:heads fetch, so preferring it would resolve a STALE sha after the remote
+    // advanced. Keep it only as a last-ditch fallback. `git rev-parse` echoes the arg
+    // on failure, so validate the 40-hex result rather than trusting the exit code.
     const resolveSha = (ref) => capture(paths.root, `git --git-dir=${paths.repoGit} rev-parse ${ref}`, config, c);
-    st.sha = resolveSha(`${config.remote}/${branch}`);
-    if (!/^[0-9a-f]{40}$/.test(st.sha)) st.sha = resolveSha(`refs/heads/${branch}`);
+    st.sha = resolveSha(`refs/heads/${branch}`);
+    if (!/^[0-9a-f]{40}$/.test(st.sha)) st.sha = resolveSha(`${config.remote}/${branch}`);
     if (!/^[0-9a-f]{40}$/.test(st.sha)) {
       throw new Error(`Could not resolve ${config.remote}/${branch} (or refs/heads/${branch}) to a SHA in ${paths.repoGit} (got "${st.sha}")`);
     }

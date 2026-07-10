@@ -7,6 +7,19 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.8.2
+
+Fix — release SHA resolution could still pick a STALE `origin/<branch>`.
+
+- v0.8.1 fetches `+refs/heads/*:refs/heads/*` (force-updating local heads) but resolution
+  still tried `origin/<branch>` FIRST. If `repo.git` carries a `heads→remotes/origin`
+  refspec (the migration sets one), `refs/remotes/origin/<branch>` is updated only by a
+  plain `git fetch`, NOT by our heads:heads fetch — so after the remote advanced it went
+  stale and was preferred over the current `refs/heads/<branch>`, silently rebuilding the
+  old sha again. Now resolve `refs/heads/<branch>` FIRST (the ref our own fetch just
+  force-updated; always current), with `origin/<branch>` only as a last-ditch fallback.
+  Found by a Codex review of the v0.8.1 refspec change.
+
 ## 0.8.1
 
 Fix — release-layout deploys built a STALE commit against a `git clone --bare` repo.

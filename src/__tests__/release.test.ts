@@ -142,6 +142,25 @@ describe('release deploy — happy path', () => {
     expect(result.steps).toContain('flip');
   });
 
+  it('prefers refs/heads over a STALE origin/<branch> (heads:heads fetch is authoritative)', () => {
+    // If repo.git has a heads->remotes/origin refspec, origin/master is only updated by a
+    // plain fetch — NOT our heads:heads fetch — so it can be stale after the remote moved.
+    // refs/heads/master (force-updated by our fetch) is current and must win.
+    const STALE = 'dead00000000dead00000000dead00000000dead';
+    const rt = makeReleaseRuntime();
+    const runtime = {
+      execFileSync: (_f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        if (cmd.includes('rev-parse origin/master')) return STALE;       // stale remote-tracking ref
+        if (cmd.includes('rev-parse refs/heads/master')) return SHA;      // current local head
+        return (rt.runtime.execFileSync as any)(_f, args);
+      },
+    };
+    const result = release.deployRelease(relConfig(), {}, ctx(runtime));
+    expect(result.sha).toBe(SHA);       // current, NOT the stale origin sha
+    expect(result.sha).not.toBe(STALE);
+  });
+
   it('restarts from the stable ecosystem (never a baked release path) and verifies cwd', () => {
     const { runtime, calls } = makeReleaseRuntime();
     release.deployRelease(relConfig(), {}, ctx(runtime));
