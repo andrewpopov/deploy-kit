@@ -7,6 +7,18 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.8.1
+
+Fix — release-layout deploys built a STALE commit against a `git clone --bare` repo.
+
+- `git clone --bare` configures no `remote.origin.fetch`, so the materialize step's
+  `fetch --prune origin` only moved `FETCH_HEAD` — `refs/heads/<branch>` stayed frozen
+  at clone time. Once the remote advanced past the host-migration commit, every deploy
+  silently rebuilt the OLD sha (the build-sha match still passed — it was internally
+  consistent, just stale). Now fetch with an explicit `+refs/heads/*:refs/heads/*`
+  refspec so local heads track the remote. Caught when a smarthome deploy shipped the
+  pre-migration HEAD instead of the just-merged master (SMH-116).
+
 ## 0.8.0
 
 Shared fleet monitoring + alerting (SMH-116, absorbs the app-agnostic parts of

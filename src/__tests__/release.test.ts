@@ -111,6 +111,9 @@ describe('release deploy — happy path', () => {
     expect(calls.some((cmd) => /cd \/srv\/app\/current.*npm ci/.test(cmd))).toBe(false);
     // worktree materialized detached at the resolved SHA.
     expect(joined).toContain(`worktree add --detach /srv/app/releases/a1b2c3d4e5f6-20260710T090000Z ${SHA}`);
+    // Fetch MUST use an explicit refspec so a `git clone --bare` repo (no configured
+    // refspec) actually updates refs/heads/* — else it builds a stale sha (SMH-116).
+    expect(joined).toContain("fetch --prune origin '+refs/heads/*:refs/heads/*'");
     // atomic activation via mv -Tf onto current.
     expect(calls.some((cmd) => /mv -Tf .*\/srv\/app\/current/.test(cmd))).toBe(true);
     // ordering: install → build → stop → backup → migrate → flip.
