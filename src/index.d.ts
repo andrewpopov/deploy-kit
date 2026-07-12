@@ -120,6 +120,8 @@ export interface DeployConfig {
   layout?: ReleaseLayout | null;
   /** Opt-in fleet monitoring + alerting (SMH-116). Absent/null = disabled. */
   monitor?: MonitorConfig | null;
+  /** Optional target command that receives the post-health deployment JSON on stdin. */
+  deliveryEvent?: { command: string } | null;
   hooks: DeployHooks;
 }
 

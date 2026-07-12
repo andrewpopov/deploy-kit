@@ -99,6 +99,10 @@ const DEFAULT_CONFIG = {
   //     checkTimeoutSeconds: 20,
   //   }
   monitor: null,
+  // Optional post-health delivery event. The command runs on the target and
+  // receives structured deployment JSON on stdin; failures are reported but do
+  // not turn a healthy deployment into a rollback.
+  deliveryEvent: null,
   // The framework-specific seams. Each is a shell command run on the target.
   hooks: {
     // Prefer the offline cache first so a GitHub outage can't break a deploy that
@@ -151,6 +155,7 @@ const KEY_TYPES = {
   buildBeforeMigrate: 'boolean',
   layout: 'object?',
   monitor: 'object?',
+  deliveryEvent: 'object?',
   hooks: 'object',
 };
 
