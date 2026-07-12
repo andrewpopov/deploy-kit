@@ -133,7 +133,7 @@ function deploy(config, options = {}, ctx = {}) {
 
   const run = (message, command, opts) => {
     log.step(message);
-    const res = runOnTarget(command, config, { runtime });
+    const res = runOnTarget(command, config, { runtime, input: opts?.input });
     if (!res.ok && !opts?.tolerate) throw new Error(`Deploy aborted: ${message} failed`);
     return res.ok;
   };
@@ -259,6 +259,16 @@ function deploy(config, options = {}, ctx = {}) {
       throw new Error('Deploy completed but the application is unhealthy');
     }
     steps.push('health');
+
+    if (config.deliveryEvent?.command) {
+      const payload = JSON.stringify({
+        event: 'deployment', status: 'succeeded', branch,
+        revision: runOnTarget('git rev-parse HEAD', config, { runtime, capture: true }).output.trim(),
+        deployedAt: new Date().toISOString(),
+      });
+      run('Emitting delivery event', config.deliveryEvent.command, { tolerate: true, input: payload });
+      steps.push('delivery-event');
+    }
 
     log.success('Deployment completed successfully');
     return { branch, mode: config.mode, host: config.host, steps, healthy };
