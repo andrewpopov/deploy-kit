@@ -7,6 +7,20 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.9.0
+
+Feature — **post-deploy verification gates**: opt-in checks that run after the
+health gate and fail the deploy if they do not pass (`verifyGates` in config).
+
+Feature — **optional post-health delivery events**: emit an event after a deploy
+goes healthy, so a consumer can notify/record without polling.
+
+Both are additive and default to off; existing configs are unaffected.
+
+These shipped on master as three untagged commits and were being consumed by
+cairn via a bare SHA pin — which the standards forbid (pin tags, never SHAs).
+This release tags them so every consumer can pin `#v0.9.0`.
+
 ## 0.8.2
 
 Fix — release SHA resolution could still pick a STALE `origin/<branch>`.
