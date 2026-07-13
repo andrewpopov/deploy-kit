@@ -48,6 +48,11 @@ Drop a `.deploy-kit.config.json` in the repo root (or run `deploy-kit init`):
 }
 ```
 
+## Project policies
+
+See [Contributing](./CONTRIBUTING.md), [Support](./SUPPORT.md), and the
+[Security Policy](./SECURITY.md). This package is licensed under [MIT](./LICENSE).
+
 The `.deploy-kit.config.json` holding your real host/paths lives in each
 **consumer** repo, never in this package. The config is validated on load —
 unknown keys, wrong types, a bad `mode`, or a removed key (e.g.

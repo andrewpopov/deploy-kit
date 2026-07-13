@@ -2,6 +2,7 @@
 
 ## 0.9.2
 
+- Add public contribution, support, and private vulnerability-reporting policies.
 - Add the MIT `LICENSE` file shipped with the public package.
 - Correct the documented `stepTimeoutSeconds` default to the runtime value of
   `1800`; only an explicit `null` disables the timeout.
