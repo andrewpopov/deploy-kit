@@ -103,6 +103,8 @@ export interface DeployConfig {
   tunnelName: string | null;
   ensureApps?: string[];
   preDeployChecks?: PreDeployCheck[];
+  /** Named gates run after health succeeds; failures fail the deployment result. */
+  postDeployChecks?: PreDeployCheck[];
   ecosystemFile?: string | null;
   port: number;
   healthPath: string;

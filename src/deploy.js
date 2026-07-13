@@ -260,6 +260,11 @@ function deploy(config, options = {}, ctx = {}) {
     }
     steps.push('health');
 
+    for (const check of config.postDeployChecks) {
+      gate({ message: `Post-deploy check: ${check.name}`, command: check.command }, config, c);
+      steps.push(`post-check:${check.name}`);
+    }
+
     if (config.deliveryEvent?.command) {
       const payload = JSON.stringify({
         event: 'deployment', status: 'succeeded', branch,

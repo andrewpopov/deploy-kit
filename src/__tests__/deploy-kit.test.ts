@@ -211,6 +211,24 @@ describe('deploy pipeline', () => {
     expect(joined).not.toContain('npm ci');
   });
 
+  it('runs postDeployChecks after health and fails the deploy when one fails', () => {
+    const cfg = mergeConfig(baseConfig, {
+      postDeployChecks: [{ name: 'public-smoke', command: 'npm run test:smoke:prod' }],
+    });
+    const { runtime, calls } = makeRuntime();
+    const result = deploy(cfg, {}, ctxWith(runtime));
+    expect(result.steps).toContain('post-check:public-smoke');
+    expect(calls.join('\n').indexOf('curl')).toBeLessThan(calls.join('\n').indexOf('npm run test:smoke:prod'));
+
+    const failed = makeRuntime({ fail: ['npm run test:smoke:prod'] });
+    expect(() => deploy(cfg, {}, ctxWith(failed.runtime))).toThrow(/Post-deploy check: public-smoke failed/);
+  });
+
+  it('rejects malformed postDeployChecks instead of silently ignoring them', () => {
+    expect(validateConfig({ postDeployChecks: [{ name: '', command: '' }] }).join('\n'))
+      .toMatch(/postDeployChecks\[0\]\.(name|command)/);
+  });
+
   it('skips deps/build/migrate when requested', () => {
     const { runtime } = makeRuntime();
     const result = deploy(baseConfig, { skipDeps: true, skipBuild: true, skipMigrate: true, stash: false }, ctxWith(runtime));
