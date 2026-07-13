@@ -67,6 +67,7 @@ unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 | `tunnelName` | `string \| null` | `null` | both | 0.1 | cloudflared PM2 process name — ops-verb display only (use `ensureApps` to keep it up). |
 | `ensureApps` | `string[]` | `[]` | both | 0.4 | Auxiliary PM2 procs ensured up (tolerant) AFTER the app restart. A failure never fails the deploy. |
 | `preDeployChecks` | `{name,command}[]` | `[]` | both | 0.4 | Gates run BEFORE anything is touched; non-zero aborts with nothing changed. |
+| `postDeployChecks` | `{name,command}[]` | `[]` | both | 0.8 | Gates run after restart and every health probe succeeds; use public smoke journeys and asset checks. A failure reports the deploy as failed but does not silently roll back the live revision. |
 | `ecosystemFile` | `string \| null` | `null` | both | 0.3 | PM2 ecosystem file (rel. to `projectDir`). Enables first-deploy-safe `pm2 start … --only … \|\| pm2 restart …`. |
 | `port` | `number` | `3000` | both | 0.1 | Health-probe port (`http://localhost:<port>`). |
 | `healthPath` | `string` | `'/api/health'` | both | 0.1 | Health-probe path. |

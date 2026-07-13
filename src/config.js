@@ -25,6 +25,11 @@ const DEFAULT_CONFIG = {
   // a non-zero exit aborts the deploy with nothing changed (free disk, DB reachable,
   // required secret present, …). The kit runs them; the consumer supplies them.
   preDeployChecks: [],
+  // Post-health gates run after the new app is healthy. Use them for public smoke
+  // journeys and asset-contract checks that a localhost health probe cannot see.
+  // A failure makes the deploy fail loudly; the active revision is left intact for
+  // an explicit, evidence-based rollback decision.
+  postDeployChecks: [],
   // Path (relative to projectDir) to the PM2 ecosystem file. When set, the deploy
   // (re)starts apps/ensureApps via `pm2 start <file> --only <name> || pm2 restart <name>`
   // so a not-yet-registered process starts on first deploy and a running one
@@ -143,6 +148,7 @@ const KEY_TYPES = {
   tunnelName: 'string?',
   ensureApps: 'array',
   preDeployChecks: 'array',
+  postDeployChecks: 'array',
   ecosystemFile: 'string?',
   port: 'number',
   healthPath: 'string',
@@ -165,6 +171,25 @@ const SAFE_ID_RE = /^[A-Za-z0-9._-]+$/;
 const MONITOR_KEYS = ['disk', 'backup', 'restartStorm', 'tunnel', 'publicProbes', 'checks', 'alert', 'failAfterRuns', 'recoverAfterRuns', 'reAlertAfterMinutes', 'stateFile', 'checkTimeoutSeconds'];
 
 function isPosInt(v) { return typeof v === 'number' && Number.isInteger(v) && v > 0; }
+
+function validateDeployChecks(checks, key, source) {
+  const problems = [];
+  if (checks == null) return problems;
+  if (!Array.isArray(checks)) return [`${source}: "${key}" must be an array`];
+  const names = new Set();
+  checks.forEach((check, index) => {
+    const where = `${key}[${index}]`;
+    if (check == null || typeof check !== 'object' || Array.isArray(check)) {
+      problems.push(`${source}: ${where} must be an object`);
+      return;
+    }
+    if (typeof check.name !== 'string' || !check.name.trim()) problems.push(`${source}: ${where}.name must be a non-empty string`);
+    else if (names.has(check.name)) problems.push(`${source}: duplicate ${key} name "${check.name}"`);
+    else names.add(check.name);
+    if (typeof check.command !== 'string' || !check.command.trim()) problems.push(`${source}: ${where}.command must be a non-empty string`);
+  });
+  return problems;
+}
 
 // Validate the opt-in `monitor` block. Enforces the invariants the state machine and
 // alert delivery depend on: an alert sink with a valid run-location, unique safe ids
@@ -353,6 +378,8 @@ function validateConfig(raw, { source = 'config' } = {}) {
   if (raw.mode != null && raw.mode !== 'ssh' && raw.mode !== 'local') {
     problems.push(`${source}: "mode" must be "ssh" or "local"`);
   }
+  problems.push(...validateDeployChecks(raw.preDeployChecks, 'preDeployChecks', source));
+  problems.push(...validateDeployChecks(raw.postDeployChecks, 'postDeployChecks', source));
   // `layout` type is checked above (object?); if present, validate its inner shape.
   if (raw.layout != null && typeof raw.layout === 'object' && !Array.isArray(raw.layout)) {
     problems.push(...validateLayout(raw.layout, source));
