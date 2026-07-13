@@ -7,6 +7,13 @@ package.json and that a `## X.Y.Z` heading exists here. Tags are immutable —
 fix forward with a new patch version.
 -->
 
+## 0.9.1
+
+Fix — v0.9.0 accidentally tracked a stray `.worktree/delivery-event` gitlink
+(the .gitignore had `.worktrees/` plural, not `.worktree/`). Untracked it and
+fixed the ignore rule. Tags are immutable, so this is a fix-forward: pin
+`#v0.9.1`, not `#v0.9.0`. No functional change.
+
 ## 0.9.0
 
 Feature — **post-deploy verification gates**: opt-in checks that run after the
