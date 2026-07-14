@@ -73,7 +73,7 @@ unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 | `ensureApps` | `string[]` | `[]` | both | 0.4 | Auxiliary PM2 procs ensured up (tolerant) AFTER the app restart. A failure never fails the deploy. |
 | `preDeployChecks` | `{name,command}[]` | `[]` | both | 0.4 | Gates run BEFORE anything is touched; non-zero aborts with nothing changed. |
 | `postDeployChecks` | `{name,command}[]` | `[]` | both | 0.8 | Gates run after restart and every health probe succeeds; use public smoke journeys and asset checks. A failure reports the deploy as failed but does not silently roll back the live revision. |
-| `ecosystemFile` | `string \| null` | `null` | both | 0.3 | PM2 ecosystem file (rel. to `projectDir`). Enables first-deploy-safe `pm2 start … --only … \|\| pm2 restart …`. |
+| `ecosystemFile` | `string \| null` | `null` | both | 0.3 | PM2 ecosystem file (rel. to `projectDir`). Enables first-deploy-safe `pm2 start … --only … --update-env \|\| pm2 restart … --update-env`; each deploy refreshes process env from the ecosystem file. |
 | `port` | `number` | `3000` | both | 0.1 | Health-probe port (`http://localhost:<port>`). |
 | `healthPath` | `string` | `'/api/health'` | both | 0.1 | Health-probe path. |
 | `healthHeaders` | `Record<string,string>` | `{}` | both | 0.3.1 | Extra probe headers, e.g. `{"X-Forwarded-Proto":"https"}` behind a TLS proxy. |
@@ -247,7 +247,9 @@ for the backup hook.
   real 200. (Since 0.3.1.)
 - **First deploy of a brand-new PM2 process fails at restart.** `pm2 restart`
   requires the process to already exist. Set `ecosystemFile` so the deploy uses
-  `pm2 start <file> --only <name> || pm2 restart <name>`. (Since 0.3.0.)
+  `pm2 start <file> --only <name> --update-env || pm2 restart <name> --update-env`.
+  The environment refresh is required when the ecosystem file derives a release
+  ID or other deploy-time configuration. (Since 0.3.0.)
 - **"Another deploy holds the lock".** A previous deploy is still running, or one
   died without releasing. Wait, or pass `--steal-lock` to force past a stale lock.
 - **Deploy hangs.** A wedged Tailscale/ssh route. The ssh `ConnectTimeout` bounds
