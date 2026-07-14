@@ -6,11 +6,14 @@ const { log } = require('./log');
 const { deploy, rollback } = require('./deploy');
 const { init } = require('./init');
 const remote = require('./remote');
+const { checkPortGuard } = require('./port-guard');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
   '--skip-migrate', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
 ];
+
+const PORT_RE = /^[0-9]+$/;
 
 // Reject anything we do not recognise. Silently ignoring an unknown flag is
 // dangerous precisely for the flag an operator reaches for when being careful:
@@ -46,6 +49,8 @@ Usage: deploy-kit <command> [options]   (reads .deploy-kit.config.json from cwd)
 
 Commands:
   init                                     scaffold .deploy-kit.config.json + scripts
+  port-guard <port> <pm2-process-name>     fail if <port> is held by a process
+                                            other than <pm2-process-name>'s pm2 tree
   deploy [--skip-build|--skip-deps|--skip-migrate]
          [--no-stash] [--dry-run] [--steal-lock] [--no-lock]
   rollback [--skip-build|--skip-deps] [--steal-lock]
@@ -87,6 +92,31 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd() } = {}) {
   if (command === 'init') {
     init({ cwd });
     return 0;
+  }
+
+  if (command === 'port-guard') {
+    const rest = argv.slice(1);
+    // No flags — loud rejection matches every other command (an unrecognised
+    // `--foo` here must never be silently ignored while the guard passes anyway).
+    const badFlag = rest.find((a) => a.startsWith('-'));
+    if (badFlag) {
+      log.error(`Unknown argument: ${badFlag}\nUsage: deploy-kit port-guard <port> <pm2-process-name>`);
+      return 1;
+    }
+    const [portArg, processName] = rest;
+    const port = Number(portArg);
+    if (!portArg || !PORT_RE.test(portArg) || !Number.isInteger(port) || port < 1 || port > 65535) {
+      log.error(`Invalid <port>: "${portArg || ''}"\nUsage: deploy-kit port-guard <port> <pm2-process-name>`);
+      return 1;
+    }
+    if (!processName) {
+      log.error('Missing <pm2-process-name>\nUsage: deploy-kit port-guard <port> <pm2-process-name>');
+      return 1;
+    }
+    const result = checkPortGuard(port, processName, { log });
+    if (result.ok) { log.success(result.message); return 0; }
+    log.error(result.message);
+    return 1;
   }
 
   let config;

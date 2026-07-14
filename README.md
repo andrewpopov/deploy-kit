@@ -73,6 +73,7 @@ unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 | `ensureApps` | `string[]` | `[]` | both | 0.4 | Auxiliary PM2 procs ensured up (tolerant) AFTER the app restart. A failure never fails the deploy. |
 | `preDeployChecks` | `{name,command}[]` | `[]` | both | 0.4 | Gates run BEFORE anything is touched; non-zero aborts with nothing changed. |
 | `postDeployChecks` | `{name,command}[]` | `[]` | both | 0.8 | Gates run after restart and every health probe succeeds; use public smoke journeys and asset checks. A failure reports the deploy as failed but does not silently roll back the live revision. |
+| `preRestartChecks` | `{name,command}[]` | `[]` | both | 0.10 | Gates run IMMEDIATELY BEFORE the app restart (after build, with `dbBoundApps` still paused; after the release-layout flip). A failure resumes any paused apps (legacy) or runs phase recovery (release layout) before aborting. Also gates `rollback`'s restart. Use for a check against the freshly-built/flipped candidate right before it takes traffic — e.g. `port-guard` (see below). |
 | `ecosystemFile` | `string \| null` | `null` | both | 0.3 | PM2 ecosystem file (rel. to `projectDir`). Enables first-deploy-safe `pm2 start … --only … --update-env \|\| pm2 restart … --update-env`; each deploy refreshes process env from the ecosystem file. |
 | `port` | `number` | `3000` | both | 0.1 | Health-probe port (`http://localhost:<port>`). |
 | `healthPath` | `string` | `'/api/health'` | both | 0.1 | Health-probe path. |
@@ -153,6 +154,29 @@ stable `ecosystemFile` whose `cwd` is the literal `…/current`. deploy-kit neve
 performs the one-time host restructure — that is a separate, per-app, reversible
 migration. A legacy deploy against a migrated host (or vice-versa) fails closed.
 
+### `port-guard` (shared-host port-conflict guard)
+
+On a multi-tenant host, a stale/unrelated process can end up squatting on the port
+your app is about to (re)claim — the reload then either fails or, worse, silently
+takes the WRONG process offline. `deploy-kit port-guard <port> <pm2-process-name>`
+checks who currently holds `<port>`:
+
+- nothing listening → exit 0 (free)
+- every listener is `<pm2-process-name>`'s pm2 process or a descendant PID (BFS via
+  `pgrep -P` / `ps --ppid`) → exit 0 (safe to reload)
+- any listener is a foreign process → exit 1, naming the squatting PID(s)
+- neither `lsof` nor `ss` is present on the host → exit 1 (**fails closed**; an
+  unverifiable guard is not a passed guard)
+
+It's a plain check command, so wire it into `preRestartChecks` (it then runs on the
+target immediately before the restart, gating it):
+
+```json
+"preRestartChecks": [
+  { "name": "port-safe", "command": "npx deploy-kit port-guard 3006 towerpower-app" }
+]
+```
+
 ### Monitoring (`deploy-kit monitor`)
 
 Add a `monitor` block to turn on cron-driven ops monitoring + alerting. It runs the
@@ -192,6 +216,7 @@ keep the app's own `/live` vs `/ready` split app-side.
 
 ```
 npx deploy-kit init              # scaffold config + print scripts block
+npx deploy-kit port-guard 3006 towerpower-app   # fail if 3006 is held by a foreign process
 npx deploy-kit deploy            # full pipeline
 npx deploy-kit deploy --dry-run  # print the command stream, execute nothing
 npx deploy-kit rollback          # git reset to the pre-last-deploy SHA + rebuild + restart
@@ -206,6 +231,7 @@ npx deploy-kit logs [--lines N] [--follow] [--errors]
 | Command | Flags | Does |
 | --- | --- | --- |
 | `init` | — | Write a `.deploy-kit.config.json` skeleton (never overwrites) + print the scripts block. |
+| `port-guard <port> <pm2-process-name>` | — | Exit 0 if `<port>` is free or held only by `<pm2-process-name>`'s pm2 process tree; exit 1 (naming the PID) if a foreign process holds it, or if neither `lsof` nor `ss` is available (fails closed). Meant to run ON the target as a `preRestartChecks` command — see below. |
 | `deploy` | `--skip-build` `--skip-deps` `--skip-migrate` `--no-stash` `--dry-run` `--steal-lock` `--no-lock` | Run the full pipeline. |
 | `rollback` | `--skip-build` `--skip-deps` `--steal-lock` | Reset to the recorded pre-deploy SHA, rebuild, restart, health-gate. |
 | `monitor` | `--steal-lock` | Run the `monitor` checks, alert on transitions, exit `0`/`1`/`2`. For a cron. |
