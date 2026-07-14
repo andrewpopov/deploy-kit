@@ -309,3 +309,46 @@ export function alertDiscord(options: {
   fetchImpl?: typeof fetch;
   log: Logger;
 }): Promise<0 | 1>;
+
+/** Env var read for the release-announcement Discord webhook URL when
+ * `--webhook-env` is not passed. */
+export const DEFAULT_RELEASE_WEBHOOK_ENV: string;
+
+/** The `deliveryEvent.command` payload deploy.js/release.js pipe on stdin after
+ * a successful deploy — see `DeployConfig['deliveryEvent']`. */
+export interface DeliveryEvent {
+  event: 'deployment';
+  status: 'succeeded';
+  branch: string;
+  revision: string;
+  deployedAt: string;
+}
+
+/** Format a delivery event into a concise Discord release-announcement body
+ * ("🚀 `<service>` deployed `<branch>@<shortsha>` at <time>"). Pure — no I/O. */
+export function formatReleaseDiscordMessage(event: DeliveryEvent, options?: { service?: string }): string;
+
+/** Bundled, OPT-IN convenience `deliveryEvent.command` implementation: reads the
+ * post-deploy delivery event from `stdin`, resolves the webhook URL from
+ * `env[webhookEnvName]` (default `DEFAULT_RELEASE_WEBHOOK_ENV`), formats it, and
+ * POSTs it to Discord. This is a convenience sink, NOT part of deploy.js's/
+ * release.js's policy-free `deliveryEvent` contract — they remain unaware
+ * Discord exists; a config opts in explicitly via
+ * `deliveryEvent.command = "npx deploy-kit announce-discord"`. Backs the
+ * `deploy-kit announce-discord [--webhook-env NAME] [--service NAME]` CLI
+ * command.
+ *
+ * ASYMMETRIC vs `alertDiscord`: a deliveryEvent is already a tolerated,
+ * best-effort step, and a release announcement is opt-in decoration on top of
+ * an already-succeeded deploy — so every failure mode here (unset webhook env,
+ * malformed stdin, a failed/timed-out POST) is a logged warning and exit `0`,
+ * never non-zero; a broken/unconfigured announcement must never fail a deploy.
+ * Never logs the webhook URL. */
+export function announceDiscord(options: {
+  stdin: string;
+  webhookEnvName?: string;
+  service?: string;
+  env?: Record<string, string | undefined>;
+  fetchImpl?: typeof fetch;
+  log: Logger;
+}): Promise<0>;

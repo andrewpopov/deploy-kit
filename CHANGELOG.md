@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.12.0
+
+- Add a bundled, OPT-IN `deploy-kit announce-discord [--webhook-env NAME]
+  [--service NAME]` CLI command: the RELEASE counterpart to `alert-discord`,
+  modeled 1:1 on it — a convenience `deliveryEvent.command` implementation for
+  `deploy`/`release`. It reads the post-deploy delivery event on stdin (the
+  same `{event:'deployment', status:'succeeded', branch, revision,
+  deployedAt}` shape `deliveryEvent.command` receives), resolves the webhook
+  URL from `process.env.DISCORD_RELEASE_WEBHOOK` (override the env var name
+  with `--webhook-env`; override the service name with `--service` or
+  `DISCORD_RELEASE_SERVICE`/`DISCORD_ALERT_SERVICE`), formats a concise
+  release announcement, and POSTs it to the webhook with a 10s timeout. Zero
+  runtime deps — uses Node's built-in `fetch`. The webhook URL is never
+  logged. **Asymmetric vs `alert-discord` by design**: since `deliveryEvent`
+  is already a tolerated, best-effort step and a release announcement is
+  opt-in decoration on an already-succeeded deploy, an unset webhook env,
+  malformed stdin, or a failed/timed-out POST is a clear stderr warning and
+  exit `0` — never non-zero — so a missing or broken announcement route can
+  never turn a healthy deploy red. This does NOT change deploy.js's/
+  release.js's policy-free `deliveryEvent` contract; opt in per-project via
+  `deliveryEvent: { command: "npx deploy-kit announce-discord" }`.
+
 ## 0.11.0
 
 - Add a bundled, OPT-IN `deploy-kit alert-discord [--webhook-env NAME]` CLI

@@ -8,11 +8,12 @@ const { init } = require('./init');
 const remote = require('./remote');
 const { checkPortGuard } = require('./port-guard');
 const { alertDiscord, DEFAULT_WEBHOOK_ENV } = require('./alert-discord');
+const { announceDiscord, DEFAULT_WEBHOOK_ENV: DEFAULT_RELEASE_WEBHOOK_ENV } = require('./announce-discord');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
   '--skip-migrate', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
-  '--webhook-env',
+  '--webhook-env', '--service',
 ];
 
 const PORT_RE = /^[0-9]+$/;
@@ -37,6 +38,7 @@ function parseOptions(args) {
     else if (a === '--steal-lock') options.stealLock = true;
     else if (a === '--no-lock') options.lock = false;
     else if (a === '--webhook-env' && args[i + 1]) { options.webhookEnv = args[i + 1]; i += 1; }
+    else if (a === '--service' && args[i + 1]) { options.service = args[i + 1]; i += 1; }
     else {
       throw new Error(
         `Unknown argument: ${a}\nValid options: ${KNOWN_FLAGS.join(', ')}`
@@ -58,6 +60,12 @@ Commands:
                                             monitor's alert JSON on stdin, post it
                                             to a Discord webhook (env NAME, default
                                             DISCORD_ALERT_WEBHOOK)
+  announce-discord [--webhook-env NAME]    convenience deliveryEvent.command:
+    [--service NAME]                       read the deploy delivery-event JSON on
+                                            stdin, post a release announcement to a
+                                            Discord webhook (env NAME, default
+                                            DISCORD_RELEASE_WEBHOOK). Opt-in and
+                                            unset -> skip (exit 0), never fails a deploy.
   deploy [--skip-build|--skip-deps|--skip-migrate]
          [--no-stash] [--dry-run] [--steal-lock] [--no-lock]
   rollback [--skip-build|--skip-deps] [--steal-lock]
@@ -156,6 +164,23 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     }));
   }
 
+  // announce-discord takes no positional args (only the now-generic
+  // `--webhook-env`/`--service` flags), so — like alert-discord — it is safe to
+  // dispatch AFTER parseOptions. It is dispatched here, before loadConfig,
+  // because it is a standalone utility: it does not read
+  // .deploy-kit.config.json and must not fail an operator who runs it outside
+  // a project directory.
+  if (command === 'announce-discord') {
+    return readStdin(stdin).then((data) => announceDiscord({
+      stdin: data,
+      webhookEnvName: options.webhookEnv || DEFAULT_RELEASE_WEBHOOK_ENV,
+      service: options.service,
+      env,
+      fetchImpl,
+      log,
+    }));
+  }
+
   let config;
   try {
     config = loadConfig({ cwd });
@@ -210,9 +235,10 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
 }
 
 if (require.main === module) {
-  // run() is synchronous for every command except alert-discord, which returns a
-  // Promise (it awaits stdin + the Discord POST). Promise.resolve(...).then(...)
-  // handles both: a plain number resolves immediately, a Promise<number> awaits.
+  // run() is synchronous for every command except alert-discord/announce-discord,
+  // which return a Promise (they await stdin + the Discord POST).
+  // Promise.resolve(...).then(...) handles both: a plain number resolves
+  // immediately, a Promise<number> awaits.
   Promise.resolve()
     .then(() => run())
     .then((code) => process.exit(code))
