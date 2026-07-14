@@ -1,6 +1,6 @@
 {
   "name": "@andrewpopov/deploy-kit",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "Hook-driven SSH/local deploy pipeline + remote PM2 ops CLI + Cloudflare tunnel launcher for the Pi service fleet",
   "author": "Andrew Popov",
   "main": "src/index.js",
@@ -12,7 +12,9 @@
     "type": "git",
     "url": "https://github.com/andrewpopov/deploy-kit.git"
   },
-  "bugs": { "url": "https://github.com/andrewpopov/deploy-kit/issues" },
+  "bugs": {
+    "url": "https://github.com/andrewpopov/deploy-kit/issues"
+  },
   "homepage": "https://github.com/andrewpopov/deploy-kit#readme",
   "bin": {
     "deploy-kit": "src/cli.js"
