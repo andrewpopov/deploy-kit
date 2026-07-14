@@ -137,13 +137,13 @@ describe('deploy pipeline', () => {
   it('ecosystemFile restarts apps via start-or-restart from the file (first-deploy safe)', () => {
     const { runtime, calls } = makeRuntime();
     deploy(mergeConfig(baseConfig, { ecosystemFile: 'ecosystem.config.cjs' }), {}, ctxWith(runtime));
-    expect(calls.some((c) => c.includes('pm2 start ecosystem.config.cjs --only app 2>/dev/null || pm2 restart app'))).toBe(true);
+    expect(calls.some((c) => c.includes('pm2 start ecosystem.config.cjs --only app --update-env 2>/dev/null || pm2 restart app --update-env'))).toBe(true);
   });
 
-  it('without ecosystemFile the app restart stays plain pm2 restart', () => {
+  it('without ecosystemFile the app restart refreshes its environment', () => {
     const { runtime, calls } = makeRuntime();
     deploy(baseConfig, {}, ctxWith(runtime));
-    expect(calls.some((c) => c.includes('pm2 restart app'))).toBe(true);
+    expect(calls.some((c) => c.includes('pm2 restart app --update-env'))).toBe(true);
     expect(calls.some((c) => c.includes('--only'))).toBe(false);
   });
 
@@ -159,7 +159,7 @@ describe('deploy pipeline', () => {
       ['stash', 'pull:master', 'install', 'backup', 'migrate', 'build', 'restart', 'ensure', 'health'],
     );
     const joined = calls.join('\n');
-    expect(joined).toContain('pm2 start ecosystem.config.cjs --only app-tunnel 2>/dev/null || pm2 restart app-tunnel');
+    expect(joined).toContain('pm2 start ecosystem.config.cjs --only app-tunnel --update-env 2>/dev/null || pm2 restart app-tunnel --update-env');
     // ensured apps come up after the main app, before the health gate
     expect(joined.indexOf('--only app ')).toBeLessThan(joined.indexOf('--only app-tunnel'));
     expect(joined.indexOf('--only app-tunnel')).toBeLessThan(joined.indexOf('curl'));
