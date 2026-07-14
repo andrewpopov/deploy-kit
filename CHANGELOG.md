@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.11.0
+
+- Add a bundled, OPT-IN `deploy-kit alert-discord [--webhook-env NAME]` CLI
+  command: a convenience `alert.command` implementation for `monitor`. It reads
+  the monitor's batched alert JSON on stdin (the same `{eventId, createdAtMs,
+  host, alerts}` shape any `alert.command` receives), resolves the webhook URL
+  from `process.env.DISCORD_ALERT_WEBHOOK` (override the env var name with
+  `--webhook-env`), formats a concise message (title + failing/recovered
+  checks), and POSTs it to the webhook with a 10s timeout. Zero runtime deps —
+  uses Node's built-in `fetch`. The webhook URL is never logged. An unset env
+  var, malformed stdin, or a failed/timed-out POST is a clear stderr message
+  and a non-zero exit, never a crash. This does NOT change the monitor's
+  policy-free contract — `monitor.js`/`checks.js` remain unaware Discord
+  exists; opt in per-project via
+  `monitor: { alert: { command: "npx deploy-kit alert-discord" } }`.
+
 ## 0.10.0
 
 - Add a generic `preRestartChecks` config phase — `{name,command}[]`, same shape

@@ -276,3 +276,36 @@ export function checkPortGuard(
   processName: string,
   ctx?: { runtime?: Runtime; log?: Logger },
 ): PortGuardResult;
+
+/** Env var read for the Discord webhook URL when `--webhook-env` is not passed. */
+export const DEFAULT_WEBHOOK_ENV: string;
+
+/** The batched monitor alert event `alert.command` receives on stdin — see
+ * `MonitorResult['alerts']` and `monitor.js`'s `deliverAlert`. */
+export interface MonitorAlertEvent {
+  eventId: string;
+  createdAtMs: number;
+  host: string;
+  alerts: { id: string; kind: 'alert' | 'recovery' | 'escalation' | 'reminder'; status: string; message: string }[];
+}
+
+/** Format a monitor alert event into a concise Discord message body (title +
+ * failing/recovered checks). Pure — no I/O. */
+export function formatDiscordMessage(event: MonitorAlertEvent): string;
+
+/** Bundled, OPT-IN convenience `alert.command` implementation: reads the monitor's
+ * alert JSON from `stdin`, resolves the webhook URL from `env[webhookEnvName]`
+ * (default `DEFAULT_WEBHOOK_ENV`), formats it, and POSTs it to Discord. This is a
+ * convenience sink, NOT part of the monitor's policy-free contract — monitor.js
+ * and checks.js remain unaware Discord exists; a config opts in explicitly via
+ * `monitor.alert.command = "npx deploy-kit alert-discord"`. Backs the
+ * `deploy-kit alert-discord [--webhook-env NAME]` CLI command. Never throws —
+ * every failure (unset env var, malformed stdin, a failed/timed-out POST) is a
+ * logged message and a non-zero return. Never logs the webhook URL. */
+export function alertDiscord(options: {
+  stdin: string;
+  webhookEnvName?: string;
+  env?: Record<string, string | undefined>;
+  fetchImpl?: typeof fetch;
+  log: Logger;
+}): Promise<0 | 1>;

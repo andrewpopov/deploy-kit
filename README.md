@@ -212,11 +212,37 @@ condition · `2` a monitor/config/delivery failure. Provider/scheduler-specific 
 belong in `checks[]` (statically-severitied) so they alert without flapping liveness —
 keep the app's own `/live` vs `/ready` split app-side.
 
+#### `alert-discord` — bundled Discord sink (opt-in convenience, not a policy change)
+
+`monitor.alert` is deliberately **policy-free**: `monitor.js`/`checks.js` only know
+how to hand the batched alert JSON to whatever `command` you configure — they have
+no idea what Discord, Slack, or PagerDuty are, and this stays true after adding
+`alert-discord`. What ships is a *consumer* of that same stdin-JSON contract, exactly
+like a hand-rolled `curl` one-liner would be, just bundled so a project doesn't have
+to hand-roll it:
+
+```json
+"monitor": {
+  "alert": { "command": "npx deploy-kit alert-discord" }
+}
+```
+
+It reads the batched alert event on stdin, resolves the webhook URL from
+`process.env.DISCORD_ALERT_WEBHOOK` (override the env var name with
+`--webhook-env NAME`), formats a concise message (title + one line per
+failing/recovered check), and POSTs it with a 10s timeout — zero runtime deps,
+using Node's built-in `fetch`. The webhook URL is never logged, in success or
+failure messages. If the env var is unset, the command prints `alert webhook not
+configured (set DISCORD_ALERT_WEBHOOK)` to stderr and exits non-zero — loud, not a
+silent no-op — without ever crashing with a stack trace; a failed or timed-out POST
+is likewise a clear message and non-zero exit.
+
 ## Use
 
 ```
 npx deploy-kit init              # scaffold config + print scripts block
 npx deploy-kit port-guard 3006 towerpower-app   # fail if 3006 is held by a foreign process
+npx deploy-kit alert-discord [--webhook-env NAME]  # convenience alert.command: post to Discord
 npx deploy-kit deploy            # full pipeline
 npx deploy-kit deploy --dry-run  # print the command stream, execute nothing
 npx deploy-kit rollback          # git reset to the pre-last-deploy SHA + rebuild + restart
@@ -232,6 +258,7 @@ npx deploy-kit logs [--lines N] [--follow] [--errors]
 | --- | --- | --- |
 | `init` | — | Write a `.deploy-kit.config.json` skeleton (never overwrites) + print the scripts block. |
 | `port-guard <port> <pm2-process-name>` | — | Exit 0 if `<port>` is free or held only by `<pm2-process-name>`'s pm2 process tree; exit 1 (naming the PID) if a foreign process holds it, or if neither `lsof` nor `ss` is available (fails closed). Meant to run ON the target as a `preRestartChecks` command — see below. |
+| `alert-discord` | `--webhook-env NAME` | Convenience `alert.command`: read the monitor's alert JSON on stdin, POST a formatted message to a Discord webhook (env var `NAME`, default `DISCORD_ALERT_WEBHOOK`). Exit 0 on a successful POST; non-zero (with a clear stderr message, never a stack trace) if the env var is unset or the POST fails. Opt-in — the monitor stays policy-free. |
 | `deploy` | `--skip-build` `--skip-deps` `--skip-migrate` `--no-stash` `--dry-run` `--steal-lock` `--no-lock` | Run the full pipeline. |
 | `rollback` | `--skip-build` `--skip-deps` `--steal-lock` | Reset to the recorded pre-deploy SHA, rebuild, restart, health-gate. |
 | `monitor` | `--steal-lock` | Run the `monitor` checks, alert on transitions, exit `0`/`1`/`2`. For a cron. |

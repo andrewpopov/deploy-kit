@@ -7,10 +7,12 @@ const { deploy, rollback } = require('./deploy');
 const { init } = require('./init');
 const remote = require('./remote');
 const { checkPortGuard } = require('./port-guard');
+const { alertDiscord, DEFAULT_WEBHOOK_ENV } = require('./alert-discord');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
   '--skip-migrate', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
+  '--webhook-env',
 ];
 
 const PORT_RE = /^[0-9]+$/;
@@ -34,6 +36,7 @@ function parseOptions(args) {
     else if (a === '--dry-run') options.dryRun = true;
     else if (a === '--steal-lock') options.stealLock = true;
     else if (a === '--no-lock') options.lock = false;
+    else if (a === '--webhook-env' && args[i + 1]) { options.webhookEnv = args[i + 1]; i += 1; }
     else {
       throw new Error(
         `Unknown argument: ${a}\nValid options: ${KNOWN_FLAGS.join(', ')}`
@@ -51,6 +54,10 @@ Commands:
   init                                     scaffold .deploy-kit.config.json + scripts
   port-guard <port> <pm2-process-name>     fail if <port> is held by a process
                                             other than <pm2-process-name>'s pm2 tree
+  alert-discord [--webhook-env NAME]       convenience alert.command: read the
+                                            monitor's alert JSON on stdin, post it
+                                            to a Discord webhook (env NAME, default
+                                            DISCORD_ALERT_WEBHOOK)
   deploy [--skip-build|--skip-deps|--skip-migrate]
          [--no-stash] [--dry-run] [--steal-lock] [--no-lock]
   rollback [--skip-build|--skip-deps] [--steal-lock]
@@ -75,7 +82,19 @@ function dryRunContext() {
   };
 }
 
-function run(argv = process.argv.slice(2), { cwd = process.cwd() } = {}) {
+// Drain a stream to a string. Injected as `stdin` so alert-discord is testable
+// without a real process.stdin (tests pass a Readable.from([json])).
+function readStdin(stream) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    stream.setEncoding('utf8');
+    stream.on('data', (chunk) => { data += chunk; });
+    stream.on('end', () => resolve(data));
+    stream.on('error', reject);
+  });
+}
+
+function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = process.stdin, env = process.env, fetchImpl } = {}) {
   const command = argv[0];
   if (!command || command === 'help' || command === '--help' || command === '-h') {
     console.log(HELP);
@@ -123,6 +142,18 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd() } = {}) {
   if (command === 'init') {
     init({ cwd });
     return 0;
+  }
+
+  // alert-discord takes no positional args (only the now-generic `--webhook-env`
+  // flag), so — unlike port-guard — it is safe to dispatch AFTER parseOptions;
+  // there is no positional value for the generic validator to misparse. It is
+  // still dispatched here, before loadConfig, because it is a standalone utility:
+  // it does not read .deploy-kit.config.json and must not fail an operator who
+  // runs it outside a project directory.
+  if (command === 'alert-discord') {
+    return readStdin(stdin).then((data) => alertDiscord({
+      stdin: data, webhookEnvName: options.webhookEnv || DEFAULT_WEBHOOK_ENV, env, fetchImpl, log,
+    }));
   }
 
   let config;
@@ -179,14 +210,18 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd() } = {}) {
 }
 
 if (require.main === module) {
-  try {
-    process.exit(run());
-  } catch (error) {
-    // A bad argument is an operator mistake, not a crash. Print it the way an
-    // unknown COMMAND is printed, and exit non-zero.
-    log.error(error.message);
-    process.exit(1);
-  }
+  // run() is synchronous for every command except alert-discord, which returns a
+  // Promise (it awaits stdin + the Discord POST). Promise.resolve(...).then(...)
+  // handles both: a plain number resolves immediately, a Promise<number> awaits.
+  Promise.resolve()
+    .then(() => run())
+    .then((code) => process.exit(code))
+    .catch((error) => {
+      // A bad argument is an operator mistake, not a crash. Print it the way an
+      // unknown COMMAND is printed, and exit non-zero.
+      log.error(error.message);
+      process.exit(1);
+    });
 }
 
 module.exports = { run, parseOptions };
