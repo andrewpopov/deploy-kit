@@ -30,6 +30,14 @@ const DEFAULT_CONFIG = {
   // A failure makes the deploy fail loudly; the active revision is left intact for
   // an explicit, evidence-based rollback decision.
   postDeployChecks: [],
+  // Pre-restart check gates run IMMEDIATELY BEFORE the app (re)start step — after
+  // build, with any dbBoundApps still paused. Each { name, command }; a non-zero
+  // exit aborts the deploy (any paused db-bound apps are resumed first, same as
+  // any other gate in that window). Use for a check that only makes sense against
+  // the freshly-built candidate but must run before traffic-affecting restart
+  // (e.g. a port-conflict guard). Generic: the kit runs them, the consumer supplies
+  // them.
+  preRestartChecks: [],
   // Path (relative to projectDir) to the PM2 ecosystem file. When set, the deploy
   // (re)starts apps/ensureApps via `pm2 start <file> --only <name> || pm2 restart <name>`
   // so a not-yet-registered process starts on first deploy and a running one
@@ -149,6 +157,7 @@ const KEY_TYPES = {
   ensureApps: 'array',
   preDeployChecks: 'array',
   postDeployChecks: 'array',
+  preRestartChecks: 'array',
   ecosystemFile: 'string?',
   port: 'number',
   healthPath: 'string',
@@ -380,6 +389,7 @@ function validateConfig(raw, { source = 'config' } = {}) {
   }
   problems.push(...validateDeployChecks(raw.preDeployChecks, 'preDeployChecks', source));
   problems.push(...validateDeployChecks(raw.postDeployChecks, 'postDeployChecks', source));
+  problems.push(...validateDeployChecks(raw.preRestartChecks, 'preRestartChecks', source));
   // `layout` type is checked above (object?); if present, validate its inner shape.
   if (raw.layout != null && typeof raw.layout === 'object' && !Array.isArray(raw.layout)) {
     problems.push(...validateLayout(raw.layout, source));

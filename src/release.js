@@ -539,6 +539,17 @@ function deployRelease(config, options = {}, ctx = {}) {
     st.flipped = true;
     steps.push('flip');
 
+    // Pre-restart checks: gated, run IMMEDIATELY BEFORE the pm2 restart — after
+    // `current` has flipped to the new release, before it takes over the port/
+    // process. A failure here throws into the 'flipped'-phase recovery (flips
+    // `current` back, restores DB if migrated, resumes the previous release) —
+    // the same recovery a failure anywhere else in this phase gets.
+    for (const check of config.preRestartChecks) {
+      log.step(`Pre-restart check: ${check.name}`);
+      runInDir(paths.root, check.command, config, c);
+      steps.push(`pre-restart-check:${check.name}`);
+    }
+
     log.step('Restarting apps from the stable ecosystem');
     runInDir(paths.root, pm2Activate(config, paths), config, c);
     runInDir(paths.root, 'pm2 save 2>/dev/null || true', config, c, { tolerate: true });
@@ -667,6 +678,13 @@ function rollbackRelease(config, options = {}, ctx = {}) {
 
     log.step(`Flipping current back to ${pointers.previous}`);
     activateSymlink(config, paths, pointers.previous, c);
+    // Pre-restart checks: gated, run IMMEDIATELY BEFORE the pm2 restart, same as
+    // the forward deploy — a rollback restart is just as capable of colliding
+    // with a squatting process as a forward one.
+    for (const check of config.preRestartChecks) {
+      log.step(`Pre-restart check: ${check.name}`);
+      runInDir(paths.root, check.command, config, c);
+    }
     runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
     runInDir(paths.root, 'pm2 save 2>/dev/null || true', config, c, { tolerate: true });
 

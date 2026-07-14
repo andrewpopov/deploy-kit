@@ -236,6 +236,49 @@ describe('release deploy — happy path', () => {
   });
 });
 
+describe('release deploy — preRestartChecks', () => {
+  it('runs IMMEDIATELY BEFORE the pm2 restart, after the current flip', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    const cfg = relConfig({ preRestartChecks: [{ name: 'port-safe', command: 'check-port' }] });
+    const result = release.deployRelease(cfg, {}, ctx(runtime));
+    expect(result.steps).toContain('pre-restart-check:port-safe');
+    const flip = calls.findIndex((cmd) => /mv -Tf .*\/current/.test(cmd));
+    const check = calls.findIndex((cmd) => cmd.includes('check-port'));
+    const restart = calls.findIndex((cmd) => cmd.includes('pm2 startOrRestart'));
+    expect(flip).toBeLessThan(check);
+    expect(check).toBeLessThan(restart);
+  });
+
+  it('a failing preRestartCheck runs the flipped-phase recovery (flips current back)', () => {
+    const { runtime, calls } = makeReleaseRuntime({ fail: ['check-port'] });
+    const cfg = relConfig({ preRestartChecks: [{ name: 'port-safe', command: 'check-port' }] });
+    expect(() => release.deployRelease(cfg, {}, ctx(runtime))).toThrow();
+    // The check fails BEFORE the forward pm2 restart, so the only
+    // `pm2 startOrRestart` seen is recovery's resume of the PREVIOUS release.
+    expect(calls.filter((cmd) => cmd.includes('pm2 startOrRestart')).length).toBe(1);
+    // two mv -Tf onto current: forward flip + recovery flip-back.
+    expect(calls.filter((cmd) => /mv -Tf .*\/current/.test(cmd)).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('absent preRestartChecks is a strict no-op on the release path too', () => {
+    const { runtime: r1, calls: c1 } = makeReleaseRuntime();
+    release.deployRelease(relConfig(), {}, ctx(r1));
+    const { runtime: r2, calls: c2 } = makeReleaseRuntime();
+    release.deployRelease(relConfig({ preRestartChecks: [] }), {}, ctx(r2));
+    expect(c2).toEqual(c1);
+  });
+
+  it('also gates release rollback, immediately before its restart', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    const cfg = relConfig({ preRestartChecks: [{ name: 'port-safe', command: 'check-port' }] });
+    release.rollbackRelease(cfg, {}, ctx(runtime));
+    const check = calls.findIndex((cmd) => cmd.includes('check-port'));
+    const restart = calls.findIndex((cmd) => cmd.includes('pm2 startOrRestart'));
+    expect(check).toBeGreaterThanOrEqual(0);
+    expect(check).toBeLessThan(restart);
+  });
+});
+
 describe('release deploy — failure recovery by phase', () => {
   it('install failure: current keeps serving, apps never stopped, candidate quarantined', () => {
     const { runtime, calls } = makeReleaseRuntime({ fail: ['npm ci'] });

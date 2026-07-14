@@ -237,6 +237,16 @@ function deploy(config, options = {}, ctx = {}) {
       steps.push('build');
     }
 
+    // Pre-restart checks: gated, run IMMEDIATELY BEFORE the restart step — after
+    // build, with any dbBoundApps still paused. A failure here resumes paused apps
+    // first (safeStep), same contract as a failed build in this window. Generic:
+    // the kit runs them, the consumer supplies them (e.g. a port-conflict guard
+    // against the freshly-built candidate before it takes over the port).
+    for (const check of config.preRestartChecks) {
+      safeStep(`Pre-restart check: ${check.name}`, check.command);
+      steps.push(`pre-restart-check:${check.name}`);
+    }
+
     if (config.appNames.length) {
       const restartCmd = config.hooks.restart || pm2StartOrRestart(config.appNames, config);
       run(`Restarting apps (${config.appNames.join(', ')})`, restartCmd);
@@ -322,6 +332,12 @@ function rollback(config, options = {}, ctx = {}) {
     run(`Resetting to ${sha.slice(0, 12)}`, `git reset --hard ${sha}`);
     if (!options.skipDeps) run('Installing dependencies', config.hooks.install);
     if (!options.skipBuild && config.hooks.build) run('Building', config.hooks.build);
+    // Same gate as the forward deploy, immediately before restart — a rollback
+    // restart is just as capable of colliding with a squatting process as a
+    // forward one, so the guard must cover both.
+    for (const check of config.preRestartChecks) {
+      run(`Pre-restart check: ${check.name}`, check.command);
+    }
     if (config.appNames.length) {
       run(`Restarting apps (${config.appNames.join(', ')})`, config.hooks.restart || pm2StartOrRestart(config.appNames, config));
       for (const name of config.ensureApps) {

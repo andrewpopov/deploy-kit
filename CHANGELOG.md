@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.10.0
+
+- Add a generic `preRestartChecks` config phase — `{name,command}[]`, same shape
+  and validation as `preDeployChecks`/`postDeployChecks`. Runs IMMEDIATELY BEFORE
+  the app restart: in the legacy pipeline after build (with any `dbBoundApps`
+  still paused — a failure resumes them, same as a failed build); in the
+  release-layout pipeline after the `current` symlink flip (a failure runs the
+  same 'flipped'-phase recovery as any other failure there). Also gates the
+  restart in both `rollback` paths. Strictly config-gated: absent/null/`[]`
+  emits a byte-identical command sequence to prior versions.
+- Add a `deploy-kit port-guard <port> <pm2-process-name>` CLI command: fails if
+  `<port>` is held by a process outside `<pm2-process-name>`'s pm2 process tree
+  (own pid + descendants via `pgrep -P`/`ps --ppid`), so a deploy reload on a
+  shared multi-tenant host can't collide with an unrelated process on the same
+  port. Prefers `lsof`, falls back to `ss`; fails CLOSED (loud, non-zero) if
+  neither is available. Wire it into `preRestartChecks` as
+  `{"name":"port-safe","command":"npx deploy-kit port-guard <port> <app>"}`.
+  Ported from towerpower's hand-rolled `verify_port_is_safe_for_reload`.
+
 ## 0.9.4
 
 Fix — release-layout deploys now run `postDeployChecks` and `deliveryEvent`

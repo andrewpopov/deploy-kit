@@ -229,6 +229,56 @@ describe('deploy pipeline', () => {
       .toMatch(/postDeployChecks\[0\]\.(name|command)/);
   });
 
+  const restartCheckConfig = mergeConfig(baseConfig, {
+    preRestartChecks: [{ name: 'port-safe', command: 'npx deploy-kit port-guard 3000 app' }],
+  });
+
+  it('preRestartChecks run IMMEDIATELY BEFORE restart (after build, before pm2 restart)', () => {
+    const { runtime, calls } = makeRuntime();
+    const result = deploy(restartCheckConfig, {}, ctxWith(runtime));
+    expect(result.steps).toEqual(
+      ['stash', 'pull:master', 'install', 'backup', 'migrate', 'build', 'pre-restart-check:port-safe', 'restart', 'health'],
+    );
+    const joined = calls.join('\n');
+    expect(joined.indexOf('npm run build')).toBeLessThan(joined.indexOf('npx deploy-kit port-guard'));
+    expect(joined.indexOf('npx deploy-kit port-guard')).toBeLessThan(joined.indexOf('pm2 restart app'));
+  });
+
+  it('a failing preRestartCheck aborts BEFORE restart and resumes any paused db-bound apps', () => {
+    const { runtime, calls } = makeRuntime({ fail: ['port-guard'] });
+    expect(() => deploy(restartCheckConfig, {}, ctxWith(runtime))).toThrow(/Pre-restart check: port-safe failed/);
+    const joined = calls.join('\n');
+    expect(joined).not.toContain('pm2 restart app');
+    // db-bound app (paused for migrate) must be resumed before aborting.
+    expect(calls.some((c) => c.includes('pm2 start app'))).toBe(true);
+  });
+
+  it('absent preRestartChecks is a strict no-op: identical step/command sequence to no config', () => {
+    const { runtime: r1, calls: c1 } = makeRuntime();
+    const base = deploy(baseConfig, {}, ctxWith(r1));
+    const { runtime: r2, calls: c2 } = makeRuntime();
+    const withEmpty = deploy(mergeConfig(baseConfig, { preRestartChecks: [] }), {}, ctxWith(r2));
+    expect(withEmpty.steps).toEqual(base.steps);
+    expect(c2).toEqual(c1);
+  });
+
+  it('preRestartChecks also gates rollback, immediately before its restart', () => {
+    const sha = 'c'.repeat(40);
+    const { runtime, calls } = makeRuntime();
+    const patched = {
+      execFileSync: (f: string, a: string[]) => {
+        const cmd = a[a.length - 1];
+        if (cmd.includes('prev-sha')) return sha;
+        return runtime.execFileSync(f, a);
+      },
+    };
+    rollback(mergeConfig(baseConfig, {
+      preRestartChecks: [{ name: 'port-safe', command: 'npx deploy-kit port-guard 3000 app' }],
+    }), {}, { runtime: patched, sleep: () => {} });
+    const joined = calls.join('\n');
+    expect(joined.indexOf('npx deploy-kit port-guard')).toBeLessThan(joined.indexOf('pm2 restart app'));
+  });
+
   it('skips deps/build/migrate when requested', () => {
     const { runtime } = makeRuntime();
     const result = deploy(baseConfig, { skipDeps: true, skipBuild: true, skipMigrate: true, stash: false }, ctxWith(runtime));

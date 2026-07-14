@@ -105,6 +105,11 @@ export interface DeployConfig {
   preDeployChecks?: PreDeployCheck[];
   /** Named gates run after health succeeds; failures fail the deployment result. */
   postDeployChecks?: PreDeployCheck[];
+  /** Named gates run IMMEDIATELY BEFORE the app restart (legacy: after build, with
+   * dbBoundApps still paused; release layout: after the `current` flip). A failure
+   * resumes paused apps / runs phase recovery before aborting. Also gates
+   * `rollback`'s restart. */
+  preRestartChecks?: PreDeployCheck[];
   ecosystemFile?: string | null;
   port: number;
   healthPath: string;
@@ -256,3 +261,18 @@ export function startTunnel(
   options: { configPath: string; tunnelName: string; cloudflaredBin?: string },
   ctx?: { execFileSync?: (file: string, args: string[], options?: unknown) => unknown; fs?: unknown; log?: Logger },
 ): { tunnelName: string; configPath: string; args: string[] };
+
+export interface PortGuardResult {
+  ok: boolean;
+  message: string;
+}
+/** Is every process LISTENing on `port` owned by `processName`'s PM2 process tree
+ * (its pm2 pid or a descendant, via pgrep -P / ps --ppid)? Free port or all-ours
+ * -> ok:true. A foreign listener -> ok:false, naming the squatting PID(s). Neither
+ * lsof nor ss present on the host -> ok:false (fails closed; loud). Backs the
+ * `deploy-kit port-guard <port> <pm2-process-name>` CLI command. */
+export function checkPortGuard(
+  port: number,
+  processName: string,
+  ctx?: { runtime?: Runtime; log?: Logger },
+): PortGuardResult;
