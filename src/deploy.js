@@ -80,14 +80,15 @@ function waitForHealth(config, ctx) {
 // Build the PM2 (re)start command for one or more process names. With an
 // `ecosystemFile`, start from the file when a process isn't registered yet (first
 // deploy) and fall back to `pm2 restart` when it is — the proven
-// `pm2 start <file> --only <name> || pm2 restart <name>` idiom from the
+// `pm2 start <file> --only <name> --update-env || pm2 restart <name> --update-env`
+// idiom from the
 // hand-rolled deploy.sh (sano). Without a file, plain `pm2 restart <names>`
 // (requires the processes to already exist, matching the original default).
 function pm2StartOrRestart(names, config) {
   const list = Array.isArray(names) ? names : [names];
-  const restart = `pm2 restart ${list.join(' ')}`;
+  const restart = `pm2 restart ${list.join(' ')} --update-env`;
   if (!config.ecosystemFile) return restart;
-  return `pm2 start ${config.ecosystemFile} --only ${list.join(',')} 2>/dev/null || ${restart}`;
+  return `pm2 start ${config.ecosystemFile} --only ${list.join(',')} --update-env 2>/dev/null || ${restart}`;
 }
 
 // A step that must succeed or the whole deploy aborts. onFail runs first
