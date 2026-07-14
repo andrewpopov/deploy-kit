@@ -81,19 +81,12 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd() } = {}) {
     console.log(HELP);
     return 0;
   }
-  const options = parseOptions(argv.slice(1));
-  // Surface the resolved version: a stale node_modules (manifest pinned newer
-  // than what is installed) is otherwise invisible until a flag silently
-  // misbehaves. See BRAIN-18 — `npm install` does not re-resolve a github: tag.
-  if (!options.dryRun) {
-    log.info(`deploy-kit v${require('../package.json').version}`);
-  }
 
-  if (command === 'init') {
-    init({ cwd });
-    return 0;
-  }
-
+  // port-guard takes POSITIONAL args (<port> <pm2-name>) and does its own parsing
+  // below. It must be dispatched BEFORE the generic parseOptions() flag validation,
+  // which only knows deploy/monitor flags and would otherwise reject the positional
+  // <port> as "Unknown argument" (BRAIN: caught only in a real deploy — the guard's
+  // function was unit-tested but the CLI subcommand invocation was not).
   if (command === 'port-guard') {
     const rest = argv.slice(1);
     // No flags — loud rejection matches every other command (an unrecognised
@@ -117,6 +110,19 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd() } = {}) {
     if (result.ok) { log.success(result.message); return 0; }
     log.error(result.message);
     return 1;
+  }
+
+  const options = parseOptions(argv.slice(1));
+  // Surface the resolved version: a stale node_modules (manifest pinned newer
+  // than what is installed) is otherwise invisible until a flag silently
+  // misbehaves. See BRAIN-18 — `npm install` does not re-resolve a github: tag.
+  if (!options.dryRun) {
+    log.info(`deploy-kit v${require('../package.json').version}`);
+  }
+
+  if (command === 'init') {
+    init({ cwd });
+    return 0;
   }
 
   let config;

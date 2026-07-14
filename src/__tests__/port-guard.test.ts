@@ -1,9 +1,58 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { createRequire } from 'module';
 
 const require = createRequire(__filename);
 const portGuard = require('../port-guard.js') as typeof import('../port-guard');
 const { checkPortGuard } = portGuard;
+const { run } = require('../cli.js') as { run: (argv: string[]) => number };
+// cli.js does `const { log } = require('./log')` — the SAME singleton object we grab
+// here, so spying on its methods captures exactly what the CLI emits (no fragile
+// console/stdout interception, which vitest itself hijacks).
+const { log } = require('../log.js') as { log: Record<string, (m: string) => void> };
+
+// Capture everything the CLI writes so we can assert WHICH code path produced an
+// error. The load-bearing distinction: the port-guard HANDLER says "Invalid <port>"
+// / "Usage: deploy-kit port-guard", whereas the generic parseOptions() flag validator
+// says "Valid options: --lines, ...". If a positional <port> reaches parseOptions,
+// the subcommand was dispatched in the wrong order (the real-deploy bug this guards).
+function captureCli(argv: string[]): { code: number; out: string } {
+  let out = '';
+  const sink = (m: string): void => { out += String(m) + '\n'; };
+  const spies = ['error', 'success', 'info', 'step', 'header', 'warn'].map((m) =>
+    log[m] ? vi.spyOn(log, m).mockImplementation(sink) : null,
+  );
+  try {
+    const code = run(argv);
+    return { code, out };
+  } finally {
+    for (const s of spies) s?.mockRestore();
+  }
+}
+
+describe('CLI: port-guard subcommand arg parsing (regression: caught only in a real deploy)', () => {
+  it('a positional <port> reaches the port-guard handler, NOT parseOptions', () => {
+    // Before the fix, `port-guard notaport app` hit parseOptions first and errored
+    // "Unknown argument: notaport / Valid options: --lines, ...". After, the handler
+    // owns it and reports "Invalid <port>".
+    const { code, out } = captureCli(['port-guard', 'notaport', 'app']);
+    expect(code).toBe(1);
+    expect(out).toMatch(/Invalid <port>/);
+    expect(out).not.toMatch(/Valid options: --lines/); // parseOptions must NOT have run
+  });
+
+  it('a valid-looking numeric <port> is not rejected as an unknown flag', () => {
+    // The exact failed command from the towerpower deploy. On CI the port is free so
+    // checkPortGuard returns ok; the point is it must PARSE, never "Unknown argument: 3006".
+    const { out } = captureCli(['port-guard', '3006', 'some-app']);
+    expect(out).not.toMatch(/Unknown argument: 3006/);
+  });
+
+  it('still rejects a stray flag from within the handler', () => {
+    const { code, out } = captureCli(['port-guard', '--nope']);
+    expect(code).toBe(1);
+    expect(out).toMatch(/deploy-kit port-guard <port>/); // handler usage, not parseOptions
+  });
+});
 
 // A fake execFileSync modeling `command -v`, lsof/ss, `pm2 pid`, and pgrep/ps
 // process-tree walks. `has` controls which binaries "exist" on the fake host.
