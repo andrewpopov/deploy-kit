@@ -10,6 +10,7 @@ const initMod = require('./init');
 const monitorMod = require('./monitor');
 const portGuardMod = require('./port-guard');
 const alertDiscordMod = require('./alert-discord');
+const announceDiscordMod = require('./announce-discord');
 
 // Destructure into locals so module.exports uses shorthand keys — Node's
 // cjs-module-lexer only detects named exports for identifier/shorthand forms,
@@ -27,6 +28,9 @@ const { init } = initMod;
 const { monitor } = monitorMod;
 const { checkPortGuard } = portGuardMod;
 const { formatDiscordMessage, alertDiscord, DEFAULT_WEBHOOK_ENV } = alertDiscordMod;
+const {
+  formatDiscordMessage: formatReleaseDiscordMessage, announceDiscord, DEFAULT_WEBHOOK_ENV: DEFAULT_RELEASE_WEBHOOK_ENV,
+} = announceDiscordMod;
 
 module.exports = {
   // config
@@ -64,4 +68,8 @@ module.exports = {
   formatDiscordMessage,
   alertDiscord,
   DEFAULT_WEBHOOK_ENV,
+  // announce-discord CLI (opt-in convenience deliveryEvent.command; deploy/release stay policy-free)
+  formatReleaseDiscordMessage,
+  announceDiscord,
+  DEFAULT_RELEASE_WEBHOOK_ENV,
 };

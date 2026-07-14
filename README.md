@@ -237,12 +237,44 @@ configured (set DISCORD_ALERT_WEBHOOK)` to stderr and exits non-zero — loud, n
 silent no-op — without ever crashing with a stack trace; a failed or timed-out POST
 is likewise a clear message and non-zero exit.
 
+#### `announce-discord` — bundled release sink (opt-in convenience, not a policy change)
+
+The RELEASE counterpart to `alert-discord`, modeled 1:1 on it. `deliveryEvent`
+is likewise deliberately **policy-free**: `deploy.js`/`release.js` only know how
+to pipe the post-deploy event JSON to whatever `command` you configure, run
+`tolerate: true` so a broken sink never fails the deploy. `announce-discord` is
+just a bundled *consumer* of that stdin-JSON contract:
+
+```json
+"deliveryEvent": { "command": "npx deploy-kit announce-discord" }
+```
+
+It reads the delivery event on stdin (`{event:'deployment', status:'succeeded',
+branch, revision, deployedAt}` — see `deploy.js`/`release.js`), resolves the
+webhook URL from `process.env.DISCORD_RELEASE_WEBHOOK` (override with
+`--webhook-env NAME`), picks a service name from `--service NAME` /
+`DISCORD_RELEASE_SERVICE` / `DISCORD_ALERT_SERVICE` (default `app`), formats
+`🚀 \`<service>\` deployed \`<branch>@<shortsha>\` at <time>`, and POSTs it with
+a 10s timeout — zero runtime deps, using Node's built-in `fetch`. The webhook
+URL is never logged.
+
+**Asymmetric vs `alert-discord` on purpose**: a release announcement is opt-in
+decoration on top of an *already-tolerated* `deliveryEvent` step, not the
+incident route itself. So an unset `DISCORD_RELEASE_WEBHOOK` prints
+`announce-discord: DISCORD_RELEASE_WEBHOOK not set — skipping release
+announcement` and **exits 0** — a missing release channel is a skip, never a
+reason to turn a healthy deploy red. Malformed stdin and a failed/timed-out
+POST are likewise a clear stderr warning and exit `0`. Contrast `alert-discord`,
+where a missing/broken route IS the problem it exists to report and exits
+non-zero.
+
 ## Use
 
 ```
 npx deploy-kit init              # scaffold config + print scripts block
 npx deploy-kit port-guard 3006 towerpower-app   # fail if 3006 is held by a foreign process
 npx deploy-kit alert-discord [--webhook-env NAME]  # convenience alert.command: post to Discord
+npx deploy-kit announce-discord [--webhook-env NAME] [--service NAME]  # convenience deliveryEvent.command: post a release announcement
 npx deploy-kit deploy            # full pipeline
 npx deploy-kit deploy --dry-run  # print the command stream, execute nothing
 npx deploy-kit rollback          # git reset to the pre-last-deploy SHA + rebuild + restart
@@ -259,6 +291,7 @@ npx deploy-kit logs [--lines N] [--follow] [--errors]
 | `init` | — | Write a `.deploy-kit.config.json` skeleton (never overwrites) + print the scripts block. |
 | `port-guard <port> <pm2-process-name>` | — | Exit 0 if `<port>` is free or held only by `<pm2-process-name>`'s pm2 process tree; exit 1 (naming the PID) if a foreign process holds it, or if neither `lsof` nor `ss` is available (fails closed). Meant to run ON the target as a `preRestartChecks` command — see below. |
 | `alert-discord` | `--webhook-env NAME` | Convenience `alert.command`: read the monitor's alert JSON on stdin, POST a formatted message to a Discord webhook (env var `NAME`, default `DISCORD_ALERT_WEBHOOK`). Exit 0 on a successful POST; non-zero (with a clear stderr message, never a stack trace) if the env var is unset or the POST fails. Opt-in — the monitor stays policy-free. |
+| `announce-discord` | `--webhook-env NAME` `--service NAME` | Convenience `deliveryEvent.command`: read the post-deploy delivery event on stdin, POST a release announcement to a Discord webhook (env var `NAME`, default `DISCORD_RELEASE_WEBHOOK`). Always exits 0 — an unset env var, malformed stdin, or a failed/timed-out POST is a clear stderr warning, never a failure, since a broken announcement must never fail an already-succeeded deploy. Opt-in — deploy/release stay policy-free. |
 | `deploy` | `--skip-build` `--skip-deps` `--skip-migrate` `--no-stash` `--dry-run` `--steal-lock` `--no-lock` | Run the full pipeline. |
 | `rollback` | `--skip-build` `--skip-deps` `--steal-lock` | Reset to the recorded pre-deploy SHA, rebuild, restart, health-gate. |
 | `monitor` | `--steal-lock` | Run the `monitor` checks, alert on transitions, exit `0`/`1`/`2`. For a cron. |
