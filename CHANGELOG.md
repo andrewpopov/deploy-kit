@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.4
+
+Fix — release-layout deploys now run `postDeployChecks` and `deliveryEvent`
+after the full activation verification, matching the existing legacy deploy
+contract. A failed post-deploy gate reports the deploy as failed without
+silently rolling back the already healthy release.
+
 ## 0.9.2
 
 - Add public contribution, support, and private vulnerability-reporting policies.

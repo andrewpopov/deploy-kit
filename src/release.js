@@ -56,8 +56,8 @@ function isReleaseLayout(config) {
 
 // Run one command on the target in a chosen directory (buildTargetCommand prefixes
 // `cd <projectDir> &&`, so we clone the config with projectDir swapped to `dir`).
-function runInDir(dir, command, config, ctx, { capture = false, tolerate = false } = {}) {
-  const res = runOnTarget(command, { ...config, projectDir: dir }, { capture, runtime: ctx.runtime });
+function runInDir(dir, command, config, ctx, { capture = false, tolerate = false, input } = {}) {
+  const res = runOnTarget(command, { ...config, projectDir: dir }, { capture, runtime: ctx.runtime, input });
   if (!res.ok && !tolerate && !capture) {
     throw new Error(`Deploy aborted: command failed in ${dir}: ${command}`);
   }
@@ -369,6 +369,11 @@ function deployRelease(config, options = {}, ctx = {}) {
         markRecovered();
         return;
       }
+      case 'post-deploy':
+        // Post-deploy checks run only after activation has fully verified. They
+        // report a failed deploy but intentionally do not roll back a healthy
+        // release, matching the legacy pipeline's contract.
+        return;
       default:
         fail(`unknown phase "${st.phase}"`);
     }
@@ -543,6 +548,32 @@ function deployRelease(config, options = {}, ctx = {}) {
     const v = verifyActivation(config, paths, st.sha, st.releaseDir, c);
     if (!v.ok) throw new Error(`Activation verification failed: ${v.reason}`);
     steps.push('health');
+
+    // These hooks are part of the public deploy contract, not a legacy-only
+    // feature. Run from the stable root so callers can explicitly `cd current`
+    // when their command needs release files, while preserving hooks that only
+    // operate on shared host state. A failure is reported without silently
+    // rolling back an already verified release.
+    st.phase = 'post-deploy';
+    journal();
+    for (const check of config.postDeployChecks) {
+      log.step(`Post-deploy check: ${check.name}`);
+      const result = runInDir(paths.root, check.command, config, c, { tolerate: true });
+      if (!result.ok) throw new Error(`Post-deploy check failed: ${check.name}`);
+      steps.push(`post-check:${check.name}`);
+    }
+    if (config.deliveryEvent?.command) {
+      const payload = JSON.stringify({
+        event: 'deployment', status: 'succeeded', branch,
+        revision: st.sha,
+        deployedAt: new Date().toISOString(),
+      });
+      runInDir(paths.root, config.deliveryEvent.command, config, c, {
+        tolerate: true,
+        input: payload,
+      });
+      steps.push('delivery-event');
+    }
 
     // ---- Phase: metadata + prune (success; still holding the lock) ----
     st.phase = 'done';
