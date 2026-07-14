@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.2
+
+- Add public contribution, support, and private vulnerability-reporting policies.
+- Add the MIT `LICENSE` file shipped with the public package.
+- Correct the documented `stepTimeoutSeconds` default to the runtime value of
+  `1800`; only an explicit `null` disables the timeout.
+- Add `npm run verify` for the local release gate.
+
 <!--
 Add a new entry at the top under `## <next-version>` when you change shipped
 behavior. The release-guard CI job asserts the git tag `vX.Y.Z` matches

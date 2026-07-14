@@ -48,6 +48,11 @@ Drop a `.deploy-kit.config.json` in the repo root (or run `deploy-kit init`):
 }
 ```
 
+## Project policies
+
+See [Contributing](./CONTRIBUTING.md), [Support](./SUPPORT.md), and the
+[Security Policy](./SECURITY.md). This package is licensed under [MIT](./LICENSE).
+
 The `.deploy-kit.config.json` holding your real host/paths lives in each
 **consumer** repo, never in this package. The config is validated on load —
 unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
@@ -79,7 +84,7 @@ unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 | `ssh.serverAliveInterval` | `number \| null` | `15` | ssh | 0.5 | `-o ServerAliveInterval`; `null` omits. |
 | `ssh.serverAliveCountMax` | `number \| null` | `3` | ssh | 0.5 | `-o ServerAliveCountMax`; `null` omits. |
 | `ssh.options` | `string[]` | `[]` | ssh | 0.5 | Extra raw `-o Key=Value` flags. |
-| `stepTimeoutSeconds` | `number \| null` | `null` | both | 0.5 | Per-command wall-clock timeout; `null` = no limit. |
+| `stepTimeoutSeconds` | `number \| null` | `1800` | both | 0.5 | Per-command wall-clock timeout; explicit `null` = no limit. |
 | `lock` | `boolean` | `true` | both | 0.5 | Take an atomic target lock so concurrent deploys can't interleave. |
 | `buildBeforeMigrate` | `boolean` | `false` | both | 0.2 | Build while apps are UP (paused window = just migration). |
 | `hooks.install` | `string` | `npm ci --prefer-offline \|\| npm ci \|\| npm install` | both | 0.1 | Dependency install; offline-first so a GitHub outage can't break a no-dep-change deploy. |
