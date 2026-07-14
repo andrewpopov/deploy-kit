@@ -9,6 +9,7 @@ const tunnel = require('./tunnel');
 const initMod = require('./init');
 const monitorMod = require('./monitor');
 const portGuardMod = require('./port-guard');
+const alertDiscordMod = require('./alert-discord');
 
 // Destructure into locals so module.exports uses shorthand keys — Node's
 // cjs-module-lexer only detects named exports for identifier/shorthand forms,
@@ -25,6 +26,7 @@ const { startTunnel } = tunnel;
 const { init } = initMod;
 const { monitor } = monitorMod;
 const { checkPortGuard } = portGuardMod;
+const { formatDiscordMessage, alertDiscord, DEFAULT_WEBHOOK_ENV } = alertDiscordMod;
 
 module.exports = {
   // config
@@ -58,4 +60,8 @@ module.exports = {
   init,
   // port-guard CLI
   checkPortGuard,
+  // alert-discord CLI (opt-in convenience alert.command; monitor stays policy-free)
+  formatDiscordMessage,
+  alertDiscord,
+  DEFAULT_WEBHOOK_ENV,
 };
