@@ -169,6 +169,18 @@ describe('release deploy — happy path', () => {
     expect(calls.some((cmd) => cmd.includes('get-running-sha'))).toBe(true);
   });
 
+  it('runs post-deploy checks and delivery events after activation', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    const result = release.deployRelease(relConfig({
+      postDeployChecks: [{ name: 'public-smoke', command: 'cd current && run-smoke' }],
+      deliveryEvent: { command: 'cd current && emit-event' },
+    }), {}, ctx(runtime));
+    expect(result.steps).toContain('post-check:public-smoke');
+    expect(result.steps).toContain('delivery-event');
+    expect(calls.some((command) => command.includes('cd /srv/app && cd current && run-smoke'))).toBe(true);
+    expect(calls.some((command) => command.includes('cd /srv/app && cd current && emit-event'))).toBe(true);
+  });
+
   it('dispatches through the public deploy() when layout.type is releases', () => {
     const { runtime } = makeReleaseRuntime();
     const result = kit.deploy(relConfig(), {}, ctx(runtime));
