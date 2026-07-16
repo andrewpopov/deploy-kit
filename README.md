@@ -13,7 +13,7 @@ paused apps are resumed on any failure, deploys are locked and health-verified).
 Pin the latest tag (tags are immutable — always pin `vX.Y.Z`, never a branch):
 
 ```
-npm install github:andrewpopov/deploy-kit#v0.12.0
+npm install github:andrewpopov/deploy-kit#v0.13.1
 ```
 
 ## Quick start
