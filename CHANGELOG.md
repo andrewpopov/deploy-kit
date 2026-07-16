@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.0
+
+- Harden `alert-discord` with the reusable delivery behavior proven by Smart
+  Home: bounded stdin, Discord-safe output truncation, severity and reminder
+  presentation, service branding, and non-retryable invalid-batch handling so
+  malformed input cannot poison the monitor outbox forever.
+
 ## 0.12.2
 
 - Legacy in-place delivery events now include the same optional opaque
@@ -7,7 +14,6 @@
   a safe final-line id/path or a db-backup JSON result. Both layouts share one
   validator and expose only the leaf label; unsafe, traversing, skipped, or
   noisy output is omitted without breaking existing backup hooks.
-
 ## 0.12.1
 
 - Release-layout delivery events now include an optional opaque

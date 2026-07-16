@@ -4,7 +4,7 @@ import { Readable } from 'stream';
 
 const require = createRequire(__filename);
 const alertDiscordMod = require('../alert-discord.js') as typeof import('../alert-discord');
-const { formatDiscordMessage, alertDiscord, DEFAULT_WEBHOOK_ENV } = alertDiscordMod;
+const { formatDiscordMessage, alertDiscord, DEFAULT_WEBHOOK_ENV, DISCORD_CONTENT_LIMIT } = alertDiscordMod;
 const { run } = require('../cli.js') as { run: (argv: string[], opts?: any) => number | Promise<number> };
 const { log } = require('../log.js') as { log: Record<string, (m: string) => void> };
 
@@ -33,14 +33,27 @@ const SAMPLE_EVENT = {
 describe('formatDiscordMessage', () => {
   it('renders a title and one line per failing/recovered check', () => {
     const msg = formatDiscordMessage(SAMPLE_EVENT);
-    expect(msg).toMatch(/1 issue\(s\) on app@pi/);
-    expect(msg).toMatch(/\[CRIT\/alert\] pm2:app: app not online \(stopped\)/);
-    expect(msg).toMatch(/\[OK\/recovery\] disk:\/srv\/app: disk ok \(900000 KiB free\)/);
+    expect(msg).toMatch(/🚨 deploy-kit monitor — app@pi/);
+    expect(msg).toMatch(/🔴 `pm2:app` app not online \(stopped\)/);
+    expect(msg).toMatch(/✅ `disk:\/srv\/app` disk ok \(900000 KiB free\)/);
+    expect(msg).toMatch(/— event `123-abc`/);
   });
 
-  it('handles an event with no alerts without crashing', () => {
-    const msg = formatDiscordMessage({ eventId: 'x', createdAtMs: 0, host: 'h', alerts: [] });
-    expect(msg).toMatch(/no check details/);
+  it('supports service branding and bounds the message to Discord limits', () => {
+    const event = {
+      ...SAMPLE_EVENT,
+      alerts: Array.from({ length: 20 }, (_, index) => ({
+        id: `check-${index}`,
+        kind: index === 0 ? 'reminder' : 'alert',
+        status: 'warn',
+        message: 'x'.repeat(500),
+      })),
+    };
+    const msg = formatDiscordMessage(event, { service: 'smarthome' });
+    expect(msg).toMatch(/smarthome monitor/);
+    expect(msg).toMatch(/🔁 `check-0`/);
+    expect(msg).toMatch(/…\(\+\d+ more\)/);
+    expect(msg.length).toBeLessThanOrEqual(DISCORD_CONTENT_LIMIT);
   });
 });
 
@@ -63,6 +76,7 @@ describe('alertDiscord (module)', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe('https://discord.example/webhooks/1/secret-token');
     expect(calls[0].body.content).toBe(formatDiscordMessage(SAMPLE_EVENT));
+    expect(calls[0].body.username).toBe('deploy-kit monitor');
   });
 
   it('never logs the webhook URL, on success or failure', async () => {
@@ -107,7 +121,7 @@ describe('alertDiscord (module)', () => {
     expect(calls).toEqual(['https://discord.example/custom']);
   });
 
-  it('malformed stdin JSON -> clear error, non-zero, no crash', async () => {
+  it('malformed stdin JSON is dropped instead of poisoning the retry outbox', async () => {
     const cap = captureLog();
     const code = await alertDiscord({
       stdin: '{not valid json',
@@ -116,8 +130,21 @@ describe('alertDiscord (module)', () => {
     });
     const out = cap.out();
     cap.restore();
-    expect(code).toBe(1);
+    expect(code).toBe(0);
     expect(out).toMatch(/malformed alert JSON/);
+    expect(out).toMatch(/non-retryable/);
+  });
+
+  it('invalid and empty alert batches are dropped without attempting delivery', async () => {
+    const fetchImpl = vi.fn();
+    const cap = captureLog();
+    const invalid = await alertDiscord({ stdin: 'null', env: {}, fetchImpl, log });
+    const empty = await alertDiscord({ stdin: JSON.stringify({ alerts: [null, 'bad'] }), env: {}, fetchImpl, log });
+    cap.restore();
+
+    expect(invalid).toBe(0);
+    expect(empty).toBe(0);
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('a failed (non-2xx) POST is reported clearly and non-zero', async () => {
@@ -143,7 +170,7 @@ describe('CLI: alert-discord subcommand dispatch', () => {
     // `--webhook-env` would hit parseOptions and print "Valid options: --lines, ...".
     const cap = captureLog();
     const stdin = Readable.from([JSON.stringify(SAMPLE_EVENT)]);
-    const code = await run(['alert-discord', '--webhook-env', 'SOME_OTHER_VAR'], {
+    const code = await run(['alert-discord', '--webhook-env', 'SOME_OTHER_VAR', '--service', 'smarthome'], {
       stdin, env: {},
     });
     const out = cap.out();
@@ -165,5 +192,19 @@ describe('CLI: alert-discord subcommand dispatch', () => {
     });
     expect(code).toBe(0);
     expect(calls).toEqual(['https://discord.example/webhooks/1/x']);
+  });
+
+  it('bounds stdin and drops oversized batches without poisoning retries', async () => {
+    const cap = captureLog();
+    const code = await run(['alert-discord'], {
+      stdin: Readable.from(['x'.repeat(256 * 1024 + 1)]),
+      env: {},
+    });
+    const out = cap.out();
+    cap.restore();
+
+    expect(code).toBe(0);
+    expect(out).toMatch(/stdin exceeded the size cap/);
+    expect(out).not.toMatch(/webhook not configured/);
   });
 });
