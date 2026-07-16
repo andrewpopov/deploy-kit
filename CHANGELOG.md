@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.2
+
+- Legacy in-place delivery events now include the same optional opaque
+  `backupReference` as release-layout deploys when the backup hook emits either
+  a safe final-line id/path or a db-backup JSON result. Both layouts share one
+  validator and expose only the leaf label; unsafe, traversing, skipped, or
+  noisy output is omitted without breaking existing backup hooks.
+
 ## 0.12.1
 
 - Release-layout delivery events now include an optional opaque
