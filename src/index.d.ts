@@ -322,7 +322,7 @@ export interface DeliveryEvent {
   branch: string;
   revision: string;
   deployedAt: string;
-  /** Opaque backup label, never the host-local backup path. Present when a release-layout backup ran. */
+  /** Opaque backup label, never the host-local backup path. Present when a backup hook emits a usable id. */
   backupReference?: string;
 }
 

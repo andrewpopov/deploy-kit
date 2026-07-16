@@ -12,20 +12,23 @@ const cli = require('../cli.js') as { run: Function; parseOptions: Function };
 // A fake execFileSync that records every command and returns programmed output.
 // The command to run is always the LAST arg: local is ('sh', ['-c', cmd]); ssh is
 // ('ssh', [...hardening -o flags, host, 'cd dir && <cmd>']).
-function makeRuntime({ fail = [] as string[] } = {}) {
+function makeRuntime({ fail = [] as string[], backupOutput = '' } = {}) {
   const calls: string[] = [];
-  const execFileSync = (file: string, args: string[]) => {
+  const inputs: Array<{ command: string; input: string | undefined }> = [];
+  const execFileSync = (file: string, args: string[], options: { input?: string } = {}) => {
     const remoteCmd = args[args.length - 1];
     calls.push(remoteCmd);
+    inputs.push({ command: remoteCmd, input: options.input });
     if (fail.some((f) => remoteCmd.includes(f))) {
       const err: any = new Error(`fake failure: ${remoteCmd}`);
       err.stdout = '';
       throw err;
     }
     if (remoteCmd.includes('curl')) return '200';
+    if (remoteCmd.includes('db:backup')) return backupOutput;
     return '';
   };
-  return { runtime: { execFileSync }, calls };
+  return { runtime: { execFileSync }, calls, inputs };
 }
 
 const baseConfig = mergeConfig(DEFAULT_CONFIG, {
@@ -90,6 +93,37 @@ describe('deploy pipeline', () => {
     const { runtime, calls } = makeRuntime({ fail: ['db:backup'] });
     expect(() => deploy(baseConfig, {}, ctxWith(runtime))).toThrow(/Pre-migration database backup failed/);
     expect(calls.join('\n')).not.toContain('db:migrate');
+  });
+
+  it('emits a leaf-only backup reference from db-backup JSON', () => {
+    const backupPath = '/var/lib/bewks/backups/bewks-20260716T201500Z.db.gz';
+    const { runtime, inputs } = makeRuntime({
+      backupOutput: JSON.stringify({ created: { fullPath: backupPath, fileName: 'bewks-20260716T201500Z.db.gz' } }),
+    });
+    const cfg = mergeConfig(baseConfig, { deliveryEvent: { command: 'emit-event' } });
+
+    const result = deploy(cfg, {}, ctxWith(runtime));
+
+    expect(result.steps).toContain('delivery-event');
+    const event = JSON.parse(inputs.find(({ command }) => command.includes('emit-event'))?.input ?? '{}');
+    expect(event.backupReference).toBe('bewks-20260716T201500Z.db.gz');
+    expect(JSON.stringify(event)).not.toContain('/var/lib/bewks/backups');
+  });
+
+  it('omits unsafe or noisy backup output from delivery events without failing the deploy', () => {
+    for (const backupOutput of [
+      '../../etc/shadow',
+      '/var/lib/bewks/backups/',
+      '.',
+      '[db-backup] Keeping 4 backup(s), removed 0 backup(s).',
+    ]) {
+      const { runtime, inputs } = makeRuntime({ backupOutput });
+      const cfg = mergeConfig(baseConfig, { deliveryEvent: { command: 'emit-event' } });
+
+      expect(deploy(cfg, {}, ctxWith(runtime)).healthy).toBe(true);
+      const event = JSON.parse(inputs.find(({ command }) => command.includes('emit-event'))?.input ?? '{}');
+      expect(event).not.toHaveProperty('backupReference');
+    }
   });
 
   it('resumes paused db-bound apps if the migration fails, then aborts', () => {

@@ -3,6 +3,7 @@
 const { runOnTarget, buildHealthCommand } = require('./exec');
 const { acquireLock } = require('./lock');
 const { log: defaultLog } = require('./log');
+const { backupIdFromOutput, isSafeBackupId, backupReferenceFromId } = require('./backup-reference');
 
 // Bump when the on-host layout changes shape. The host migration writes this
 // version into .deploy-kit-layout; a release deploy refuses a host whose marker
@@ -499,17 +500,13 @@ function deployRelease(config, options = {}, ctx = {}) {
       if (!res.ok) throw new Error('Pre-migration database backup failed');
       // The backup hook must print a restorable id/path as its last non-empty stdout
       // line. Validate it to a safe charset before it is interpolated into restore.
-      const lines = (res.output || '').split('\n').map((s) => s.trim()).filter(Boolean);
-      st.backupId = lines.length ? lines[lines.length - 1] : null;
-      // Safe charset AND no absolute path / `..` traversal — the id may be used as a
-      // path by the restore hook, so an absolute or traversing value could restore
-      // the wrong file even though the single-quoting already blocks shell injection.
-      // A backup id is typically an ABSOLUTE path to the backup file (e.g.
+      st.backupId = backupIdFromOutput(res.output);
+      // The id may be used as a path by the restore hook. A backup id is typically
+      // an ABSOLUTE path to the backup file (e.g.
       // /var/lib/smarthome/backups/smarthome-<ts>.db.gpg), so absolute is allowed.
-      // Reject only shell metacharacters (safe charset) and `..` traversal — the id
-      // is produced by our own backup hook and single-quoted into the restore command.
-      const safeBackupId = (id) => !!id && /^[A-Za-z0-9._/-]+$/.test(id) && !id.split('/').includes('..');
-      if (config.hooks.migrate && !safeBackupId(st.backupId)) {
+      // Reject shell metacharacters, `..` traversal, and directory-only values — the
+      // id is produced by our own backup hook and single-quoted into the restore command.
+      if (config.hooks.migrate && !isSafeBackupId(st.backupId)) {
         throw new Error(`Backup hook did not emit a safe restorable id as its last line (got "${st.backupId || ''}"); refusing to migrate without a usable restore point`);
       }
       steps.push('backup');
@@ -578,9 +575,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       // cross-system audit record, so expose only its opaque leaf reference.
       // This preserves a deploy-to-backup correlation without publishing host
       // topology to the receiving control plane.
-      const backupReference = typeof st.backupId === 'string'
-        ? st.backupId.split('/').filter(Boolean).at(-1)
-        : undefined;
+      const backupReference = backupReferenceFromId(st.backupId);
       const payload = JSON.stringify({
         event: 'deployment', status: 'succeeded', branch,
         revision: st.sha,
