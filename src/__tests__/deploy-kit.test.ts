@@ -844,3 +844,52 @@ describe('monitor config validation', () => {
     expect(withMon(bad).join('\n')).toMatch(/headers\["Authorization"\].*single quote/);
   });
 });
+
+describe('backup-reference: backupIdFromOutput contract (PKG-29)', () => {
+  const { backupIdFromOutput, NO_BACKUP_ID_WARNING } = require('../backup-reference.js');
+
+  function fakeLog() {
+    const warnings: string[] = [];
+    return { warnings, log: { warning: (msg: string) => warnings.push(msg) } };
+  }
+
+  it('prefers a top-level backupId over the legacy created.fileName', () => {
+    const { warnings, log } = fakeLog();
+    const output = JSON.stringify({
+      backupId: 'stable-backup-id-42',
+      created: { fullPath: '/backups/legacy-path.db.gz', fileName: 'legacy-path.db.gz' },
+    });
+    expect(backupIdFromOutput(output, { log })).toBe('stable-backup-id-42');
+    expect(warnings).toEqual([]);
+  });
+
+  it('warns loudly (without throwing) when the hook output contains no parseable id', () => {
+    const { warnings, log } = fakeLog();
+    expect(backupIdFromOutput(JSON.stringify({ ok: true, tookMs: 12 }), { log })).toBeNull();
+    expect(warnings).toEqual([NO_BACKUP_ID_WARNING]);
+    expect(NO_BACKUP_ID_WARNING).toContain('backupId');
+    expect(NO_BACKUP_ID_WARNING).toContain('db-backup >= 0.18.0');
+  });
+
+  it('warns when the hook produced no output at all', () => {
+    for (const empty of ['', '   \n  ', undefined]) {
+      const { warnings, log } = fakeLog();
+      expect(backupIdFromOutput(empty, { log })).toBeNull();
+      expect(warnings).toEqual([NO_BACKUP_ID_WARNING]);
+    }
+  });
+
+  it('does not warn when an id parses via any supported form', () => {
+    for (const output of [
+      JSON.stringify({ backupId: 'b-1' }),
+      JSON.stringify({ id: 'b-2' }),
+      JSON.stringify({ created: { fullPath: '/backups/b-3.db.gz' } }),
+      JSON.stringify({ created: { fileName: 'b-4.db.gz' } }),
+      'noise line\n/backups/b-5.db.gz',
+    ]) {
+      const { warnings, log } = fakeLog();
+      expect(backupIdFromOutput(output, { log })).toBeTruthy();
+      expect(warnings).toEqual([]);
+    }
+  });
+});

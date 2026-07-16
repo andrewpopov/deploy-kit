@@ -9,12 +9,12 @@ const remote = require('./remote');
 const { checkPortGuard } = require('./port-guard');
 const { alertDiscord, DEFAULT_WEBHOOK_ENV } = require('./alert-discord');
 const { announceDiscord, DEFAULT_WEBHOOK_ENV: DEFAULT_RELEASE_WEBHOOK_ENV } = require('./announce-discord');
-const { runCairnOperations } = require('./cairn-operations');
+const { runHostOperations, runCairnOperations } = require('./host-operations');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
   '--skip-migrate', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
-  '--webhook-env', '--service',
+  '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
 ];
 
 const PORT_RE = /^[0-9]+$/;
@@ -40,6 +40,9 @@ function parseOptions(args) {
     else if (a === '--no-lock') options.lock = false;
     else if (a === '--webhook-env' && args[i + 1]) { options.webhookEnv = args[i + 1]; i += 1; }
     else if (a === '--service' && args[i + 1]) { options.service = args[i + 1]; i += 1; }
+    else if (a === '--action' && args[i + 1]) { options.action = args[i + 1]; i += 1; }
+    else if (a === '--api-url-env' && args[i + 1]) { options.apiUrlEnv = args[i + 1]; i += 1; }
+    else if (a === '--api-key-env' && args[i + 1]) { options.apiKeyEnv = args[i + 1]; i += 1; }
     else {
       throw new Error(
         `Unknown argument: ${a}\nValid options: ${KNOWN_FLAGS.join(', ')}`
@@ -67,8 +70,13 @@ Commands:
                                             Discord webhook (env NAME, default
                                             DISCORD_RELEASE_WEBHOOK). Opt-in and
                                             unset -> skip (exit 0), never fails a deploy.
-  run-cairn-operations                     claim one allowlisted Cairn operation
-                                            and run this project's configured deploy pipeline
+  run-host-operations --action NAME        claim one allowlisted operation-API
+    [--api-url-env ENV] [--api-key-env ENV] request and run this project's configured deploy
+                                            pipeline (env defaults: HOST_OPERATIONS_API_URL /
+                                            HOST_OPERATIONS_API_KEY)
+  run-cairn-operations                     deprecated alias for run-host-operations with
+                                            the Cairn defaults (DEPLOY_CAIRN_PRODUCTION action,
+                                            CAIRN_OPERATIONS_API_URL / CAIRN_OPERATIONS_API_KEY)
   deploy [--skip-build|--skip-deps|--skip-migrate]
          [--no-stash] [--dry-run] [--steal-lock] [--no-lock]
   rollback [--skip-build|--skip-deps] [--steal-lock]
@@ -238,7 +246,28 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
         log.error(error instanceof Error ? error.message : String(error));
         return 2;
       }
+    case 'run-host-operations':
+      if (!options.action) {
+        log.error('Missing --action\nUsage: deploy-kit run-host-operations --action NAME [--api-url-env ENV] [--api-key-env ENV]');
+        return 1;
+      }
+      return runHostOperations(config, {
+        action: options.action,
+        apiUrl: env[options.apiUrlEnv || 'HOST_OPERATIONS_API_URL'],
+        apiKey: env[options.apiKeyEnv || 'HOST_OPERATIONS_API_KEY'],
+      }).then(() => 0).catch((error) => {
+        log.error(error instanceof Error ? error.message : String(error));
+        return 1;
+      });
+    // Deprecated alias — supplies the old fixed Cairn defaults. See host-operations.js.
     case 'run-cairn-operations':
+      // The alias's contract is exactly the old fixed one — accepting the new
+      // generic flags and silently ignoring them would be the BWK-136 failure
+      // mode again (an operator believes a flag took effect when it did not).
+      if (options.action || options.apiUrlEnv || options.apiKeyEnv) {
+        log.error('run-cairn-operations takes no flags — use `deploy-kit run-host-operations --action NAME [--api-url-env ENV] [--api-key-env ENV]` instead');
+        return 1;
+      }
       return runCairnOperations(config, {
         apiUrl: env.CAIRN_OPERATIONS_API_URL,
         apiKey: env.CAIRN_OPERATIONS_API_KEY,

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.14.0
+
+- Added `runHostOperations` / `deploy-kit run-host-operations --action NAME
+  [--api-url-env ENV] [--api-key-env ENV]`: a generic, host-configurable
+  operation runner (claim one allowlisted operations-API request matching
+  `action`, run this checkout's configured deploy pipeline, complete the
+  lease). The action name, API base URL, and API key are now supplied by the
+  caller instead of being hardcoded to Cairn. The claim request now sends the
+  configured action so a filtering server never leases a request meant for
+  another runner; a mismatched claim is released as FAILED (`unsupported
+  action for this runner`) instead of being abandoned until lease expiry.
+- Deprecated `runCairnOperations` / `deploy-kit run-cairn-operations`: both
+  remain as thin wrappers over `runHostOperations` that supply the old
+  `DEPLOY_CAIRN_PRODUCTION` action and `CAIRN_OPERATIONS_API_URL` /
+  `CAIRN_OPERATIONS_API_KEY` env var defaults, so existing Cairn usage keeps
+  working unchanged.
+- Backup-hook id parsing no longer degrades silently: when the hook ran but
+  its output contained no parseable backup id (or no output at all), deploy-kit
+  now logs a loud warning naming the preferred contract — JSON stdout with a
+  top-level `backupId` (db-backup >= 0.18.0) — instead of quietly losing
+  restore correlation. Legacy fallbacks (`id`, `created.fullPath`,
+  `created.fileName`, safe final line) remain supported; the deploy never
+  fails over a missing id.
+
 ## 0.13.0
 
 - Harden `alert-discord` with the reusable delivery behavior proven by Smart
