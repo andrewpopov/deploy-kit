@@ -574,10 +574,18 @@ function deployRelease(config, options = {}, ctx = {}) {
       steps.push(`post-check:${check.name}`);
     }
     if (config.deliveryEvent?.command) {
+      // Backup hooks often return a host-local path. The delivery event is a
+      // cross-system audit record, so expose only its opaque leaf reference.
+      // This preserves a deploy-to-backup correlation without publishing host
+      // topology to the receiving control plane.
+      const backupReference = typeof st.backupId === 'string'
+        ? st.backupId.split('/').filter(Boolean).at(-1)
+        : undefined;
       const payload = JSON.stringify({
         event: 'deployment', status: 'succeeded', branch,
         revision: st.sha,
         deployedAt: new Date().toISOString(),
+        ...(backupReference ? { backupReference } : {}),
       });
       runInDir(paths.root, config.deliveryEvent.command, config, c, {
         tolerate: true,
