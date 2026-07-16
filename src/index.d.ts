@@ -322,6 +322,8 @@ export interface DeliveryEvent {
   branch: string;
   revision: string;
   deployedAt: string;
+  /** Opaque backup label, never the host-local backup path. Present when a release-layout backup ran. */
+  backupReference?: string;
 }
 
 /** Format a delivery event into a concise Discord release-announcement body

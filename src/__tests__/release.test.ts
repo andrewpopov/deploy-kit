@@ -33,12 +33,14 @@ function makeReleaseRuntime(over: any = {}) {
     ...over,
   };
   const calls: string[] = [];
+  const inputs: Array<{ command: string; input: string | undefined }> = [];
   // Model PM2 stop/start so the GATED, verified writer-stop can be exercised: a
   // `pm2 stop` marks apps stopped; a start/restart brings them back online.
   const stopped = new Set<string>();
-  const execFileSync = (_file: string, args: string[]) => {
+  const execFileSync = (_file: string, args: string[], options: { input?: string } = {}) => {
     const cmd = args[args.length - 1];
     calls.push(cmd);
+    inputs.push({ command: cmd, input: options.input });
     if (cfg.fail.some((f: string) => cmd.includes(f))) {
       const err: any = new Error(`fake failure: ${cmd}`);
       err.stdout = '';
@@ -66,7 +68,7 @@ function makeReleaseRuntime(over: any = {}) {
     if (cmd.includes('curl')) return '200';
     return '';
   };
-  return { runtime: { execFileSync }, calls, cfg };
+  return { runtime: { execFileSync }, calls, inputs, cfg };
 }
 
 const relConfig = (over: any = {}) => mergeConfig(DEFAULT_CONFIG, {
@@ -162,7 +164,7 @@ describe('release deploy — happy path', () => {
   });
 
   it('restarts from the stable ecosystem (never a baked release path) and verifies cwd', () => {
-    const { runtime, calls } = makeReleaseRuntime();
+    const { runtime, calls, inputs } = makeReleaseRuntime();
     release.deployRelease(relConfig(), {}, ctx(runtime));
     expect(calls.some((cmd) => cmd.includes('pm2 startOrRestart /srv/app/shared/ecosystem.config.cjs'))).toBe(true);
     expect(calls.some((cmd) => cmd.includes('readlink -f /proc/111/cwd'))).toBe(true);
@@ -170,7 +172,7 @@ describe('release deploy — happy path', () => {
   });
 
   it('runs post-deploy checks and delivery events after activation', () => {
-    const { runtime, calls } = makeReleaseRuntime();
+    const { runtime, calls, inputs } = makeReleaseRuntime();
     const result = release.deployRelease(relConfig({
       postDeployChecks: [{ name: 'public-smoke', command: 'cd current && run-smoke' }],
       deliveryEvent: { command: 'cd current && emit-event' },
@@ -179,6 +181,9 @@ describe('release deploy — happy path', () => {
     expect(result.steps).toContain('delivery-event');
     expect(calls.some((command) => command.includes('cd /srv/app && cd current && run-smoke'))).toBe(true);
     expect(calls.some((command) => command.includes('cd /srv/app && cd current && emit-event'))).toBe(true);
+    const event = JSON.parse(inputs.find(({ command }) => command.includes('emit-event'))?.input ?? '{}');
+    expect(event.backupReference).toBe('smarthome-20260710T090000Z.db.gpg');
+    expect(JSON.stringify(event)).not.toContain('/var/lib/smarthome/backups');
   });
 
   it('dispatches through the public deploy() when layout.type is releases', () => {
