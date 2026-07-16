@@ -261,6 +261,13 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
       });
     // Deprecated alias — supplies the old fixed Cairn defaults. See host-operations.js.
     case 'run-cairn-operations':
+      // The alias's contract is exactly the old fixed one — accepting the new
+      // generic flags and silently ignoring them would be the BWK-136 failure
+      // mode again (an operator believes a flag took effect when it did not).
+      if (options.action || options.apiUrlEnv || options.apiKeyEnv) {
+        log.error('run-cairn-operations takes no flags — use `deploy-kit run-host-operations --action NAME [--api-url-env ENV] [--api-key-env ENV]` instead');
+        return 1;
+      }
       return runCairnOperations(config, {
         apiUrl: env.CAIRN_OPERATIONS_API_URL,
         apiKey: env.CAIRN_OPERATIONS_API_KEY,

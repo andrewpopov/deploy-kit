@@ -7,7 +7,10 @@
   operation runner (claim one allowlisted operations-API request matching
   `action`, run this checkout's configured deploy pipeline, complete the
   lease). The action name, API base URL, and API key are now supplied by the
-  caller instead of being hardcoded to Cairn.
+  caller instead of being hardcoded to Cairn. The claim request now sends the
+  configured action so a filtering server never leases a request meant for
+  another runner; a mismatched claim is released as FAILED (`unsupported
+  action for this runner`) instead of being abandoned until lease expiry.
 - Deprecated `runCairnOperations` / `deploy-kit run-cairn-operations`: both
   remain as thin wrappers over `runHostOperations` that supply the old
   `DEPLOY_CAIRN_PRODUCTION` action and `CAIRN_OPERATIONS_API_URL` /
