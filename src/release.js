@@ -500,7 +500,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       if (!res.ok) throw new Error('Pre-migration database backup failed');
       // The backup hook must print a restorable id/path as its last non-empty stdout
       // line. Validate it to a safe charset before it is interpolated into restore.
-      st.backupId = backupIdFromOutput(res.output);
+      st.backupId = backupIdFromOutput(res.output, { log });
       // The id may be used as a path by the restore hook. A backup id is typically
       // an ABSOLUTE path to the backup file (e.g.
       // /var/lib/smarthome/backups/smarthome-<ts>.db.gpg), so absolute is allowed.

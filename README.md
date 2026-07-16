@@ -89,7 +89,7 @@ unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 | `lock` | `boolean` | `true` | both | 0.5 | Take an atomic target lock so concurrent deploys can't interleave. |
 | `buildBeforeMigrate` | `boolean` | `false` | both | 0.2 | Build while apps are UP (paused window = just migration). |
 | `hooks.install` | `string` | `npm ci --prefer-offline \|\| npm ci \|\| npm install` | both | 0.1 | Dependency install; offline-first so a GitHub outage can't break a no-dep-change deploy. |
-| `hooks.backup` | `string \| null` | `null` | both | 0.1 | Pre-migration backup **gate** — a failure aborts before any schema change. A safe final-line id/path or db-backup `--json` result is correlated to `deliveryEvent` as a leaf-only `backupReference`. |
+| `hooks.backup` | `string \| null` | `null` | both | 0.1 | Pre-migration backup **gate** — a failure aborts before any schema change. Preferred output contract: JSON on stdout with a top-level `backupId` (db-backup >= 0.18.0 emits this). Legacy fallbacks remain supported: `id`, `created.fullPath`, `created.fileName`, or a safe final-line id/path. The parsed id is correlated to `deliveryEvent` as a leaf-only `backupReference`; if nothing parses, deploy-kit logs a loud warning (restore correlation unavailable) but never fails the deploy over it. |
 | `hooks.migrate` | `string \| null` | `null` | both | 0.1 | Migration command; runs with `dbBoundApps` paused. |
 | `hooks.build` | `string \| null` | `null` | both | 0.1 | Build command. |
 | `hooks.restart` | `string \| null` | `null` | both | 0.3 | Override the app (re)start command. `null` → the `ecosystemFile`-aware start-or-restart idiom. |

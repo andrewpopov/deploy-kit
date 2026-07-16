@@ -227,7 +227,7 @@ function deploy(config, options = {}, ctx = {}) {
         // Capture is required to correlate the backup with the delivery event.
         // Replay stdout so legacy hooks retain their operator-visible output.
         for (const line of (backup.output || '').split('\n').filter(Boolean)) log.info(line);
-        backupId = backupIdFromOutput(backup.output);
+        backupId = backupIdFromOutput(backup.output, { log });
         steps.push('backup');
       }
       if (config.dbBoundApps.length) {
