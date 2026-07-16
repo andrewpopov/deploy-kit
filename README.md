@@ -89,7 +89,7 @@ unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 | `lock` | `boolean` | `true` | both | 0.5 | Take an atomic target lock so concurrent deploys can't interleave. |
 | `buildBeforeMigrate` | `boolean` | `false` | both | 0.2 | Build while apps are UP (paused window = just migration). |
 | `hooks.install` | `string` | `npm ci --prefer-offline \|\| npm ci \|\| npm install` | both | 0.1 | Dependency install; offline-first so a GitHub outage can't break a no-dep-change deploy. |
-| `hooks.backup` | `string \| null` | `null` | both | 0.1 | Pre-migration backup **gate** — a failure aborts before any schema change. |
+| `hooks.backup` | `string \| null` | `null` | both | 0.1 | Pre-migration backup **gate** — a failure aborts before any schema change. A safe final-line id/path or db-backup `--json` result is correlated to `deliveryEvent` as a leaf-only `backupReference`. |
 | `hooks.migrate` | `string \| null` | `null` | both | 0.1 | Migration command; runs with `dbBoundApps` paused. |
 | `hooks.build` | `string \| null` | `null` | both | 0.1 | Build command. |
 | `hooks.restart` | `string \| null` | `null` | both | 0.3 | Override the app (re)start command. `null` → the `ecosystemFile`-aware start-or-restart idiom. |
@@ -250,8 +250,10 @@ just a bundled *consumer* of that stdin-JSON contract:
 ```
 
 It reads the delivery event on stdin (`{event:'deployment', status:'succeeded',
-branch, revision, deployedAt}` — see `deploy.js`/`release.js`), resolves the
-webhook URL from `process.env.DISCORD_RELEASE_WEBHOOK` (override with
+branch, revision, deployedAt, backupReference?}` — see `deploy.js`/`release.js`).
+When either deploy layout captured a safe backup id, `backupReference` contains
+only its opaque leaf label; host paths and unsafe/noisy output are omitted. It
+resolves the webhook URL from `process.env.DISCORD_RELEASE_WEBHOOK` (override with
 `--webhook-env NAME`), picks a service name from `--service NAME` /
 `DISCORD_RELEASE_SERVICE` / `DISCORD_ALERT_SERVICE` (default `app`), formats
 `🚀 \`<service>\` deployed \`<branch>@<shortsha>\` at <time>`, and POSTs it with

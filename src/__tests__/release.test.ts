@@ -186,6 +186,22 @@ describe('release deploy — happy path', () => {
     expect(JSON.stringify(event)).not.toContain('/var/lib/smarthome/backups');
   });
 
+  it('uses the shared db-backup JSON normalizer for release delivery events', () => {
+    const backupId = JSON.stringify({
+      created: {
+        fullPath: '/var/lib/smarthome/backups/smarthome-20260710T090000Z.db.gpg',
+        fileName: 'smarthome-20260710T090000Z.db.gpg',
+      },
+    });
+    const { runtime, inputs } = makeReleaseRuntime({ backupId });
+
+    release.deployRelease(relConfig({ deliveryEvent: { command: 'emit-event' } }), {}, ctx(runtime));
+
+    const event = JSON.parse(inputs.find(({ command }) => command.includes('emit-event'))?.input ?? '{}');
+    expect(event.backupReference).toBe('smarthome-20260710T090000Z.db.gpg');
+    expect(JSON.stringify(event)).not.toContain('/var/lib/smarthome/backups');
+  });
+
   it('dispatches through the public deploy() when layout.type is releases', () => {
     const { runtime } = makeReleaseRuntime();
     const result = kit.deploy(relConfig(), {}, ctx(runtime));

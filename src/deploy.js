@@ -3,6 +3,7 @@
 const { runOnTarget, buildHealthCommand } = require('./exec');
 const { lockDir, prevShaFile, acquireLock } = require('./lock');
 const { log: defaultLog } = require('./log');
+const { backupIdFromOutput, backupReferenceFromId } = require('./backup-reference');
 
 function defaultSleep(seconds) {
   const ms = seconds * 1000;
@@ -93,13 +94,14 @@ function pm2StartOrRestart(names, config) {
 
 // A step that must succeed or the whole deploy aborts. onFail runs first
 // (e.g. restart the apps we paused) so we never leave services stopped.
-function gate(step, config, ctx, { onFail } = {}) {
+function gate(step, config, ctx, { onFail, capture = false } = {}) {
   ctx.log.step(step.message);
-  const res = runOnTarget(step.command, config, { runtime: ctx.runtime });
+  const res = runOnTarget(step.command, config, { runtime: ctx.runtime, capture });
   if (!res.ok) {
     if (onFail) onFail();
     throw new Error(`Deploy aborted: ${step.message} failed`);
   }
+  return res;
 }
 
 // Run the full pipeline on the target. Returns a structured summary. Throws on
@@ -142,6 +144,7 @@ function deploy(config, options = {}, ctx = {}) {
   log.header(`🚀 Deploying (${config.mode}${config.host ? ` → ${config.host}` : ''})`);
   const branch = resolveBranch(config, c);
   const steps = [];
+  let backupId = null;
 
   const release = acquireLock(config, c, { steal: stealLock });
   try {
@@ -215,7 +218,16 @@ function deploy(config, options = {}, ctx = {}) {
       if (config.hooks.backup) {
         // Backup BEFORE migrating; a failed backup aborts before any schema change
         // (apps are still running here, so no resume needed).
-        gate({ message: 'Pre-migration database backup', command: config.hooks.backup }, config, c);
+        const backup = gate(
+          { message: 'Pre-migration database backup', command: config.hooks.backup },
+          config,
+          c,
+          { capture: true },
+        );
+        // Capture is required to correlate the backup with the delivery event.
+        // Replay stdout so legacy hooks retain their operator-visible output.
+        for (const line of (backup.output || '').split('\n').filter(Boolean)) log.info(line);
+        backupId = backupIdFromOutput(backup.output);
         steps.push('backup');
       }
       if (config.dbBoundApps.length) {
@@ -277,10 +289,12 @@ function deploy(config, options = {}, ctx = {}) {
     }
 
     if (config.deliveryEvent?.command) {
+      const backupReference = backupReferenceFromId(backupId);
       const payload = JSON.stringify({
         event: 'deployment', status: 'succeeded', branch,
         revision: runOnTarget('git rev-parse HEAD', config, { runtime, capture: true }).output.trim(),
         deployedAt: new Date().toISOString(),
+        ...(backupReference ? { backupReference } : {}),
       });
       run('Emitting delivery event', config.deliveryEvent.command, { tolerate: true, input: payload });
       steps.push('delivery-event');
