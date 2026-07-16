@@ -319,10 +319,25 @@ export function alertDiscord(options: {
  * `--webhook-env` is not passed. */
 export const DEFAULT_RELEASE_WEBHOOK_ENV: string;
 
-/** The only Cairn operation action deploy-kit will execute. */
+/** Claim one allowlisted operations-API request matching `action` and execute
+ * this config's deploy pipeline. Generic host-configurable operation runner —
+ * `action`, `apiUrl`, and `apiKey` are supplied by the caller, not fixed. */
+export function runHostOperations(config: DeployConfig, options: {
+  action: string;
+  apiUrl?: string;
+  apiKey?: string;
+  fetchImpl?: typeof fetch;
+  deployFn?: typeof deploy;
+  log?: Pick<Console, 'info' | 'error'>;
+}): Promise<{ state: 'idle' } | { state: 'succeeded'; id: string }>;
+
+/** The fixed Cairn operation action used by the deprecated `runCairnOperations` wrapper. */
 export const DEPLOY_ACTION: 'DEPLOY_CAIRN_PRODUCTION';
 
-/** Claim one allowlisted Cairn operation and execute this config's deploy pipeline. */
+/** @deprecated Use `runHostOperations` with an explicit `action`, `apiUrl`, and
+ * `apiKey`. Kept for existing Cairn consumers — supplies the old fixed
+ * `DEPLOY_CAIRN_PRODUCTION` action and `CAIRN_OPERATIONS_API_URL` /
+ * `CAIRN_OPERATIONS_API_KEY` env var defaults. */
 export function runCairnOperations(config: DeployConfig, options?: {
   apiUrl?: string;
   apiKey?: string;

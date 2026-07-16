@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.14.0
+
+- Added `runHostOperations` / `deploy-kit run-host-operations --action NAME
+  [--api-url-env ENV] [--api-key-env ENV]`: a generic, host-configurable
+  operation runner (claim one allowlisted operations-API request matching
+  `action`, run this checkout's configured deploy pipeline, complete the
+  lease). The action name, API base URL, and API key are now supplied by the
+  caller instead of being hardcoded to Cairn.
+- Deprecated `runCairnOperations` / `deploy-kit run-cairn-operations`: both
+  remain as thin wrappers over `runHostOperations` that supply the old
+  `DEPLOY_CAIRN_PRODUCTION` action and `CAIRN_OPERATIONS_API_URL` /
+  `CAIRN_OPERATIONS_API_KEY` env var defaults, so existing Cairn usage keeps
+  working unchanged.
+
 ## 0.13.0
 
 - Harden `alert-discord` with the reusable delivery behavior proven by Smart
