@@ -56,9 +56,9 @@ Commands:
   init                                     scaffold .deploy-kit.config.json + scripts
   port-guard <port> <pm2-process-name>     fail if <port> is held by a process
                                             other than <pm2-process-name>'s pm2 tree
-  alert-discord [--webhook-env NAME]       convenience alert.command: read the
-                                            monitor's alert JSON on stdin, post it
-                                            to a Discord webhook (env NAME, default
+  alert-discord [--webhook-env NAME]       convenience alert.command: read bounded
+    [--service NAME]                       monitor alert JSON on stdin, post it to
+                                            a Discord webhook (env NAME, default
                                             DISCORD_ALERT_WEBHOOK)
   announce-discord [--webhook-env NAME]    convenience deliveryEvent.command:
     [--service NAME]                       read the deploy delivery-event JSON on
@@ -90,14 +90,25 @@ function dryRunContext() {
   };
 }
 
-// Drain a stream to a string. Injected as `stdin` so alert-discord is testable
-// without a real process.stdin (tests pass a Readable.from([json])).
-function readStdin(stream) {
+// Drain a stream to a string with an optional memory bound. Injected as `stdin`
+// so alert-discord is testable without a real process.stdin.
+function readStdin(stream, maxBytes = Infinity) {
   return new Promise((resolve, reject) => {
     let data = '';
+    let bytes = 0;
+    let exceeded = false;
     stream.setEncoding('utf8');
-    stream.on('data', (chunk) => { data += chunk; });
-    stream.on('end', () => resolve(data));
+    stream.on('data', (chunk) => {
+      if (exceeded) return;
+      bytes += Buffer.byteLength(chunk, 'utf8');
+      if (bytes > maxBytes) {
+        exceeded = true;
+        data = '';
+        return;
+      }
+      data += chunk;
+    });
+    stream.on('end', () => resolve(exceeded ? null : data));
     stream.on('error', reject);
   });
 }
@@ -152,15 +163,21 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     return 0;
   }
 
-  // alert-discord takes no positional args (only the now-generic `--webhook-env`
-  // flag), so — unlike port-guard — it is safe to dispatch AFTER parseOptions;
+  // alert-discord takes no positional args (only the generic `--webhook-env`
+  // and `--service` flags), so — unlike port-guard — it is safe to dispatch AFTER parseOptions;
   // there is no positional value for the generic validator to misparse. It is
   // still dispatched here, before loadConfig, because it is a standalone utility:
   // it does not read .deploy-kit.config.json and must not fail an operator who
   // runs it outside a project directory.
   if (command === 'alert-discord') {
-    return readStdin(stdin).then((data) => alertDiscord({
-      stdin: data, webhookEnvName: options.webhookEnv || DEFAULT_WEBHOOK_ENV, env, fetchImpl, log,
+    const { MAX_STDIN_BYTES } = require('./alert-discord');
+    return readStdin(stdin, MAX_STDIN_BYTES).then((data) => alertDiscord({
+      stdin: data,
+      webhookEnvName: options.webhookEnv || DEFAULT_WEBHOOK_ENV,
+      service: options.service,
+      env,
+      fetchImpl,
+      log,
     }));
   }
 
