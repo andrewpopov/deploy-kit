@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.12.1
+
+- Release-layout delivery events now include an optional opaque
+  `backupReference` after a successful pre-migration backup. The reference is
+  the backup ID leaf only; host-local backup paths remain internal to the
+  restore workflow.
+
 ## 0.12.0
 
 - Add a bundled, OPT-IN `deploy-kit announce-discord [--webhook-env NAME]
