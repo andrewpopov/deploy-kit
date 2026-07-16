@@ -9,6 +9,7 @@ const remote = require('./remote');
 const { checkPortGuard } = require('./port-guard');
 const { alertDiscord, DEFAULT_WEBHOOK_ENV } = require('./alert-discord');
 const { announceDiscord, DEFAULT_WEBHOOK_ENV: DEFAULT_RELEASE_WEBHOOK_ENV } = require('./announce-discord');
+const { runCairnOperations } = require('./cairn-operations');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
@@ -66,6 +67,8 @@ Commands:
                                             Discord webhook (env NAME, default
                                             DISCORD_RELEASE_WEBHOOK). Opt-in and
                                             unset -> skip (exit 0), never fails a deploy.
+  run-cairn-operations                     claim one allowlisted Cairn operation
+                                            and run this project's configured deploy pipeline
   deploy [--skip-build|--skip-deps|--skip-migrate]
          [--no-stash] [--dry-run] [--steal-lock] [--no-lock]
   rollback [--skip-build|--skip-deps] [--steal-lock]
@@ -235,6 +238,14 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
         log.error(error instanceof Error ? error.message : String(error));
         return 2;
       }
+    case 'run-cairn-operations':
+      return runCairnOperations(config, {
+        apiUrl: env.CAIRN_OPERATIONS_API_URL,
+        apiKey: env.CAIRN_OPERATIONS_API_KEY,
+      }).then(() => 0).catch((error) => {
+        log.error(error instanceof Error ? error.message : String(error));
+        return 1;
+      });
     case 'status': return remote.status(config) ? 0 : 1;
     case 'health': return remote.health(config) ? 0 : 1;
     case 'dashboard': return remote.dashboard(config) ? 0 : 1;

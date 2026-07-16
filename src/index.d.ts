@@ -319,6 +319,18 @@ export function alertDiscord(options: {
  * `--webhook-env` is not passed. */
 export const DEFAULT_RELEASE_WEBHOOK_ENV: string;
 
+/** The only Cairn operation action deploy-kit will execute. */
+export const DEPLOY_ACTION: 'DEPLOY_CAIRN_PRODUCTION';
+
+/** Claim one allowlisted Cairn operation and execute this config's deploy pipeline. */
+export function runCairnOperations(config: DeployConfig, options?: {
+  apiUrl?: string;
+  apiKey?: string;
+  fetchImpl?: typeof fetch;
+  deployFn?: typeof deploy;
+  log?: Pick<Console, 'info' | 'error'>;
+}): Promise<{ state: 'idle' } | { state: 'succeeded'; id: string }>;
+
 /** The `deliveryEvent.command` payload deploy.js/release.js pipe on stdin after
  * a successful deploy — see `DeployConfig['deliveryEvent']`. */
 export interface DeliveryEvent {

@@ -277,6 +277,7 @@ npx deploy-kit init              # scaffold config + print scripts block
 npx deploy-kit port-guard 3006 towerpower-app   # fail if 3006 is held by a foreign process
 npx deploy-kit alert-discord [--webhook-env NAME] [--service NAME]  # convenience alert.command: post to Discord
 npx deploy-kit announce-discord [--webhook-env NAME] [--service NAME]  # convenience deliveryEvent.command: post a release announcement
+npx deploy-kit run-cairn-operations  # claim one allowlisted Cairn request and run this configured deploy
 npx deploy-kit deploy            # full pipeline
 npx deploy-kit deploy --dry-run  # print the command stream, execute nothing
 npx deploy-kit rollback          # git reset to the pre-last-deploy SHA + rebuild + restart
@@ -294,6 +295,7 @@ npx deploy-kit logs [--lines N] [--follow] [--errors]
 | `port-guard <port> <pm2-process-name>` | — | Exit 0 if `<port>` is free or held only by `<pm2-process-name>`'s pm2 process tree; exit 1 (naming the PID) if a foreign process holds it, or if neither `lsof` nor `ss` is available (fails closed). Meant to run ON the target as a `preRestartChecks` command — see below. |
 | `alert-discord` | `--webhook-env NAME` `--service NAME` | Convenience `alert.command`: read bounded monitor alert JSON on stdin and POST a length-safe message to Discord (env var `NAME`, default `DISCORD_ALERT_WEBHOOK`). Invalid/empty input exits 0 so a poison batch cannot retry forever; an unset webhook or failed POST remains non-zero. Opt-in — the monitor stays policy-free. |
 | `announce-discord` | `--webhook-env NAME` `--service NAME` | Convenience `deliveryEvent.command`: read the post-deploy delivery event on stdin, POST a release announcement to a Discord webhook (env var `NAME`, default `DISCORD_RELEASE_WEBHOOK`). Always exits 0 — an unset env var, malformed stdin, or a failed/timed-out POST is a clear stderr warning, never a failure, since a broken announcement must never fail an already-succeeded deploy. Opt-in — deploy/release stay policy-free. |
+| `run-cairn-operations` | — | Host-agent command. Requires `CAIRN_OPERATIONS_API_URL` and a narrowly scoped `CAIRN_OPERATIONS_API_KEY`. Claims at most one fixed Cairn request, accepts only `DEPLOY_CAIRN_PRODUCTION`, runs this checkout's existing configured deploy pipeline, and completes the short-lived lease with a redacted result. It never executes a command, host, or path supplied by Cairn. |
 | `deploy` | `--skip-build` `--skip-deps` `--skip-migrate` `--no-stash` `--dry-run` `--steal-lock` `--no-lock` | Run the full pipeline. |
 | `rollback` | `--skip-build` `--skip-deps` `--steal-lock` | Reset to the recorded pre-deploy SHA, rebuild, restart, health-gate. |
 | `monitor` | `--steal-lock` | Run the `monitor` checks, alert on transitions, exit `0`/`1`/`2`. For a cron. |
