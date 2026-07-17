@@ -28,7 +28,7 @@ const { startTunnel } = tunnel;
 const { init } = initMod;
 const { monitor } = monitorMod;
 const { checkPortGuard } = portGuardMod;
-const { formatDiscordMessage, alertDiscord, DEFAULT_WEBHOOK_ENV } = alertDiscordMod;
+const { formatDiscordMessage, alertDiscord, DEFAULT_WEBHOOK_ENV, DEFAULT_SERVICE, DISCORD_CONTENT_LIMIT, MAX_STDIN_BYTES } = alertDiscordMod;
 const {
   formatDiscordMessage: formatReleaseDiscordMessage, announceDiscord, DEFAULT_WEBHOOK_ENV: DEFAULT_RELEASE_WEBHOOK_ENV,
 } = announceDiscordMod;
@@ -70,6 +70,9 @@ module.exports = {
   formatDiscordMessage,
   alertDiscord,
   DEFAULT_WEBHOOK_ENV,
+  DEFAULT_SERVICE,
+  DISCORD_CONTENT_LIMIT,
+  MAX_STDIN_BYTES,
   // announce-discord CLI (opt-in convenience deliveryEvent.command; deploy/release stay policy-free)
   formatReleaseDiscordMessage,
   announceDiscord,
