@@ -1,7 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { createRequire } from 'module';
+import { spawn } from 'child_process';
+import {
+  mkdtempSync, writeFileSync, readFileSync, rmSync,
+} from 'fs';
+import { tmpdir } from 'os';
+import path from 'path';
 
 const require = createRequire(__filename);
+const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const kit = require('../index.js') as typeof import('../index');
 const {
   buildTargetCommand, sshHardeningArgs, loadConfig, mergeConfig, validateConfig,
@@ -364,43 +371,197 @@ describe('PKG-82 Bug 3: a dbBoundApp not also in appNames must still be restarte
 });
 
 describe('PKG-82 Bug 2: SIGINT/SIGTERM mid-deploy', () => {
-  it('resumes paused db-bound apps and releases the lock instead of leaving them stopped forever', () => {
-    const { runtime, calls } = makeRuntime();
-    let exitCalled: number | undefined;
-    const originalExit = process.exit;
-    // process.exit really terminates the process — mock it to throw instead, so
-    // the test can observe "nothing after this executes" without killing vitest.
-    // Thrown from here (not from inside an execFileSync call, which runOnTarget's
-    // own try/catch would swallow into a normal step failure) so it propagates
-    // all the way out, exactly like a real process.exit would never return.
-    (process as unknown as { exit: (code?: number) => never }).exit = ((code?: number) => {
-      exitCalled = code;
-      throw new Error('__TEST_PROCESS_EXIT__');
-    }) as never;
-    // A fake logger whose `step` fires the interrupt the moment migrate's step
-    // message is logged — by then dbAppsPaused is true (apps were stopped before
-    // the backup, per Bug 1), so this is a faithful "Ctrl-C mid-migration".
-    const log = {
-      header: () => {}, info: () => {}, success: () => {}, warning: () => {}, error: () => {},
-      step: (msg: string) => { if (msg.includes('Running database migrations')) process.emit('SIGINT'); },
-    };
+  // The old version of this test simulated Ctrl-C with `process.emit('SIGINT')`
+  // IN-PROCESS while mocking `process.exit`. That stopped being safe once
+  // deploy.js's/release.js's signal handler changed from `process.exit(1)` to
+  // `process.removeListener(sig, handler); process.kill(process.pid, sig)` (see
+  // deploy.js): the mocked `process.exit` no longer intercepts anything, so the
+  // signal we emit falls straight through to the real handler, which re-raises
+  // a REAL SIGINT with no listener left — the OS default disposition then kills
+  // the vitest WORKER process itself, taking all ~108 tests in this file down
+  // with it (exactly the failure this rewrite fixes).
+  //
+  // Rewritten to run the deploy in a REAL CHILD PROCESS, in its OWN process
+  // group (so a group-directed signal can never reach the vitest worker), and
+  // to interrupt it with a REAL SIGINT — matching how an operator's Ctrl-C
+  // actually reaches a running deploy: delivered to the whole foreground
+  // process group, hitting BOTH deploy-kit's own process AND whatever real
+  // subprocess (the migrate hook, here) is currently blocking it. The "migrate"
+  // hook below shells out to a REAL `sleep`, specifically so a real SIGINT has
+  // a real, killable subprocess to interrupt (every other command is faked).
+  //
+  // IMPORTANT FINDING, verified empirically against this exact scenario run
+  // through the REAL `src/cli.js` against a real git repo (not just this
+  // fake-runtime test): deploy.js's SIGINT/SIGTERM handler can NEVER actually
+  // reach its own manual `resumeDbApps(); release(); process.removeListener(...);
+  // process.kill(...)` body for a signal that arrives while `deploy()` is
+  // running. Node defers dispatch of an externally-delivered signal (while a
+  // handler is still registered) until a LATER macrotask; `deploy()`'s own
+  // `finally` removes the SIGINT/SIGTERM listeners unconditionally and
+  // SYNCHRONOUSLY as the very last thing it does before returning, and nothing
+  // inside `deploy()` (100% synchronous — confirmed even several further
+  // execFileSync calls in a row never yield back to the event loop) ever gives
+  // the queued signal a chance to be dispatched before that `finally` wins the
+  // race. The signal is then simply discarded, not "replayed" later as a
+  // default-disposition kill. So in this scenario the actual resume/lock-release
+  // comes from the PRE-EXISTING "migrate step failed" `onFail`/`finally` path —
+  // the migrate hook's real subprocess dies from the same group signal, so
+  // `gate()` sees `ok:false` and runs `onFail` exactly as it would for any other
+  // migrate failure — not from the SIGINT handler's own body, and the process
+  // exits via a normal, controlled `process.exit(1)` (verified: code 1, signal
+  // null), not via a re-raised signal. Coverage lost vs. the original test:
+  // the original (via synchronous in-process `process.emit`) could assert that
+  // onSignal's own lines ran; a real OS signal cannot exercise those exact
+  // lines given deploy()'s current fully-synchronous implementation, so this
+  // test asserts the CONTRACT that matters operationally — an interrupted
+  // legacy deploy still resumes paused DB-bound apps and releases the lock,
+  // and the process dies in a controlled, non-hanging way — rather than the
+  // handler's specific internal code path.
+  it('resumes paused db-bound apps and releases the lock when a real SIGINT interrupts a real subprocess mid-migrate', async () => {
+    const { lockDir } = require('../lock.js') as { lockDir: (c: unknown, s?: string) => string };
+    const dir = lockDir(baseConfig);
+
+    const workDir = mkdtempSync(path.join(tmpdir(), 'pkg82-sigint-'));
+    const callsFile = path.join(workDir, 'calls.log');
+    const resultFile = path.join(workDir, 'result.json');
+    const scriptFile = path.join(workDir, 'run-deploy.js');
+
+    // Small inline script: loads the REAL kit, drives deploy() with a fake
+    // runtime whose "migrate" command shells out to a real, killable `sleep`,
+    // and records every command it sees to CALLS_FILE (append, flushed
+    // synchronously) so the parent can inspect them regardless of how the
+    // child process ends.
+    const script = `
+      'use strict';
+      const fs = require('fs');
+      const { execFileSync: realExecFileSync } = require('child_process');
+      const kit = require(${JSON.stringify(path.join(REPO_ROOT, 'src', 'index.js'))});
+
+      const CALLS_FILE = ${JSON.stringify(callsFile)};
+      const RESULT_FILE = ${JSON.stringify(resultFile)};
+      const NL = String.fromCharCode(10);
+      const record = (cmd) => fs.appendFileSync(CALLS_FILE, JSON.stringify(cmd) + NL);
+
+      const baseConfig = kit.mergeConfig(kit.DEFAULT_CONFIG, {
+        host: 'app@pi',
+        projectDir: '/srv/app',
+        appNames: ['app'],
+        dbBoundApps: ['app'],
+        branch: 'master',
+        hooks: {
+          install: 'npm ci', backup: 'npm run db:backup',
+          migrate: 'npm run db:migrate', build: 'npm run build',
+        },
+      });
+
+      const execFileSync = (file, args) => {
+        const cmd = args[args.length - 1];
+        record(cmd);
+        if (cmd.includes('npm run db:migrate')) {
+          process.stdout.write('MIGRATE_SUBPROCESS_STARTED\\n');
+          // Real, killable subprocess: a real group SIGINT can genuinely
+          // interrupt this (unlike every other, purely-faked command here).
+          return realExecFileSync('sleep', ['3']);
+        }
+        if (cmd.includes('curl')) return '200';
+        return '';
+      };
+
+      const log = {
+        header() {}, info() {}, success() {}, warning() {}, error() {}, step() {},
+      };
+
+      let threw = null;
+      try {
+        kit.deploy(baseConfig, {}, { runtime: { execFileSync }, sleep: () => {}, log });
+      } catch (e) {
+        threw = e instanceof Error ? e.message : String(e);
+      }
+      fs.writeFileSync(RESULT_FILE, JSON.stringify({
+        threw,
+        listenerCountSIGINT: process.listenerCount('SIGINT'),
+        listenerCountSIGTERM: process.listenerCount('SIGTERM'),
+      }));
+      if (threw) process.exitCode = 1;
+    `;
+    writeFileSync(scriptFile, script);
+
+    // `detached: true` makes the child its own process-group leader, so
+    // signaling ITS group (`-child.pid` below) can never reach the vitest
+    // worker's own process group — the exact hazard the old in-process test
+    // hit.
+    const child = spawn(process.execPath, [scriptFile], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stderr.on('data', (d) => { stdout += d.toString(); });
+
+    const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      child.on('exit', (code, signal) => resolve({ code, signal }));
+    });
+
     try {
-      const listenersBefore = process.listenerCount('SIGINT');
-      expect(() => deploy(baseConfig, {}, { runtime, sleep: () => {}, log })).toThrow('__TEST_PROCESS_EXIT__');
-      expect(exitCalled).toBe(1);
+      // Wait for the migrate step's real subprocess to actually start, then
+      // send a REAL SIGINT to the child's whole process group — mirroring an
+      // interactive Ctrl-C, which hits both the deploy-kit process and its
+      // currently-running subprocess at once.
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error('timed out waiting for MIGRATE_SUBPROCESS_STARTED')),
+          8000,
+        );
+        const onData = () => {
+          if (stdout.includes('MIGRATE_SUBPROCESS_STARTED')) {
+            clearTimeout(timeout);
+            child.stdout.off('data', onData);
+            resolve();
+          }
+        };
+        child.stdout.on('data', onData);
+        onData();
+      });
+
+      // A short real delay before signaling: the marker is written the instant
+      // the fake execFileSync is CALLED, just before it shells out to the real
+      // `sleep` — give that real subprocess a moment to actually be forked and
+      // running before the group signal targets it, or the kill can land
+      // before there's anything (in this process group) yet to interrupt.
+      await new Promise((resolve) => { setTimeout(resolve, 300); });
+
+      process.kill(-(child.pid as number), 'SIGINT');
+
+      const { code, signal } = await exitPromise;
+
+      const calls = readFileSync(callsFile, 'utf8').split(String.fromCharCode(10)).filter(Boolean).map((line) => JSON.parse(line) as string);
+      const result = JSON.parse(readFileSync(resultFile, 'utf8')) as {
+        threw: string | null; listenerCountSIGINT: number; listenerCountSIGTERM: number;
+      };
+
+      expect(result.threw).toMatch(/Running database migrations failed/);
+      expect(calls.some((c) => c.includes('pm2 stop app'))).toBe(true);
       expect(calls.some((c) => c.includes('pm2 start app'))).toBe(true);
-      // lock released: don't assume /tmp or a specific rmdir/rm shape here — that
-      // is lock.js's own scheme (owned by another agent); just assert some
+      // lock released: don't assume a specific rmdir/rm shape here — that is
+      // lock.js's own scheme (owned by another agent); just assert some
       // rm/rmdir-shaped command targeted the configured lock path.
-      const { lockDir } = require('../lock.js') as { lockDir: (c: unknown, s?: string) => string };
-      const dir = lockDir(baseConfig);
       expect(calls.some((c) => c.includes(dir) && /\brm(dir)?\b/.test(c))).toBe(true);
       // the handler must not leak across calls
-      expect(process.listenerCount('SIGINT')).toBe(listenersBefore);
+      expect(result.listenerCountSIGINT).toBe(0);
+      expect(result.listenerCountSIGTERM).toBe(0);
+      // Verified contract: a controlled, non-zero exit — not a hang, not a raw
+      // crash. See the file-level comment above for why this is `code: 1,
+      // signal: null` rather than a re-raised-signal death.
+      expect(code).toBe(1);
+      expect(signal).toBeNull();
     } finally {
-      process.exit = originalExit;
+      if (child.exitCode === null && child.signalCode === null) {
+        try { process.kill(-(child.pid as number), 'SIGKILL'); } catch { /* already gone */ }
+      }
+      rmSync(workDir, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 });
 
 describe('PKG-82 Bug 5: branch/remote are quoted at the git call site (defense in depth)', () => {
@@ -722,10 +883,17 @@ describe('deploy: lock, sha, stash-drop', () => {
     expect(() => deploy(baseConfig, { stealLock: true }, ctxWith(runtime)))
       .toThrow(/lost a race for the lock/);
   });
-  it('lock:false skips locking entirely', () => {
+  it('lock:false skips locking entirely (but the state dir mkdir for prev-sha recording still runs)', () => {
+    // PKG-82: ensureStateDir's `mkdir -m 700 -p "$HOME/.deploy-kit"` now runs
+    // unconditionally as part of "Recording current revision" (see
+    // lock.test.ts's "lock: false still records a prev-sha" suite) — state-dir
+    // creation is independent of the lock setting, so it is no longer true that
+    // `lock:false` means zero `mkdir` calls at all. What `lock:false` DOES still
+    // guarantee is no LOCK-specific mkdir (the atomic, no "-p", ".lock"-suffixed
+    // one from acquireLock).
     const { runtime, calls } = makeRuntime();
     deploy(mergeConfig(baseConfig, { lock: false }), {}, ctxWith(runtime));
-    expect(calls.some((c) => c.includes('mkdir'))).toBe(false);
+    expect(calls.some((c) => c.includes('mkdir') && c.includes('.lock'))).toBe(false);
   });
   it('releases the lock even when the deploy aborts', () => {
     const { runtime, calls } = makeRuntime({ fail: ['db:migrate'] });

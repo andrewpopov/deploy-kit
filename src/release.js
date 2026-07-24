@@ -397,10 +397,21 @@ function deployRelease(config, options = {}, ctx = {}) {
     }
   };
 
+  // DO NOT DELETE THIS AS DEAD CODE -- see the fuller note in deploy.js. This
+  // pipeline is synchronous too, so a mid-deploy signal is never dispatched
+  // before `finally` removes these listeners; the body below is unreachable in
+  // that window. Registering it is still load-bearing: it suppresses Node's
+  // default disposition, which would otherwise kill the process instantly and
+  // skip the `finally` recovery entirely.
+  //
+  // The body is kept as a correct safety net should any of this become async.
+  // It re-raises rather than calling process.exit(1) so an embedder calling
+  // deployRelease() programmatically keeps control of its own shutdown.
   const onSignal = (sig) => {
     log.error(`Received ${sig} mid-deploy — running recovery for phase "${st.phase}"`);
     try { recover(new Error(`interrupted by ${sig}`)); } catch (e) { log.error(e.message); }
-    process.exit(1);
+    process.removeListener(sig, sigHandlers[sig]);
+    process.kill(process.pid, sig);
   };
   const sigHandlers = { SIGINT: () => onSignal('SIGINT'), SIGTERM: () => onSignal('SIGTERM') };
 

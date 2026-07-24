@@ -1,7 +1,9 @@
 'use strict';
 
 const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
-const { lockDir, prevShaFile, acquireLock } = require('./lock');
+const {
+  lockDir, prevShaFile, ensureStateDir, acquireLock,
+} = require('./lock');
 const { log: defaultLog } = require('./log');
 const { backupIdFromOutput, backupReferenceFromId } = require('./backup-reference');
 const { resolveBranch } = require('./branch');
@@ -152,16 +154,30 @@ function deploy(config, options = {}, ctx = {}) {
   };
 
   const release = acquireLock(config, c, { steal: stealLock });
-  // A default SIGINT/SIGTERM kill (Ctrl-C, `kill`) skips the `finally` below
-  // entirely, leaving any paused DB-bound apps stopped and the lock held forever
-  // (matches release.js's recovery registration, same reasoning). Best-effort:
-  // resume whatever was paused and drop the lock, then exit non-zero so the
-  // operator sees a clean stop instead of a hang.
+  // DO NOT DELETE THIS AS DEAD CODE. `onSignal`'s body is in fact unreachable
+  // for a signal that arrives mid-deploy -- but merely REGISTERING it is what
+  // makes the `finally` below run at all, and that is the whole point.
+  //
+  // Why: this function is entirely synchronous (execFileSync everywhere,
+  // Atomics.wait in defaultSleep), so it never yields to the event loop and Node
+  // can never dispatch a queued signal until after `finally` has already removed
+  // these listeners. With NO listener registered, the default disposition kills
+  // the process instantly at the signal -- `finally` never runs, paused
+  // DB-bound apps stay stopped, and the lock is held forever. That was the bug.
+  // With a listener registered, Node suppresses the default death, the
+  // synchronous run reaches `finally`, and cleanup happens there. Verified
+  // empirically: sync-block + SIGINT exits 130 with no cleanup when unregistered,
+  // and completes cleanly when registered (the body never runs either way).
+  //
+  // The body is kept as a correct safety net for the day any of this becomes
+  // async. It re-raises rather than calling process.exit(1) so an embedder
+  // calling deploy() programmatically keeps control of its own shutdown.
   const onSignal = (sig) => {
     log.error(`Received ${sig} mid-deploy — resuming any paused apps and releasing the lock`);
     try { resumeDbApps(); } catch (e) { log.error(e.message); }
     try { release(); } catch (e) { log.error(e.message); }
-    process.exit(1);
+    process.removeListener(sig, sigHandlers[sig]);
+    process.kill(process.pid, sig);
   };
   const sigHandlers = { SIGINT: () => onSignal('SIGINT'), SIGTERM: () => onSignal('SIGTERM') };
   process.on('SIGINT', sigHandlers.SIGINT);
@@ -187,8 +203,17 @@ function deploy(config, options = {}, ctx = {}) {
     }
 
     // Record the current SHA before pulling so `deploy-kit rollback` can reset to
-    // the exact code that was live before this deploy.
-    run('Recording current revision', `git rev-parse HEAD > ${prevShaFile(config)} 2>/dev/null || true`, { tolerate: true });
+    // the exact code that was live before this deploy. $HOME/.deploy-kit is
+    // normally created as a side effect of acquireLock, but with `lock: false`
+    // acquireLock never runs any shell at all -- so this step must ensure the
+    // state dir (and carry the legacy /tmp migration forward) itself, or the
+    // `git rev-parse HEAD >` redirect below fails with no directory to write
+    // into, silently (this step is tolerated) breaking `rollback` later.
+    run(
+      'Recording current revision',
+      `${ensureStateDir(config)}\ngit rev-parse HEAD > ${prevShaFile(config)} 2>/dev/null || true`,
+      { tolerate: true },
+    );
 
     run('Fetching latest', `git fetch ${shQuote(config.remote)} --prune`);
     run(`Pulling ${config.remote}/${branch} (--ff-only)`, `git pull --ff-only ${shQuote(config.remote)} ${shQuote(branch)}`);

@@ -185,11 +185,15 @@ const KEY_TYPES = {
 const SAFE_ID_RE = /^[A-Za-z0-9._-]+$/;
 // A git refname charset for `branch`/`remote`. Rather than blocklist shell
 // metacharacters, allowlist the legal ones — git refnames never legally contain
-// ";$|&`()<>" etc, so this is both a "well-formed ref" check AND the shell-
-// injection guard: both values are interpolated UNQUOTED into a remote command
-// (`git pull --ff-only ${remote} ${branch}` in deploy.js). Also blocks a leading
-// "-" (would be read as a flag by git) and "..", "//", and a trailing "/", ".",
-// or ".lock" (all illegal per `git check-ref-format`).
+// ";$|&`()<>" etc, so this is both a "well-formed ref" check AND the outer half
+// of the injection defense. Call sites also shQuote these values (exec.js), so
+// this is defense in depth rather than the only guard. Note the reverse case:
+// with `branch: null` the branch is resolved at runtime from the target's own
+// origin/HEAD and never passes through this validation at all — there, the
+// call-site quoting is the only thing standing between a hostile refname and
+// the target shell. Also blocks a leading "-" (would be read as a flag by git)
+// and "..", "//", and a trailing "/", ".", or ".lock" (illegal per
+// `git check-ref-format`).
 const REF_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 function isValidRefName(v) {
   if (typeof v !== 'string' || !REF_NAME_RE.test(v)) return false;
@@ -465,10 +469,10 @@ function validateConfig(raw, { source = 'config' } = {}) {
       problems.push(`${source}: "projectDir" must not contain spaces or shell metacharacters`);
     }
   }
-  // branch/remote are interpolated UNQUOTED into a remote shell command
-  // (`git pull --ff-only ${remote} ${branch}` in deploy.js) — reject anything
-  // outside a legal git refname charset rather than let a shell metacharacter
-  // reach the target host. See REF_NAME_RE/isValidRefName above.
+  // branch/remote reach remote shell commands (`git pull --ff-only`, `git
+  // rev-parse`). They are shQuoted at those call sites; rejecting anything
+  // outside a legal git refname charset here fails fast at load instead of
+  // relying on quoting alone. See REF_NAME_RE/isValidRefName above.
   if (typeof raw.branch === 'string' && !isValidRefName(raw.branch)) {
     problems.push(`${source}: "branch" ("${raw.branch}") must be a valid git ref name (letters, digits, ".", "_", "-", "/"; no "..", no leading "-", no shell metacharacters)`);
   }

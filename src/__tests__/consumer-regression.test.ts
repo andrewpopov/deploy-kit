@@ -20,10 +20,28 @@ const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const kit = require('../index.js') as typeof import('../index');
 const { loadConfig } = kit;
 
-// Load a source file AS IT WAS AT TAG `tag`, wired to the CURRENT (unchanged since
-// v0.9.4) exec/lock/log modules, and to `overrides` for its other in-package
-// requires (used to wire release.js's old deploy.js dependency, and deploy.js's
-// old release.js dependency, so the pair is internally consistent).
+// Load a source file AS IT WAS AT TAG `tag`, wired to the CURRENT exec/lock/log
+// modules, and to `overrides` for its other in-package requires (used to wire
+// release.js's old deploy.js dependency, and deploy.js's old release.js
+// dependency, so the pair is internally consistent).
+//
+// IMPORTANT, and corrected from an earlier version of this comment: exec.js and
+// lock.js are NOT "unchanged since v0.9.4" — lock.js was substantially rewritten
+// on this branch (state moved off /tmp, atomic takeover, owner/nonce metadata,
+// `ensureStateDir`), and exec.js gained `shQuote`, ssh option validation, and the
+// StrictHostKeyChecking/BatchMode hardening defaults. Because BOTH the v0.9.4
+// pipeline (`oldDeploy`/`oldRelease`, loaded below) and the CURRENT kit are wired
+// to these SAME current modules, any behavioral difference that originates
+// *inside* exec.js/lock.js themselves is invisible to this comparison — it
+// shows up identically on both sides and never surfaces as a mismatch. That
+// lock/state rewrite is covered separately, against a real shell, by
+// `lock.test.ts`; the ssh-hardening-argument changes are covered by the
+// "ssh hardening" suite in `deploy-kit.test.ts`. What THIS file actually
+// verifies is narrower and complementary: that deploy.js's/release.js's own
+// pipeline logic (step order, gating, which commands get built and when) is
+// byte-identical to v0.9.4 except for the three documented `applyPkg82Deltas`
+// deltas below. Only log.js is genuinely unchanged since v0.9.4 (verified:
+// `git diff v0.9.4 HEAD -- src/log.js` is empty).
 function loadAtTag(relFile: string, tag: string, overrides: Record<string, unknown> = {}) {
   const source = execSync(`git show ${tag}:src/${relFile}`, { cwd: REPO_ROOT, encoding: 'utf8' });
   const filename = path.join(REPO_ROOT, 'src', relFile);
@@ -72,11 +90,28 @@ function makeUniversalRuntime(appNames: string[]) {
     if (cmd.includes('rev-parse')) return SHA;
     if (cmd.includes('readlink -f')) return '/canonical';
     if (cmd.includes('pm2 jlist')) {
-      return JSON.stringify(appNames.map((n) => ({ name: n, pid: 111, pm2_env: { status: 'online', restart_time: 5 } })));
+      // Reflect the `stopped` set: release.js's `stopWritersConfirmed`/
+      // `verifyActivation` actually READ this back (not just fire-and-forget
+      // pm2 stop/restart), so a fake that always reports "online" makes the
+      // release pipeline's own stop-confirmation permanently fail closed —
+      // aborting every dbBoundApps release config identically (old and new)
+      // before ever reaching flip/restart, which would silently make THIS
+      // fixture vacuous all over again, just one phase later.
+      return JSON.stringify(appNames.map((n) => ({
+        name: n, pid: 111, pm2_env: { status: stopped.has(n) ? 'stopped' : 'online', restart_time: 5 },
+      })));
     }
-    if (cmd.includes('readlink ') && cmd.includes('/current')) return 'releases/prev1234567-20260709T090000Z';
-    if (cmd.includes('readlink ') && cmd.includes('/previous')) return 'releases/prev0000000-20260708T090000Z';
-    if (cmd.includes('ls -1')) return 'prev1234567-20260709T090000Z\nprev0000000-20260708T090000Z';
+    // Release ids must match RELEASE_ID_BODY (`[0-9a-f]{7,40}-<UTC timestamp>`) —
+    // hex only. An earlier version of this fixture used "prev1234567"/
+    // "prev0000000", which are NOT valid hex (the letters p/r/v aren't hex
+    // digits), so `assertSafeTarget` threw during preflight for EVERY
+    // release-layout consumer (cairn/mizen/smarthome) in BOTH the old and new
+    // pipeline, making `expect(newRun.error).toEqual(oldRun.error)` pass on two
+    // identical early aborts without ever exercising fetch/resolveSha/
+    // materialize/flip. Valid hex ids so the release pipeline actually runs.
+    if (cmd.includes('readlink ') && cmd.includes('/current')) return 'releases/deadbee-20260709T090000Z';
+    if (cmd.includes('readlink ') && cmd.includes('/previous')) return 'releases/cafe123-20260708T090000Z';
+    if (cmd.includes('ls -1')) return 'deadbee-20260709T090000Z\ncafe123-20260708T090000Z';
     if (cmd.includes('git ls-files')) return '';
     if (cmd.includes('curl')) return '200';
     if (/backup/i.test(cmd)) return '/var/lib/app/backups/backup-1.gpg'; // safe backupId shape
@@ -87,13 +122,13 @@ function makeUniversalRuntime(appNames: string[]) {
 
 const ctx = (runtime: unknown) => ({ runtime, sleep: () => {} });
 
-// PKG-82 deliberately changed legacy (non-`layout: releases`) deploy behavior in two
-// ways. This function encodes exactly those two deltas, narrowly and anchored, so
-// they can be applied to the v0.9.4 sequence and diffed against the CURRENT kit's
-// output. Anything the current kit does that ISN'T one of these two deltas will
-// still show up as a mismatch — that's the whole point of keeping the v0.9.4 anchor
-// instead of just re-snapshotting today's output.
-function applyPkg82Deltas(oldSeq: string[]): string[] {
+// PKG-82 deliberately changed deploy behavior (legacy and/or release layout) in
+// four ways. This function encodes exactly those four deltas, narrowly and
+// anchored, so they can be applied to the v0.9.4 sequence and diffed against the
+// CURRENT kit's output. Anything the current kit does that ISN'T one of these
+// four deltas will still show up as a mismatch — that's the whole point of
+// keeping the v0.9.4 anchor instead of just re-snapshotting today's output.
+function applyPkg82Deltas(oldSeq: string[], config: unknown): string[] {
   // Delta 1 (security): the remote/branch used to be interpolated unquoted into a
   // remote shell command (`git fetch origin --prune`, `git pull --ff-only origin
   // master`). The branch is derived from the target's own `origin/HEAD`, so a
@@ -107,20 +142,77 @@ function applyPkg82Deltas(oldSeq: string[]): string[] {
     return next;
   });
 
-  // Delta 2 (data integrity): the pre-migration DB backup used to run BEFORE
-  // DB-bound apps were paused; a backup taken with writers still live can be
-  // inconsistent. PKG-82 moves the backup to run AFTER the pause step, matching
-  // what the release layout already did. In v0.9.4's legacy sequence the backup
-  // command is always the single line immediately preceding the `pm2 stop ...`
-  // pause line (when dbBoundApps is non-empty); PKG-82 swaps just that one
-  // adjacent pair. Configs with no dbBoundApps (e.g. clipd) have no pause line at
-  // all, so this is a no-op for them.
-  const pauseIndex = seq.findIndex((cmd) => /pm2 stop \S/.test(cmd));
-  if (pauseIndex > 0) {
-    const swapped = [...seq];
-    [swapped[pauseIndex - 1], swapped[pauseIndex]] = [swapped[pauseIndex], swapped[pauseIndex - 1]];
-    seq = swapped;
+  // Delta 2 (data integrity, LEGACY layout only): the pre-migration DB backup
+  // used to run BEFORE DB-bound apps were paused; a backup taken with writers
+  // still live can be inconsistent. PKG-82 moves the backup to run AFTER the
+  // pause step, matching what the release layout already did (release.js's own
+  // "stop writers -> backup -> migrate" ordering is unchanged since v0.9.4 — see
+  // the module header comment). In v0.9.4's LEGACY sequence the backup command
+  // is always the single line immediately preceding the `pm2 stop ...` pause
+  // line (when dbBoundApps is non-empty); PKG-82 swaps just that one adjacent
+  // pair. Configs with no dbBoundApps (e.g. clipd) have no pause line at all, so
+  // this is a no-op for them. Scoped to `layout.type !== 'releases'`: the
+  // release-layout configs (cairn/mizen/smarthome) ALSO emit a `pm2 stop ...`
+  // line (release.js's own pre-existing, unrelated writer-stop step), and a
+  // blind index-based swap there would corrupt an already-correct sequence
+  // that this delta was never meant to touch.
+  const isReleaseLayout = !!(config as { layout?: { type?: string } } | null)?.layout
+    && (config as { layout?: { type?: string } }).layout?.type === 'releases';
+  if (!isReleaseLayout) {
+    const pauseIndex = seq.findIndex((cmd) => /pm2 stop \S/.test(cmd));
+    if (pauseIndex > 0) {
+      const swapped = [...seq];
+      [swapped[pauseIndex - 1], swapped[pauseIndex]] = [swapped[pauseIndex], swapped[pauseIndex - 1]];
+      seq = swapped;
+    }
   }
+
+  // Delta 3 (correctness regression fix): $HOME/.deploy-kit used to be created
+  // ONLY as a side effect of acquireLock, so a --no-lock / lock:false deploy
+  // silently never recorded its rollback pointer (the OLD /tmp path always
+  // existed, so this was invisible before state moved off /tmp, which does
+  // NOT always exist). PKG-82 runs `ensureStateDir` as its own fragment
+  // immediately before the "Recording current revision" `git rev-parse HEAD >
+  // ...prev-sha` redirect, so recording works regardless of the lock setting —
+  // state must exist independent of locking. Anchored to the exact literal
+  // "git rev-parse HEAD > <prevShaFile> 2>/dev/null || true" line this kit
+  // emits for THIS config (via the CURRENT, real `lock.ensureStateDir`/
+  // `lock.prevShaFile` — not retyped/duplicated here, so this can't drift the
+  // next time that fragment changes) — it will not touch any other command.
+  // The v0.9.4 line is always wrapped with a "cd <projectDir> && " (ssh/local
+  // target-command) prefix, so match on the literal SUFFIX rather than the
+  // whole string, and preserve whatever prefix this consumer's mode/host
+  // produced.
+  const prevShaLine = `git rev-parse HEAD > ${lock.prevShaFile(config)} 2>/dev/null || true`;
+  seq = seq.map((cmd) => {
+    if (!cmd.endsWith(prevShaLine)) return cmd;
+    const prefix = cmd.slice(0, cmd.length - prevShaLine.length);
+    return `${prefix}${lock.ensureStateDir(config)}\n${prevShaLine}`;
+  });
+
+  // Delta 4 (security, release layout): the SAME defense-in-depth quoting as
+  // Delta 1, but for the release layout's OWN git plumbing — deploy.js's git
+  // fetch/pull and release.js's git fetch/rev-parse against the bare repo.git
+  // mirror are two separate call sites (see the module header comment above),
+  // so this branch's quoting fix shows up here too, independently of Delta 1.
+  // Anchored to the exact literal `fetch --prune <remote> '+refs/heads/...'`
+  // and `rev-parse refs/heads/<branch>` / `rev-parse <remote>/<branch>` shapes
+  // release.js emits — matched and replaced one at a time (not via alternation
+  // on an already-substituted string) so quoting one shape can never corrupt
+  // the other.
+  seq = seq.map((cmd) => {
+    let next = cmd.replace(/fetch --prune (\S+) '\+refs\/heads/, "fetch --prune '$1' '+refs/heads");
+    if (next === cmd) {
+      const refsHeadsMatch = next.match(/rev-parse refs\/heads\/(\S+)$/);
+      if (refsHeadsMatch) {
+        next = next.replace(/rev-parse refs\/heads\/(\S+)$/, "rev-parse refs/heads/'$1'");
+      } else {
+        next = next.replace(/rev-parse (\S+)\/(\S+)$/, "rev-parse '$1'/'$2'");
+      }
+    }
+    return next;
+  });
+
   return seq;
 }
 
@@ -253,8 +345,22 @@ describe('consumer regression: v0.9.4 command sequence is byte-identical (preRes
       const oldRun = run(oldDeploy.deploy, config, appNames);
       const newRun = run(kit.deploy, config, appNames);
 
-      expect(newRun.calls).toEqual(applyPkg82Deltas(oldRun.calls));
+      expect(newRun.calls).toEqual(applyPkg82Deltas(oldRun.calls, config));
       expect(newRun.error).toEqual(oldRun.error);
+
+      // Guard against this test silently going vacuous again (the release-id
+      // fixture bug fixed above, where an invalid-hex readlink/ls-1 fixture made
+      // every release-layout consumer abort during preflight before the two
+      // runs ever diverged, so `toEqual` above was comparing two identical
+      // early aborts and would pass even if the release pipeline were badly
+      // broken). Assert directly that a release-layout config's command stream
+      // actually reaches the materialize step (`git worktree add`) — if this
+      // ever stops being true, the comparison above has gone vacuous again.
+      const layout = (config as { layout?: { type?: string } }).layout;
+      if (layout && layout.type === 'releases') {
+        expect(oldRun.calls.some((c) => c.includes('worktree add'))).toBe(true);
+        expect(newRun.calls.some((c) => c.includes('worktree add'))).toBe(true);
+      }
     });
   }
 });

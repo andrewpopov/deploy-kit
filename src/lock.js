@@ -52,16 +52,14 @@ function lockTtlSeconds(config) {
   return (config.stepTimeoutSeconds || 1800) * 4;
 }
 
-// Take the target lock (atomic mkdir), recording owner metadata (pid + start
-// time) inside it so a later acquire can tell a live lock from an abandoned
-// one and reclaim it instead of wedging forever. Returns a release fn.
-// --steal-lock forces past a held lock; config.lock:false disables locking
-// entirely.
-function acquireLock(config, ctx, { steal = false, suffix } = {}) {
-  const noop = () => {};
-  if (config.lock === false) return noop;
-  const dir = lockDir(config, suffix);
-  const ttl = lockTtlSeconds(config);
+// Shell fragment that ensures $HOME/.deploy-kit exists (mode 700) and carries a
+// pre-upgrade /tmp prev-sha pointer forward into it, one time. This must NOT be
+// a side effect of taking the lock: with `lock:false` (or config.lock === false)
+// acquireLock returns a pure noop and never runs any shell at all, so a caller
+// that needs the state dir/migration (e.g. deploy.js recording the prev-sha
+// before pull) must run this fragment itself rather than relying on the lock
+// path to have done it first.
+function ensureStateDir(config) {
   const newPrevSha = prevShaFile(config);
   const legacyPrevSha = legacyPrevShaFile(config);
 
@@ -77,15 +75,49 @@ function acquireLock(config, ctx, { steal = false, suffix } = {}) {
   // either way).
   const migrate = `if [ ! -f "${newPrevSha}" ] && [ -f "${legacyPrevSha}" ]; then `
     + `cp "${legacyPrevSha}" "${newPrevSha}" 2>/dev/null || true; fi`;
-  const writeOwner = `echo $$ > "${dir}/pid" 2>/dev/null; date +%s > "${dir}/ts" 2>/dev/null`;
+  return `${ensureBase}\n${migrate}`;
+}
+
+// Take the target lock (atomic mkdir), recording owner metadata (pid + start
+// time, for operator visibility in the stale-lock log line) plus a random
+// nonce inside it. Staleness is judged PURELY by the TTL clock (recorded ts vs
+// now) -- never by the recorded pid: that pid is the ephemeral remote shell's
+// own $$, which exits moments after writing it, so it is printed for a human
+// but never checked as a liveness signal by this code. The nonce is what lets
+// release() below tell "a lock I still hold" from "a lock TTL-reclaimed out
+// from under me while I was still running" -- see release() for why that
+// matters. Returns a release fn. --steal-lock forces past a held lock;
+// config.lock:false disables locking entirely.
+function acquireLock(config, ctx, { steal = false, suffix } = {}) {
+  const noop = () => {};
+  if (config.lock === false) return noop;
+  const dir = lockDir(config, suffix);
+  const ttl = lockTtlSeconds(config);
+  const stateDir = ensureStateDir(config);
+  // Generate the nonce ON THE TARGET, not in Node: /dev/urandom (falling back to
+  // pid+timestamp if it's somehow unavailable) so it's a real per-acquire random
+  // value in production, POSIX-portable (no bashisms, no $RANDOM).
+  const genNonce = 'nonce=$(head -c16 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d " \\n"); '
+    + '[ -n "$nonce" ] || nonce="$$-$(date +%s)"';
+  const writeOwner = `${genNonce}; echo $$ > "${dir}/pid" 2>/dev/null; date +%s > "${dir}/ts" 2>/dev/null; `
+    + `echo "$nonce" > "${dir}/nonce" 2>/dev/null`;
+
+  // Dispose of a stale/held lock dir via RENAME, not `rm -rf`: `mv` of a
+  // directory to a fresh, unique (pid-suffixed) name is a single rename(2), so
+  // at most one concurrent disposer can ever win it -- the loser's `mv` fails
+  // (its source is already gone) and it falls through to the ordinary `mkdir`
+  // contest below, where it loses too. `rm -rf "$dir"` directly would defeat
+  // that: two racers could each `rm` (racer B deleting the fresh dir racer A
+  // just `mkdir`'d) then both `mkdir` and both believe they hold the lock.
+  const disposeStale = `mv "${dir}" "${dir}.stale.$$" 2>/dev/null && rm -rf "${dir}.stale.$$"`;
 
   if (steal) {
-    // Force past a held lock. rm -rf then an ATOMIC mkdir (no -p) so two
-    // concurrent --steal-lock runs can't both "succeed" silently: whichever
-    // loses the mkdir gets the normal held-lock error instead of believing it
-    // owns a lock the other racer just recreated.
-    const script = `${ensureBase}\n${migrate}\n`
-      + `rm -rf "${dir}" 2>/dev/null\n`
+    // Force past a held lock. Rename-based disposal (see disposeStale above)
+    // then an ATOMIC mkdir (no -p) so two concurrent --steal-lock runs can't
+    // both "succeed" silently: whichever loses the mkdir gets the normal
+    // held-lock error instead of believing it owns a lock the other racer
+    // just recreated.
+    const script = `${stateDir}\n${disposeStale}\n`
       + `if mkdir -m 700 "${dir}" 2>/dev/null; then ${writeOwner}; else exit 1; fi`;
     const res = runOnTarget(script, config, { runtime: ctx.runtime });
     if (!res.ok) {
@@ -95,8 +127,7 @@ function acquireLock(config, ctx, { steal = false, suffix } = {}) {
     }
   } else {
     const script = [
-      ensureBase,
-      migrate,
+      stateDir,
       `if mkdir -m 700 "${dir}" 2>/dev/null; then`,
       `  ${writeOwner}`,
       '  exit 0',
@@ -108,7 +139,7 @@ function acquireLock(config, ctx, { steal = false, suffix } = {}) {
       `if [ "$age" -gt ${ttl} ]; then`,
       `  pid=$(cat "${dir}/pid" 2>/dev/null || echo '?')`,
       `  echo "deploy-kit: stale lock at ${dir} -- age $age seconds exceeds the ${ttl}s TTL (pid $pid) -- taking it over"`,
-      `  rm -rf "${dir}" 2>/dev/null`,
+      `  ${disposeStale}`,
       `  if mkdir -m 700 "${dir}" 2>/dev/null; then`,
       `    ${writeOwner}`,
       '    exit 0',
@@ -123,9 +154,24 @@ function acquireLock(config, ctx, { steal = false, suffix } = {}) {
       );
     }
   }
-  return () => runOnTarget(`rm -rf "${dir}" 2>/dev/null || true`, config, { runtime: ctx.runtime });
+  // Read back the nonce THIS acquire just wrote (generated shell-side above, so
+  // Node never invents the value itself) to bake into the release check below.
+  const nonceRes = runOnTarget(`cat "${dir}/nonce" 2>/dev/null`, config, { capture: true, runtime: ctx.runtime });
+  const nonce = (nonceRes.output || '').trim();
+
+  // Only remove the lock dir if its nonce still matches the one we wrote at
+  // acquire time. Without this check, an unconditional `rm -rf "$dir"` here
+  // deletes whatever currently sits at that path -- including another run's
+  // lock: a slow-but-still-alive run A that exceeds the TTL gets reclaimed by
+  // run B, but A's eventual release() would delete B's (not A's) lock,
+  // letting a third run C start while B still believes it holds the lock.
+  return () => runOnTarget(
+    `[ "$(cat "${dir}/nonce" 2>/dev/null)" = "${nonce}" ] && rm -rf "${dir}" 2>/dev/null || true`,
+    config,
+    { runtime: ctx.runtime },
+  );
 }
 
 module.exports = {
-  lockId, lockDir, prevShaFile, legacyPrevShaFile, lockTtlSeconds, acquireLock,
+  lockId, lockDir, prevShaFile, legacyPrevShaFile, lockTtlSeconds, ensureStateDir, acquireLock,
 };
