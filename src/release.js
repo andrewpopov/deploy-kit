@@ -4,6 +4,7 @@ const { runOnTarget, buildHealthCommand } = require('./exec');
 const { acquireLock } = require('./lock');
 const { log: defaultLog } = require('./log');
 const { backupIdFromOutput, isSafeBackupId, backupReferenceFromId } = require('./backup-reference');
+const { resolveBranch } = require('./branch');
 
 // Bump when the on-host layout changes shape. The host migration writes this
 // version into .deploy-kit-layout; a release deploy refuses a host whose marker
@@ -269,7 +270,23 @@ function deployRelease(config, options = {}, ctx = {}) {
   const sleep = ctx.sleep || defaultSleep;
   const c = { ...ctx, log, sleep, runtime: ctx.runtime };
   const paths = releasePaths(config);
-  const { skipMigrate = false, stealLock = false } = options;
+  const {
+    skipMigrate = false, stealLock = false, skipBuild = false, skipDeps = false, stash,
+  } = options;
+
+  // `--no-stash` (options.stash === false) has no analog under the release
+  // layout: the legacy stash step exists because a legacy deploy pulls INTO an
+  // existing working tree that may carry local tracked changes worth preserving.
+  // A release is materialized fresh via `git worktree add --detach` every time —
+  // there is no persistent working tree to have local changes on, so there is
+  // nothing to stash. Silently ignoring the flag would be exactly the BWK-136
+  // failure mode (operator believes it took effect); refuse instead.
+  if (stash === false) {
+    throw new Error(
+      '--no-stash does not apply to the release layout: each release is materialized as a fresh git '
+      + 'worktree, never an in-place working tree that could carry local changes to stash. Remove the flag.',
+    );
+  }
 
   log.header(`🚀 Deploying [release layout] (${config.mode}${config.host ? ` → ${config.host}` : ''})`);
 
@@ -416,7 +433,11 @@ function deployRelease(config, options = {}, ctx = {}) {
     // no worktree has a branch checked out). It also updates a mirror clone's heads
     // harmlessly. --prune keeps deleted branches from lingering.
     runInDir(paths.root, `git --git-dir=${paths.repoGit} fetch --prune ${config.remote} '+refs/heads/*:refs/heads/*'`, config, c);
-    const branch = config.branch || 'master';
+    // Same branch-resolution rule as the legacy path (README.md: null branch ->
+    // resolve origin/HEAD, fall back to master) — the release layout's repo lives
+    // as a bare mirror at repoGit rather than a checked-out working tree, so pass
+    // gitDir through rather than relying on cwd having a `.git`.
+    const branch = resolveBranch(config, c, { gitDir: paths.repoGit });
     // Resolve the exact SHA from `refs/heads/<branch>` FIRST — that is the ref the
     // explicit `+refs/heads/*:refs/heads/*` fetch above just force-updated, so it is
     // always current. A remote-tracking `origin/<branch>` (present if repo.git has a
@@ -455,16 +476,24 @@ function deployRelease(config, options = {}, ctx = {}) {
 
     // ---- Phase: install (inside the candidate; current still serving) ----
     st.phase = 'install';
-    log.step('Installing dependencies in the candidate release');
-    runInDir(st.releaseDir, `npm_config_cache=${paths.npmCache} ${config.hooks.install}`, config, c);
-    steps.push('install');
+    if (skipDeps) {
+      log.warning('Skipping dependency install (--skip-deps) — the candidate release will have no node_modules unless sharedPaths supplies one');
+    } else {
+      log.step('Installing dependencies in the candidate release');
+      runInDir(st.releaseDir, `npm_config_cache=${paths.npmCache} ${config.hooks.install}`, config, c);
+      steps.push('install');
+    }
 
     // ---- Phase: build (inside the candidate) ----
     if (config.hooks.build) {
       st.phase = 'build';
-      log.step('Building the candidate release');
-      runInDir(st.releaseDir, config.hooks.build, config, c);
-      steps.push('build');
+      if (skipBuild) {
+        log.warning('Skipping build (--skip-build)');
+      } else {
+        log.step('Building the candidate release');
+        runInDir(st.releaseDir, config.hooks.build, config, c);
+        steps.push('build');
+      }
     }
 
     // ---- Phase: validate (candidate is now immutable) ----
@@ -667,6 +696,25 @@ function rollbackRelease(config, options = {}, ctx = {}) {
   const sleep = ctx.sleep || defaultSleep;
   const c = { ...ctx, log, sleep, runtime: ctx.runtime };
   const paths = releasePaths(config);
+
+  // Release-layout rollback NEVER reinstalls or rebuilds, with or without these
+  // flags — the previous release directory is already built (see the module
+  // comment above). So --skip-build/--skip-deps have no step to skip here; unlike
+  // the legacy rollback (which really does gate an install/build step on them),
+  // honoring or ignoring the flag would both look like a no-op to the caller.
+  // Refuse loudly rather than let an operator believe the flag did something.
+  if (options.skipBuild) {
+    throw new Error(
+      '--skip-build does not apply to release-layout rollback: it never rebuilds — the previous release is '
+      + 'already built. Remove the flag.',
+    );
+  }
+  if (options.skipDeps) {
+    throw new Error(
+      '--skip-deps does not apply to release-layout rollback: it never reinstalls dependencies — the previous '
+      + 'release already has its node_modules in place. Remove the flag.',
+    );
+  }
 
   log.header(`⏪ Rolling back [release layout] (${config.mode}${config.host ? ` → ${config.host}` : ''})`);
   const release = acquireLock(config, c, { steal: options.stealLock === true });

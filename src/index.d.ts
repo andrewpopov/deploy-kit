@@ -47,6 +47,15 @@ export interface SshOptions {
   connectTimeout?: number | null;
   serverAliveInterval?: number | null;
   serverAliveCountMax?: number | null;
+  /** -o StrictHostKeyChecking (default 'accept-new'); null omits the flag. */
+  strictHostKeyChecking?: string | null;
+  /** -o BatchMode (default 'yes'); null omits the flag. */
+  batchMode?: string | null;
+  /**
+   * Extra raw `Key=Value` strings passed as `-o`. Emitted BEFORE the defaults
+   * above, so an entry here overrides them — OpenSSH uses the first value it
+   * obtains for a repeated option.
+   */
   options?: string[];
 }
 
@@ -147,12 +156,15 @@ export interface RollbackOptions {
   stealLock?: boolean;
 }
 
-export interface RollbackResult {
-  sha: string;
-  mode: DeployMode;
-  host: string | null;
-  healthy: boolean;
-}
+/**
+ * The two layouts roll back to different things, so exactly one of `sha` /
+ * `release` is present. Legacy resets the working tree to the recorded pre-pull
+ * SHA; the release layout re-points the `current` symlink at the previous
+ * release directory and never touches a SHA.
+ */
+export type RollbackResult =
+  | { sha: string; release?: undefined; mode: DeployMode; host: string | null; healthy: boolean }
+  | { release: string; sha?: undefined; mode: DeployMode; host: string | null; healthy: boolean };
 
 export interface DeployResult {
   branch: string;
@@ -212,7 +224,14 @@ export function sshHardeningArgs(ssh?: SshOptions): string[];
 export function runOnTarget(
   command: string,
   config: DeployConfig,
-  options?: { capture?: boolean; runtime?: Runtime },
+  options?: {
+    capture?: boolean;
+    runtime?: Runtime;
+    /** Written to the command's stdin — used to pass JSON without interpolating it. */
+    input?: string;
+    /** Per-command wall-clock timeout; falls back to config.stepTimeoutSeconds. */
+    timeoutSeconds?: number | null;
+  },
 ): { ok: boolean; output: string; error?: unknown };
 export function buildHealthCommand(config: DeployConfig, check?: HealthCheck): string;
 

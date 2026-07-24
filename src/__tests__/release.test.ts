@@ -425,6 +425,79 @@ describe('release deploy — safety hardening (Codex review fixes)', () => {
   });
 });
 
+describe('release deploy — flag honoring vs rejection under the release layout', () => {
+  it('honors --skip-deps: no install command runs and "install" is absent from steps', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    const result = release.deployRelease(relConfig(), { skipDeps: true }, ctx(runtime));
+    expect(calls.some((cmd) => cmd.includes('npm ci'))).toBe(false);
+    expect(result.steps).not.toContain('install');
+    // the build step is unaffected by --skip-deps.
+    expect(result.steps).toContain('build');
+  });
+
+  it('honors --skip-build: no build command runs and "build" is absent from steps', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    const result = release.deployRelease(relConfig(), { skipBuild: true }, ctx(runtime));
+    expect(calls.some((cmd) => cmd.includes('npm run build'))).toBe(false);
+    expect(result.steps).not.toContain('build');
+    // install is unaffected by --skip-build.
+    expect(result.steps).toContain('install');
+  });
+
+  it('rejects --no-stash with a clear error naming the flag (no working-tree stash under this layout)', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    expect(() => release.deployRelease(relConfig(), { stash: false }, ctx(runtime))).toThrow(/--no-stash does not apply/);
+    // nothing was touched — the rejection happens before any target command runs.
+    expect(calls.length).toBe(0);
+  });
+
+  it('rejects --skip-build for release-layout rollback (no rebuild step exists there)', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    expect(() => release.rollbackRelease(relConfig(), { skipBuild: true }, ctx(runtime))).toThrow(/--skip-build does not apply/);
+    expect(calls.length).toBe(0);
+  });
+
+  it('rejects --skip-deps for release-layout rollback (no install step exists there)', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    expect(() => release.rollbackRelease(relConfig(), { skipDeps: true }, ctx(runtime))).toThrow(/--skip-deps does not apply/);
+    expect(calls.length).toBe(0);
+  });
+});
+
+describe('release deploy — default-branch resolution (Bug 2)', () => {
+  it('with branch: null, resolves origin/HEAD instead of hardcoding master (repo whose default is main)', () => {
+    const rt = makeReleaseRuntime();
+    const runtime = {
+      execFileSync: (_f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        // The shared resolveBranch call, scoped to the bare mirror via --git-dir.
+        if (cmd.includes('rev-parse --abbrev-ref origin/HEAD')) return 'origin/main';
+        // The subsequent SHA resolution now looks up refs/heads/main, not master.
+        if (cmd.includes('rev-parse refs/heads/main')) return SHA;
+        if (cmd.includes('rev-parse refs/heads/master')) throw new Error('should not resolve refs/heads/master when the default branch is main');
+        return (rt.runtime.execFileSync as any)(_f, args);
+      },
+    };
+    const result = release.deployRelease(relConfig({ branch: null }), {}, ctx(runtime));
+    expect(result.branch).toBe('main');
+    expect(result.sha).toBe(SHA);
+    expect(result.steps).toContain('flip');
+  });
+
+  it('with branch: null and no resolvable origin/HEAD, falls back to master', () => {
+    const rt = makeReleaseRuntime();
+    const runtime = {
+      execFileSync: (_f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        if (cmd.includes('rev-parse --abbrev-ref origin/HEAD')) return ''; // unresolvable
+        return (rt.runtime.execFileSync as any)(_f, args);
+      },
+    };
+    const result = release.deployRelease(relConfig({ branch: null }), {}, ctx(runtime));
+    expect(result.branch).toBe('master');
+  });
+});
+
 describe('release deploy — preflight guards (each must fail by name)', () => {
   it('refuses a host with no layout marker', () => {
     const { runtime } = makeReleaseRuntime({ marker: '' });

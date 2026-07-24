@@ -10,6 +10,19 @@ function normalizeRuntime(runtime = {}) {
   };
 }
 
+// ssh.options are passed straight to the ssh command line. A malformed entry
+// (not "Key=Value", e.g. a bare flag or an accidental object) would either be
+// silently swallowed or produce a confusing ssh parse error. Fail fast and name
+// the bad entry, matching assertSafeHeader's precedent below.
+const SSH_OPTION_RE = /^[A-Za-z][A-Za-z0-9]*=.+$/;
+function assertSafeSshOption(opt) {
+  if (typeof opt !== 'string' || !SSH_OPTION_RE.test(opt)) {
+    throw new Error(
+      `deploy-kit: ssh.options entry ${JSON.stringify(opt)} must be a "Key=Value" string (OpenSSH -o syntax)`
+    );
+  }
+}
+
 // Build the `-o Key=Value` ssh hardening flags from config. Defaults harden
 // against a wedged route hanging the deploy: ConnectTimeout bounds the connect,
 // ServerAlive* detects a dead session mid-command. Each is opt-out (null omits).
@@ -18,7 +31,21 @@ function sshHardeningArgs(ssh = {}) {
   if (ssh.connectTimeout != null) args.push('-o', `ConnectTimeout=${ssh.connectTimeout}`);
   if (ssh.serverAliveInterval != null) args.push('-o', `ServerAliveInterval=${ssh.serverAliveInterval}`);
   if (ssh.serverAliveCountMax != null) args.push('-o', `ServerAliveCountMax=${ssh.serverAliveCountMax}`);
-  for (const opt of ssh.options || []) args.push('-o', opt);
+  for (const opt of ssh.options || []) {
+    assertSafeSshOption(opt);
+    args.push('-o', opt);
+  }
+  // Host-key + batch defaults (StrictHostKeyChecking/BatchMode) are pushed LAST,
+  // after ssh.options, on purpose: for repeated `-o Key=Value` flags OpenSSH uses
+  // the FIRST value it obtains and ignores later duplicates (`man ssh_config`:
+  // "the first obtained value will be used"; verified against the installed
+  // ssh_config(5)/ssh(1) man pages on this machine). So a user override supplied
+  // via ssh.options — e.g. `StrictHostKeyChecking=yes` — must appear BEFORE our
+  // default of the same key or it would be silently ignored, which is the exact
+  // silently-ignored-config bug this hardening is meant to prevent. Each default
+  // is opt-out via an explicit `null`, same convention as connectTimeout etc.
+  if (ssh.strictHostKeyChecking != null) args.push('-o', `StrictHostKeyChecking=${ssh.strictHostKeyChecking}`);
+  if (ssh.batchMode != null) args.push('-o', `BatchMode=${ssh.batchMode}`);
   return args;
 }
 

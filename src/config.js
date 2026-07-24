@@ -59,6 +59,12 @@ const DEFAULT_CONFIG = {
     connectTimeout: 10, // -o ConnectTimeout (seconds); null to omit
     serverAliveInterval: 15, // -o ServerAliveInterval (seconds); null to omit
     serverAliveCountMax: 3, // -o ServerAliveCountMax; null to omit
+    // Host-key posture for unattended deploys: accept-new pins a first-seen key
+    // (so later MITM is caught) without the interactive prompt that would hang a
+    // cron/CI run, and BatchMode turns any remaining prompt into a fast failure.
+    // Override either via `options` — see sshHardeningArgs for why that wins.
+    strictHostKeyChecking: 'accept-new', // -o StrictHostKeyChecking; null to omit
+    batchMode: 'yes', // -o BatchMode; null to omit
     options: [], // extra raw `-o Key=Value` strings appended verbatim
   },
   // Per-command wall-clock timeout in seconds. A hung step is killed and its step
@@ -177,6 +183,20 @@ const KEY_TYPES = {
 // A safe identifier for a state key / display: alnum, dot, dash, underscore. Used
 // for probe/check/backup ids so they can't collide, escape, or be shell-injected.
 const SAFE_ID_RE = /^[A-Za-z0-9._-]+$/;
+// A git refname charset for `branch`/`remote`. Rather than blocklist shell
+// metacharacters, allowlist the legal ones — git refnames never legally contain
+// ";$|&`()<>" etc, so this is both a "well-formed ref" check AND the shell-
+// injection guard: both values are interpolated UNQUOTED into a remote command
+// (`git pull --ff-only ${remote} ${branch}` in deploy.js). Also blocks a leading
+// "-" (would be read as a flag by git) and "..", "//", and a trailing "/", ".",
+// or ".lock" (all illegal per `git check-ref-format`).
+const REF_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+function isValidRefName(v) {
+  if (typeof v !== 'string' || !REF_NAME_RE.test(v)) return false;
+  if (v.includes('..') || v.includes('//')) return false;
+  if (v.endsWith('/') || v.endsWith('.') || v.endsWith('.lock')) return false;
+  return true;
+}
 const MONITOR_KEYS = ['disk', 'backup', 'restartStorm', 'tunnel', 'publicProbes', 'checks', 'alert', 'failAfterRuns', 'recoverAfterRuns', 'reAlertAfterMinutes', 'stateFile', 'checkTimeoutSeconds'];
 
 function isPosInt(v) { return typeof v === 'number' && Number.isInteger(v) && v > 0; }
@@ -197,6 +217,25 @@ function validateDeployChecks(checks, key, source) {
     else names.add(check.name);
     if (typeof check.command !== 'string' || !check.command.trim()) problems.push(`${source}: ${where}.command must be a non-empty string`);
   });
+  return problems;
+}
+
+const DELIVERY_EVENT_KEYS = ['command'];
+
+// Validate the opt-in `deliveryEvent` block: `{ command }` only. deploy.js/
+// release.js read `config.deliveryEvent?.command` — a typo'd key (e.g.
+// "comand") would silently no-op the whole feature instead of erroring, so
+// reject any key other than `command` and require `command` to actually be set.
+function validateDeliveryEvent(de, source) {
+  const problems = [];
+  for (const key of Object.keys(de)) {
+    if (!DELIVERY_EVENT_KEYS.includes(key)) {
+      problems.push(`${source}: unknown deliveryEvent key "${key}" (valid: ${DELIVERY_EVENT_KEYS.join(', ')})`);
+    }
+  }
+  if (typeof de.command !== 'string' || !de.command.trim()) {
+    problems.push(`${source}: "deliveryEvent.command" must be a non-empty string`);
+  }
   return problems;
 }
 
@@ -240,6 +279,25 @@ function validateMonitor(m, source) {
           // would escape the quoting and inject. Reject it (matches buildHealthCommand).
           if (String(hk).includes("'") || String(hv).includes("'")) p.push(`${source}: ${w}.headers["${hk}"] must not contain a single quote`);
         }
+      }
+      // expectStatus is compared (as a string) against curl's %{http_code} —
+      // must be a real HTTP status code, or an array of them (checks.js).
+      if (pr.expectStatus != null) {
+        const statuses = Array.isArray(pr.expectStatus) ? pr.expectStatus : [pr.expectStatus];
+        if (statuses.length === 0 || statuses.some((s) => typeof s !== 'number' || !Number.isInteger(s) || s < 100 || s > 599)) {
+          p.push(`${source}: ${w}.expectStatus must be an HTTP status code (100-599) or a non-empty array of them`);
+        }
+      }
+      // expectBodyIncludes is only ever compared with JS String#includes() against
+      // the fetched body (checks.js) — never shell-interpolated — so just a
+      // non-empty string, no metacharacter restriction needed.
+      if (pr.expectBodyIncludes != null && (typeof pr.expectBodyIncludes !== 'string' || !pr.expectBodyIncludes)) {
+        p.push(`${source}: ${w}.expectBodyIncludes must be a non-empty string`);
+      }
+      // maxTimeSeconds is interpolated into `curl --max-time ${maxTime}`; a
+      // validated number can never carry a shell metacharacter when stringified.
+      if (pr.maxTimeSeconds != null && !(typeof pr.maxTimeSeconds === 'number' && pr.maxTimeSeconds > 0)) {
+        p.push(`${source}: ${w}.maxTimeSeconds must be a positive number`);
       }
     });
   }
@@ -406,6 +464,19 @@ function validateConfig(raw, { source = 'config' } = {}) {
     } else if (/[^A-Za-z0-9_./-]/.test(raw.projectDir)) {
       problems.push(`${source}: "projectDir" must not contain spaces or shell metacharacters`);
     }
+  }
+  // branch/remote are interpolated UNQUOTED into a remote shell command
+  // (`git pull --ff-only ${remote} ${branch}` in deploy.js) — reject anything
+  // outside a legal git refname charset rather than let a shell metacharacter
+  // reach the target host. See REF_NAME_RE/isValidRefName above.
+  if (typeof raw.branch === 'string' && !isValidRefName(raw.branch)) {
+    problems.push(`${source}: "branch" ("${raw.branch}") must be a valid git ref name (letters, digits, ".", "_", "-", "/"; no "..", no leading "-", no shell metacharacters)`);
+  }
+  if (typeof raw.remote === 'string' && !isValidRefName(raw.remote)) {
+    problems.push(`${source}: "remote" ("${raw.remote}") must be a valid git ref name (letters, digits, ".", "_", "-", "/"; no "..", no leading "-", no shell metacharacters)`);
+  }
+  if (raw.deliveryEvent != null && typeof raw.deliveryEvent === 'object' && !Array.isArray(raw.deliveryEvent)) {
+    problems.push(...validateDeliveryEvent(raw.deliveryEvent, source));
   }
   return problems;
 }
