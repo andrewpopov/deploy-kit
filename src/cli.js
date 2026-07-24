@@ -17,6 +17,74 @@ const KNOWN_FLAGS = [
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
 ];
 
+// Flags that take a following positional value. Kept in sync with the arity
+// checks in parseOptions() below — used by usedFlags() to walk raw argv the
+// same way parseOptions does, so a flag's VALUE is never mistaken for a flag
+// of its own (e.g. `--service --skip-build` must not read `--skip-build` as
+// a used flag; parseOptions consumes it as --service's value).
+const VALUE_FLAGS = new Set([
+  '--lines', '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
+]);
+
+// The set of flags each command actually reads. KNOWN_FLAGS above is only
+// "parses without throwing"; this is "has an effect for this command". The
+// gap between the two is the BWK-136 failure mode: `deploy-kit stop
+// --dry-run` used to parse fine and then really call remote.stop(), because
+// nothing checked that `stop` never reads options.dryRun.
+const COMMAND_FLAGS = {
+  init: [],
+  'alert-discord': ['--webhook-env', '--service'],
+  'announce-discord': ['--webhook-env', '--service'],
+  'run-host-operations': ['--action', '--api-url-env', '--api-key-env'],
+  'run-cairn-operations': [],
+  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--no-stash', '--dry-run', '--steal-lock', '--no-lock'],
+  rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock'],
+  monitor: ['--steal-lock', '--no-lock'],
+  status: [],
+  health: [],
+  dashboard: [],
+  resources: [],
+  git: [],
+  start: [],
+  stop: [],
+  restart: [],
+  logs: ['--lines', '--follow', '--errors'],
+};
+
+// Extra actionable guidance appended to the rejection message for specific
+// commands, on top of naming the offending flag(s) and the supported set.
+const COMMAND_HINTS = {
+  'run-cairn-operations': 'Use `deploy-kit run-host-operations --action NAME [--api-url-env ENV] [--api-key-env ENV]` instead.',
+};
+
+// Walk raw argv the way parseOptions does, returning just the flag tokens
+// actually present (not their values). Assumes args already parsed cleanly
+// (parseOptions is always called first and throws on anything malformed).
+function usedFlags(args) {
+  const used = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i];
+    if (a.startsWith('--')) {
+      used.push(a);
+      if (VALUE_FLAGS.has(a)) i += 1; // skip the value that belongs to this flag
+    }
+  }
+  return used;
+}
+
+// Reject any flag the command does not consume. Returns an error message, or
+// null if the command's flags are all supported (or the command is unknown —
+// the switch's `default` branch below reports that).
+function validateCommandFlags(command, args) {
+  const supported = COMMAND_FLAGS[command];
+  if (!supported) return null;
+  const bad = usedFlags(args).filter((f) => !supported.includes(f));
+  if (!bad.length) return null;
+  const list = supported.length ? supported.join(', ') : '(none)';
+  const hint = COMMAND_HINTS[command] ? ` ${COMMAND_HINTS[command]}` : '';
+  return `${command} does not support: ${bad.join(', ')}\n${command} supports: ${list}${hint}`;
+}
+
 const PORT_RE = /^[0-9]+$/;
 
 // Reject anything we do not recognise. Silently ignoring an unknown flag is
@@ -76,13 +144,17 @@ Commands:
                                             HOST_OPERATIONS_API_KEY)
   run-cairn-operations                     deprecated alias for run-host-operations with
                                             the Cairn defaults (DEPLOY_CAIRN_PRODUCTION action,
-                                            CAIRN_OPERATIONS_API_URL / CAIRN_OPERATIONS_API_KEY)
+                                            CAIRN_OPERATIONS_API_URL / CAIRN_OPERATIONS_API_KEY);
+                                            takes no flags
   deploy [--skip-build|--skip-deps|--skip-migrate]
          [--no-stash] [--dry-run] [--steal-lock] [--no-lock]
-  rollback [--skip-build|--skip-deps] [--steal-lock]
-  monitor                                  run fleet checks + alert on transitions (cron)
-  status | health | dashboard | resources | git
-  start | stop | restart
+  rollback [--skip-build|--skip-deps] [--dry-run] [--steal-lock] [--no-lock]
+                                            (NOT --skip-migrate or --no-stash — rollback
+                                            never reads them)
+  monitor [--steal-lock] [--no-lock]       run fleet checks + alert on transitions (cron)
+  status | health | dashboard | resources | git   (no flags)
+  start | stop | restart                   (no flags — including no --dry-run; these
+                                            commands only ever run for real)
   logs [--lines N] [--follow] [--errors]
   help`;
 
@@ -162,6 +234,16 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   }
 
   const options = parseOptions(argv.slice(1));
+
+  // Reject any flag this command does not consume, BEFORE any side effect
+  // (the version banner below, loadConfig, or dispatch) has run. See
+  // COMMAND_FLAGS above for the BWK-136 rationale.
+  const flagError = validateCommandFlags(command, argv.slice(1));
+  if (flagError) {
+    log.error(flagError);
+    return 1;
+  }
+
   // Surface the resolved version: a stale node_modules (manifest pinned newer
   // than what is installed) is otherwise invisible until a flag silently
   // misbehaves. See BRAIN-18 — `npm install` does not re-resolve a github: tag.
@@ -259,15 +341,11 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
         log.error(error instanceof Error ? error.message : String(error));
         return 1;
       });
-    // Deprecated alias — supplies the old fixed Cairn defaults. See host-operations.js.
+    // Deprecated alias — supplies the old fixed Cairn defaults. See
+    // host-operations.js. Its flag rejection (it takes none — accepting the
+    // new generic flags and silently ignoring them would be the BWK-136
+    // failure mode again) is handled generically above via COMMAND_FLAGS.
     case 'run-cairn-operations':
-      // The alias's contract is exactly the old fixed one — accepting the new
-      // generic flags and silently ignoring them would be the BWK-136 failure
-      // mode again (an operator believes a flag took effect when it did not).
-      if (options.action || options.apiUrlEnv || options.apiKeyEnv) {
-        log.error('run-cairn-operations takes no flags — use `deploy-kit run-host-operations --action NAME [--api-url-env ENV] [--api-key-env ENV]` instead');
-        return 1;
-      }
       return runCairnOperations(config, {
         apiUrl: env.CAIRN_OPERATIONS_API_URL,
         apiKey: env.CAIRN_OPERATIONS_API_KEY,

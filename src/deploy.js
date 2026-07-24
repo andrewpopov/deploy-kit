@@ -1,9 +1,12 @@
 'use strict';
 
-const { runOnTarget, buildHealthCommand } = require('./exec');
-const { lockDir, prevShaFile, acquireLock } = require('./lock');
+const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
+const {
+  lockDir, prevShaFile, ensureStateDir, acquireLock,
+} = require('./lock');
 const { log: defaultLog } = require('./log');
 const { backupIdFromOutput, backupReferenceFromId } = require('./backup-reference');
+const { resolveBranch } = require('./branch');
 
 function defaultSleep(seconds) {
   const ms = seconds * 1000;
@@ -33,19 +36,6 @@ function assertNotReleaseHost(config, ctx) {
       + `layout config, or run against the correct target.`,
     );
   }
-}
-
-// Resolve the deploy branch: explicit config wins, else the target's origin/HEAD,
-// else 'master' (matches bewks resolve_deploy_branch).
-function resolveBranch(config, ctx) {
-  if (config.branch) return config.branch;
-  const res = runOnTarget(
-    `git rev-parse --abbrev-ref ${config.remote}/HEAD 2>/dev/null || true`,
-    config,
-    { capture: true, runtime: ctx.runtime },
-  );
-  const ref = (res.output || '').trim().replace(`${config.remote}/`, '');
-  return ref || 'master';
 }
 
 // The set of endpoints to health-gate: the scalar port/healthPath is always
@@ -146,7 +136,52 @@ function deploy(config, options = {}, ctx = {}) {
   const steps = [];
   let backupId = null;
 
+  // Once the DB-bound apps are paused for migration, EVERY subsequent step
+  // (backup, migrate, build) must bring them back up on failure — otherwise a
+  // failure leaves production stopped. Matches deploy.sh, which `pm2 start`s the
+  // paused apps on every post-stop failure before aborting. Declared before the
+  // lock/signal handlers below so a SIGINT/SIGTERM mid-deploy can resume them too.
+  let dbAppsPaused = false;
+  const resumeDbApps = () => {
+    if (dbAppsPaused && config.dbBoundApps.length) {
+      runOnTarget(`pm2 start ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, config, { runtime });
+      dbAppsPaused = false;
+    }
+  };
+  // A gated step that, on failure, first resumes any paused apps, then aborts.
+  const safeStep = (message, command) => {
+    gate({ message, command }, config, c, { onFail: resumeDbApps });
+  };
+
   const release = acquireLock(config, c, { steal: stealLock });
+  // DO NOT DELETE THIS AS DEAD CODE. `onSignal`'s body is in fact unreachable
+  // for a signal that arrives mid-deploy -- but merely REGISTERING it is what
+  // makes the `finally` below run at all, and that is the whole point.
+  //
+  // Why: this function is entirely synchronous (execFileSync everywhere,
+  // Atomics.wait in defaultSleep), so it never yields to the event loop and Node
+  // can never dispatch a queued signal until after `finally` has already removed
+  // these listeners. With NO listener registered, the default disposition kills
+  // the process instantly at the signal -- `finally` never runs, paused
+  // DB-bound apps stay stopped, and the lock is held forever. That was the bug.
+  // With a listener registered, Node suppresses the default death, the
+  // synchronous run reaches `finally`, and cleanup happens there. Verified
+  // empirically: sync-block + SIGINT exits 130 with no cleanup when unregistered,
+  // and completes cleanly when registered (the body never runs either way).
+  //
+  // The body is kept as a correct safety net for the day any of this becomes
+  // async. It re-raises rather than calling process.exit(1) so an embedder
+  // calling deploy() programmatically keeps control of its own shutdown.
+  const onSignal = (sig) => {
+    log.error(`Received ${sig} mid-deploy — resuming any paused apps and releasing the lock`);
+    try { resumeDbApps(); } catch (e) { log.error(e.message); }
+    try { release(); } catch (e) { log.error(e.message); }
+    process.removeListener(sig, sigHandlers[sig]);
+    process.kill(process.pid, sig);
+  };
+  const sigHandlers = { SIGINT: () => onSignal('SIGINT'), SIGTERM: () => onSignal('SIGTERM') };
+  process.on('SIGINT', sigHandlers.SIGINT);
+  process.on('SIGTERM', sigHandlers.SIGTERM);
   try {
     // Fail closed if the host was migrated to the release layout but this config
     // still asks for a legacy in-place deploy.
@@ -168,11 +203,20 @@ function deploy(config, options = {}, ctx = {}) {
     }
 
     // Record the current SHA before pulling so `deploy-kit rollback` can reset to
-    // the exact code that was live before this deploy.
-    run('Recording current revision', `git rev-parse HEAD > ${prevShaFile(config)} 2>/dev/null || true`, { tolerate: true });
+    // the exact code that was live before this deploy. $HOME/.deploy-kit is
+    // normally created as a side effect of acquireLock, but with `lock: false`
+    // acquireLock never runs any shell at all -- so this step must ensure the
+    // state dir (and carry the legacy /tmp migration forward) itself, or the
+    // `git rev-parse HEAD >` redirect below fails with no directory to write
+    // into, silently (this step is tolerated) breaking `rollback` later.
+    run(
+      'Recording current revision',
+      `${ensureStateDir(config)}\ngit rev-parse HEAD > ${prevShaFile(config)} 2>/dev/null || true`,
+      { tolerate: true },
+    );
 
-    run('Fetching latest', `git fetch ${config.remote} --prune`);
-    run(`Pulling ${config.remote}/${branch} (--ff-only)`, `git pull --ff-only ${config.remote} ${branch}`);
+    run('Fetching latest', `git fetch ${shQuote(config.remote)} --prune`);
+    run(`Pulling ${config.remote}/${branch} (--ff-only)`, `git pull --ff-only ${shQuote(config.remote)} ${shQuote(branch)}`);
     steps.push(`pull:${branch}`);
 
     if (stash) {
@@ -189,22 +233,6 @@ function deploy(config, options = {}, ctx = {}) {
       steps.push('install');
     }
 
-    // Once the DB-bound apps are paused for migration, EVERY subsequent step
-    // (migrate, build) must bring them back up on failure — otherwise a build
-    // error leaves production stopped. Matches deploy.sh, which `pm2 start`s the
-    // paused apps on every post-stop failure before aborting.
-    let dbAppsPaused = false;
-    const resumeDbApps = () => {
-      if (dbAppsPaused && config.dbBoundApps.length) {
-        runOnTarget(`pm2 start ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, config, { runtime });
-        dbAppsPaused = false;
-      }
-    };
-    // A gated step that, on failure, first resumes any paused apps, then aborts.
-    const safeStep = (message, command) => {
-      gate({ message, command }, config, c, { onFail: resumeDbApps });
-    };
-
     const doBuild = !skipBuild && config.hooks.build;
 
     if (buildBeforeMigrate && doBuild) {
@@ -215,26 +243,30 @@ function deploy(config, options = {}, ctx = {}) {
     }
 
     if (!skipMigrate) {
+      if (config.dbBoundApps.length) {
+        // Stop DB-bound processes BEFORE the backup — matches release.js
+        // (:488-494): a writer left online during the snapshot can produce an
+        // inconsistent backup, defeating the entire reason the backup gate exists.
+        run(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`,
+          `pm2 stop ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, { tolerate: true });
+        dbAppsPaused = true;
+      }
       if (config.hooks.backup) {
-        // Backup BEFORE migrating; a failed backup aborts before any schema change
-        // (apps are still running here, so no resume needed).
+        // Backup BEFORE migrating, AFTER writers are stopped. A failed backup must
+        // still abort before any schema change — apps are already paused by now,
+        // so (unlike before this fix) resume them on failure, same as every other
+        // gate in this window.
         const backup = gate(
           { message: 'Pre-migration database backup', command: config.hooks.backup },
           config,
           c,
-          { capture: true },
+          { capture: true, onFail: resumeDbApps },
         );
         // Capture is required to correlate the backup with the delivery event.
         // Replay stdout so legacy hooks retain their operator-visible output.
         for (const line of (backup.output || '').split('\n').filter(Boolean)) log.info(line);
         backupId = backupIdFromOutput(backup.output, { log });
         steps.push('backup');
-      }
-      if (config.dbBoundApps.length) {
-        // Stop DB-bound processes so they release the SQLite lock before migrate.
-        run(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`,
-          `pm2 stop ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, { tolerate: true });
-        dbAppsPaused = true;
       }
       if (config.hooks.migrate) {
         safeStep('Running database migrations', config.hooks.migrate);
@@ -262,7 +294,6 @@ function deploy(config, options = {}, ctx = {}) {
     if (config.appNames.length) {
       const restartCmd = config.hooks.restart || pm2StartOrRestart(config.appNames, config);
       run(`Restarting apps (${config.appNames.join(', ')})`, restartCmd);
-      dbAppsPaused = false;
       steps.push('restart');
 
       // Ensure auxiliary PM2 processes are up after the main restart — a cloudflared
@@ -277,9 +308,30 @@ function deploy(config, options = {}, ctx = {}) {
       run('Persisting PM2 process list', 'pm2 save 2>/dev/null || true', { tolerate: true });
     }
 
+    // A dbBoundApp we paused above is only brought back if something else happens
+    // to cover it: appNames restarts, or the ensureApps loop. One covered by
+    // neither was left stopped while the deploy reported success (PKG-82 Bug 3).
+    // ensureApps only runs when appNames is non-empty, so it counts as coverage
+    // only under that same condition — otherwise a stranded app would be missed
+    // again whenever appNames is empty.
+    if (dbAppsPaused) {
+      const ensured = config.appNames.length ? config.ensureApps : [];
+      const stranded = config.dbBoundApps.filter(
+        (name) => !config.appNames.includes(name) && !ensured.includes(name),
+      );
+      if (stranded.length) {
+        run(`Restarting DB-bound apps (${stranded.join(', ')})`, pm2StartOrRestart(stranded, config));
+      }
+      dbAppsPaused = false;
+    }
+
     const healthy = waitForHealth(config, c);
     if (!healthy) {
-      throw new Error('Deploy completed but the application is unhealthy');
+      throw new Error(
+        'Deploy completed but the application is unhealthy: the new code is now live and failing health '
+        + 'checks. Legacy deploys have no previous release to auto-flip back to — run `deploy-kit rollback` '
+        + 'to restore the previous revision.',
+      );
     }
     steps.push('health');
 
@@ -303,6 +355,10 @@ function deploy(config, options = {}, ctx = {}) {
     log.success('Deployment completed successfully');
     return { branch, mode: config.mode, host: config.host, steps, healthy };
   } finally {
+    // Remove the signal handlers on every exit path (success or thrown) so they
+    // never leak across calls — matches release.js's own SIGINT/SIGTERM cleanup.
+    process.removeListener('SIGINT', sigHandlers.SIGINT);
+    process.removeListener('SIGTERM', sigHandlers.SIGTERM);
     release();
   }
 }

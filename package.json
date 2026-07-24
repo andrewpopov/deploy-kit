@@ -21,14 +21,16 @@
   },
   "files": [
     "src",
+    "!src/__tests__",
     "README.md"
   ],
   "license": "MIT",
   "scripts": {
+    "lint": "eslint .",
     "test": "vitest run",
     "verify:pack": "node scripts/verify-pack.mjs",
     "verify:types": "tsc --noEmit -p tsconfig.types.json",
-    "verify": "npm run verify:types && npm test && npm run verify:pack",
+    "verify": "npm run lint && npm run verify:types && npm test && npm run verify:pack",
     "release:note": "release-kit note",
     "release:notes": "release-kit notes",
     "release:bump": "release-kit bump",
@@ -38,8 +40,13 @@
   },
   "devDependencies": {
     "@andrewpopov/release-kit": "github:andrewpopov/release-kit#v0.2.0",
+    "@eslint/js": "^9.39.5",
     "@types/node": "^24.0.0",
+    "@vitest/coverage-v8": "^4.0.18",
+    "eslint": "^9.39.5",
+    "globals": "^17.7.0",
     "typescript": "^5.9.3",
+    "typescript-eslint": "^8.65.0",
     "vitest": "^4.0.18"
   },
   "keywords": [
