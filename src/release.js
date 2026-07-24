@@ -1,6 +1,6 @@
 'use strict';
 
-const { runOnTarget, buildHealthCommand } = require('./exec');
+const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
 const { acquireLock } = require('./lock');
 const { log: defaultLog } = require('./log');
 const { backupIdFromOutput, isSafeBackupId, backupReferenceFromId } = require('./backup-reference');
@@ -432,7 +432,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // heads/*` force-updates every local head to the remote (releases are detached, so
     // no worktree has a branch checked out). It also updates a mirror clone's heads
     // harmlessly. --prune keeps deleted branches from lingering.
-    runInDir(paths.root, `git --git-dir=${paths.repoGit} fetch --prune ${config.remote} '+refs/heads/*:refs/heads/*'`, config, c);
+    runInDir(paths.root, `git --git-dir=${paths.repoGit} fetch --prune ${shQuote(config.remote)} '+refs/heads/*:refs/heads/*'`, config, c);
     // Same branch-resolution rule as the legacy path (README.md: null branch ->
     // resolve origin/HEAD, fall back to master) — the release layout's repo lives
     // as a bare mirror at repoGit rather than a checked-out working tree, so pass
@@ -446,8 +446,8 @@ function deployRelease(config, options = {}, ctx = {}) {
     // advanced. Keep it only as a last-ditch fallback. `git rev-parse` echoes the arg
     // on failure, so validate the 40-hex result rather than trusting the exit code.
     const resolveSha = (ref) => capture(paths.root, `git --git-dir=${paths.repoGit} rev-parse ${ref}`, config, c);
-    st.sha = resolveSha(`refs/heads/${branch}`);
-    if (!/^[0-9a-f]{40}$/.test(st.sha)) st.sha = resolveSha(`${config.remote}/${branch}`);
+    st.sha = resolveSha(`refs/heads/${shQuote(branch)}`);
+    if (!/^[0-9a-f]{40}$/.test(st.sha)) st.sha = resolveSha(`${shQuote(config.remote)}/${shQuote(branch)}`);
     if (!/^[0-9a-f]{40}$/.test(st.sha)) {
       throw new Error(`Could not resolve ${config.remote}/${branch} (or refs/heads/${branch}) to a SHA in ${paths.repoGit} (got "${st.sha}")`);
     }

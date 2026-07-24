@@ -1,6 +1,6 @@
 'use strict';
 
-const { runOnTarget } = require('./exec');
+const { runOnTarget, shQuote } = require('./exec');
 
 // Resolve the deploy branch: explicit config wins, else the target's
 // `origin/HEAD` (the remote's default branch), else 'master'. Shared by both
@@ -16,7 +16,7 @@ function resolveBranch(config, ctx, { gitDir } = {}) {
   if (config.branch) return config.branch;
   const git = gitDir ? `git --git-dir=${gitDir}` : 'git';
   const res = runOnTarget(
-    `${git} rev-parse --abbrev-ref ${config.remote}/HEAD 2>/dev/null || true`,
+    `${git} rev-parse --abbrev-ref ${shQuote(config.remote)}/HEAD 2>/dev/null || true`,
     config,
     { capture: true, runtime: ctx.runtime },
   );

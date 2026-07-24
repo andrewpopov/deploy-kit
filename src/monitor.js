@@ -68,8 +68,6 @@ function deliverAlert(config, ctx, event) {
   }
 }
 
-const isNonOk = (s) => s === 'warn' || s === 'crit';
-
 // The per-check state machine. Given the observed status and the persisted check
 // state, decide the new state and whether an alert fires. `unknown` HOLDS (never a
 // recovery or a confirmed failure) and clears the streaks. Returns { next, alert? }.

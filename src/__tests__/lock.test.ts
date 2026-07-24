@@ -59,7 +59,7 @@ describe('lock: state location', () => {
   it('acquires under $HOME/.deploy-kit (not /tmp), created mode 700', () => {
     const home = freshHome();
     const config = lockConfig();
-    const { runtime, calls } = makeRealRuntime(home);
+    const { runtime } = makeRealRuntime(home);
     const release = lock.acquireLock(config, { runtime });
 
     // The lock/prev-sha paths themselves are no longer under /tmp (the only

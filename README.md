@@ -84,7 +84,9 @@ unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 | `ssh.connectTimeout` | `number \| null` | `10` | ssh | 0.5 | `-o ConnectTimeout`; `null` omits. |
 | `ssh.serverAliveInterval` | `number \| null` | `15` | ssh | 0.5 | `-o ServerAliveInterval`; `null` omits. |
 | `ssh.serverAliveCountMax` | `number \| null` | `3` | ssh | 0.5 | `-o ServerAliveCountMax`; `null` omits. |
-| `ssh.options` | `string[]` | `[]` | ssh | 0.5 | Extra raw `-o Key=Value` flags. |
+| `ssh.options` | `string[]` | `[]` | ssh | 0.5 | Extra raw `-o Key=Value` flags. Placed BEFORE `ssh.strictHostKeyChecking`/`ssh.batchMode` on the command line so a `Key=Value` you set here wins: OpenSSH uses the *first* value it sees for a repeated `-o`, so an override must precede deploy-kit's own default of the same key. |
+| `ssh.strictHostKeyChecking` | `string \| null` | `'accept-new'` | ssh | unreleased | `-o StrictHostKeyChecking`; `null` omits. Pins a first-seen host key without an interactive prompt. |
+| `ssh.batchMode` | `string \| null` | `'yes'` | ssh | unreleased | `-o BatchMode`; `null` omits. Turns any remaining ssh prompt into a fast failure instead of hanging an unattended deploy. |
 | `stepTimeoutSeconds` | `number \| null` | `1800` | both | 0.5 | Per-command wall-clock timeout; explicit `null` = no limit. |
 | `lock` | `boolean` | `true` | both | 0.5 | Take an atomic target lock so concurrent deploys can't interleave. |
 | `buildBeforeMigrate` | `boolean` | `false` | both | 0.2 | Build while apps are UP (paused window = just migration). |
@@ -102,12 +104,17 @@ unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 | `monitor` | `{…} \| null` | `null` | both | 0.8 | Opt-in fleet monitoring + alerting (see below). `null` = disabled. |
 | `monitor.alert` | `{command, run?}` | — | both | 0.8 | Required. Policy-free sink; gets the batched alert JSON on stdin. `run`: `controller` (default) or `target`. |
 | `monitor.publicProbes` | `{id,url,…}[]` | `[]` | both | 0.8 | External endpoint probes (unique `id`, https url). Proves DNS+ingress+TLS+routing. |
+| `monitor.publicProbes[].expectStatus` | `number \| number[]` | `200` | both | 0.8 | Expected `curl` HTTP status code, or a list of acceptable codes; anything else is `crit`. Shape-validated (unreleased). |
+| `monitor.publicProbes[].expectBodyIncludes` | `string` | — | both | 0.8 | The probe body must contain this substring, checked with JS `String#includes`; else `crit`. Shape-validated (unreleased). |
+| `monitor.publicProbes[].maxTimeSeconds` | `number` | `min(checkTimeoutSeconds - 1, 10)`, floor `2` | both | 0.8 | Per-probe `curl --max-time` override. Shape-validated (unreleased). |
 | `monitor.checks` | `{id,command,level?}[]` | `[]` | both | 0.8 | App-supplied checks; non-zero exit ⇒ alert at `level` (static severity). |
 | `monitor.disk` / `.backup` / `.restartStorm` / `.tunnel` | see below | off | both | 0.8 | Built-in host checks (omit a key to skip it). |
 | `monitor.failAfterRuns` / `.recoverAfterRuns` | `number` | `2` | both | 0.8 | Cross-run debounce before alert / recovery. |
 | `monitor.reAlertAfterMinutes` | `number` | `0` | both | 0.8 | Re-fire a still-failing alert after N minutes (0 = quiet). |
 | `monitor.stateFile` | `string` | `<dir>/.deploy-kit-monitor-state.json` | both | 0.8 | Abs path to monitor state — a STABLE dir, never under `releases/`. |
 | `monitor.checkTimeoutSeconds` | `number` | `20` | both | 0.8 | Per-check wall-clock bound. |
+| `deliveryEvent` | `{command} \| null` | `null` | both | 0.9 | Opt-in post-health delivery event (see `announce-discord` below). `null` = skip. `command` is the only valid key — a typo (e.g. `comand`) is now rejected at config load (unreleased) instead of silently no-op'ing the feature. |
+| `deliveryEvent.command` | `string` | — | both | 0.9 | Shell command run on the target; receives structured deployment JSON (`event`, `status`, `branch`, `revision`, `deployedAt`, `backupReference?`) on **stdin**. A failure is reported but never turns a healthy deploy into a rollback. |
 
 ### mode: local
 
@@ -148,6 +155,19 @@ window before the deploy is called healthy. `rollback` is an instant flip back t
 `previous` (already built). A failed deploy recovers per phase and, if a migration
 had already run, restores the backup (`hooks.restore`) or stops with `MANUAL
 RECOVERY REQUIRED` — it never resumes stale code against a migrated schema.
+
+**Flag semantics differ by layout** — the same flag can mean something
+different, or nothing, depending on which pipeline is running:
+
+- `deploy --skip-build`/`--skip-deps` are honored the same way as legacy:
+  they skip the build/install step inside the candidate release.
+- `deploy --no-stash` is **rejected** under this layout: each release is
+  materialized fresh via `git worktree add`, so there is no working tree to
+  stash. Legacy deploys still honor it.
+- `rollback --skip-build`/`--skip-deps` are **rejected** under this layout:
+  rollback is an instant flip to the already-built `previous` release, so
+  there is no install/build step for those flags to skip. Legacy `rollback`
+  still honors both (it really does rebuild).
 
 Release deploy **requires a migrated host** (the `.deploy-kit-layout` marker) and a
 stable `ecosystemFile` whose `cwd` is the literal `…/current`. deploy-kit never
@@ -298,12 +318,19 @@ npx deploy-kit logs [--lines N] [--follow] [--errors]
 | `announce-discord` | `--webhook-env NAME` `--service NAME` | Convenience `deliveryEvent.command`: read the post-deploy delivery event on stdin, POST a release announcement to a Discord webhook (env var `NAME`, default `DISCORD_RELEASE_WEBHOOK`). Always exits 0 — an unset env var, malformed stdin, or a failed/timed-out POST is a clear stderr warning, never a failure, since a broken announcement must never fail an already-succeeded deploy. Opt-in — deploy/release stay policy-free. |
 | `run-host-operations` | `--action NAME` `--api-url-env ENV` `--api-key-env ENV` | Host-agent command. Requires a base URL and a narrowly scoped API key, read from the env vars named by `--api-url-env`/`--api-key-env` (default `HOST_OPERATIONS_API_URL` / `HOST_OPERATIONS_API_KEY`). Claims at most one request matching `--action`, runs this checkout's existing configured deploy pipeline, and completes the short-lived lease with a redacted result. It never executes a command, host, or path supplied by the operations API. Example: a Cairn-hosted operations API polling for `DEPLOY_CAIRN_PRODUCTION` requests would run `deploy-kit run-host-operations --action DEPLOY_CAIRN_PRODUCTION --api-url-env CAIRN_OPERATIONS_API_URL --api-key-env CAIRN_OPERATIONS_API_KEY`. |
 | `run-cairn-operations` | — | **Deprecated** alias for `run-host-operations` with the old fixed defaults (action `DEPLOY_CAIRN_PRODUCTION`, env vars `CAIRN_OPERATIONS_API_URL` / `CAIRN_OPERATIONS_API_KEY`). Kept for existing Cairn consumers; new integrations should use `run-host-operations` directly. |
-| `deploy` | `--skip-build` `--skip-deps` `--skip-migrate` `--no-stash` `--dry-run` `--steal-lock` `--no-lock` | Run the full pipeline. |
-| `rollback` | `--skip-build` `--skip-deps` `--steal-lock` | Reset to the recorded pre-deploy SHA, rebuild, restart, health-gate. |
-| `monitor` | `--steal-lock` | Run the `monitor` checks, alert on transitions, exit `0`/`1`/`2`. For a cron. |
+| `deploy` | `--skip-build` `--skip-deps` `--skip-migrate` `--no-stash` `--dry-run` `--steal-lock` `--no-lock` | Run the full pipeline. Under the release layout, `--no-stash` is rejected (nothing to stash — see Release layout below). |
+| `rollback` | `--skip-build` `--skip-deps` `--dry-run` `--steal-lock` `--no-lock` | Reset to the recorded pre-deploy SHA, rebuild, restart, health-gate. Does **not** accept `--skip-migrate` or `--no-stash` — rollback never reads them. Under the release layout, `--skip-build`/`--skip-deps` are rejected (rollback is an instant flip to an already-built release — see Release layout below). |
+| `monitor` | `--steal-lock` `--no-lock` | Run the `monitor` checks, alert on transitions, exit `0`/`1`/`2`. For a cron. |
 | `status` / `health` / `resources` / `git` / `dashboard` | — | Read-only target inspection. |
-| `start` / `stop` / `restart` | — | PM2 lifecycle over `appNames`. |
+| `start` / `stop` / `restart` | — | PM2 lifecycle over `appNames`. Take **no** flags — including no `--dry-run`; these always run for real, and passing any flag (e.g. a typo'd `--dry-run`) is rejected rather than silently ignored. |
 | `logs` | `--lines N` `--follow` `--errors` | Tail PM2 logs for `appNames`. |
+
+Every command rejects a flag it does not consume — the Flags column above is the
+enforced set (`src/cli.js` `COMMAND_FLAGS`, matched against every command except
+`port-guard`, which does its own positional-arg parsing and rejects any `-`-prefixed
+argument directly), not just a suggestion. Passing an unsupported flag (a typo, or a
+flag from a different command) exits `1` naming the offending flag(s) and what the
+command actually supports, instead of parsing fine and silently doing nothing with it.
 
 Or programmatically:
 
@@ -321,8 +348,17 @@ deploy(loadConfig());
 - **`--ff-only` pull** and **tracked-only stash** (never sweeps untracked
   `.ssh`/`.cloudflared` into a stash); the deploy-kit stash is dropped after a
   successful pull so stashes don't pile up.
-- **Concurrent-deploy lock** — an atomic `mkdir` lock stops two deploys of the
-  same target from interleaving pm2 stop/start + git pulls.
+- **Concurrent-deploy lock** — an atomic `mkdir` lock under `$HOME/.deploy-kit/`
+  on the target (created mode `700`) stops two deploys of the same target from
+  interleaving pm2 stop/start + git pulls. A lock older than
+  `stepTimeoutSeconds * 4` (~2h with the default `stepTimeoutSeconds`) is
+  considered stale and is taken over automatically on the next run, with a
+  logged `stale lock … taking it over` line — no manual step required; within
+  that window, `--steal-lock` forces past it. Lock and rollback (`prev-sha`)
+  state used to live under `/tmp`, which is world-writable and wiped on
+  reboot; an existing `/tmp` `prev-sha` is migrated forward automatically the
+  first time a lock is acquired after upgrading. If you scripted around the
+  old `/tmp/deploy-kit-<id>.lock` / `.prev-sha` paths, update those scripts.
 - **ssh timeouts** — `ConnectTimeout`/`ServerAlive*` so a wedged route fails fast
   instead of hanging the pipeline with apps paused.
 - **Health-gate** — polls `http://localhost:<port><healthPath>` (plus any
@@ -343,7 +379,11 @@ for the backup hook.
   The environment refresh is required when the ecosystem file derives a release
   ID or other deploy-time configuration. (Since 0.3.0.)
 - **"Another deploy holds the lock".** A previous deploy is still running, or one
-  died without releasing. Wait, or pass `--steal-lock` to force past a stale lock.
+  died without releasing. A lock older than `stepTimeoutSeconds * 4` (~2h by
+  default) is taken over automatically on the next run — this is what recovers a
+  cron `monitor` that wedged mid-run and would otherwise leave every later run
+  exiting `2` forever. Inside that window, wait or pass `--steal-lock` to force
+  past it.
 - **Deploy hangs.** A wedged Tailscale/ssh route. The ssh `ConnectTimeout` bounds
   the connect; set `stepTimeoutSeconds` to bound a long-running remote command.
 - **"Invalid deploy-kit config: unknown key …".** A typo or a removed key. The

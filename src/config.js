@@ -104,7 +104,7 @@ const DEFAULT_CONFIG = {
   // Fleet monitoring + alerting (SMH-116). null (default) = disabled (no-op), so
   // apps are unaffected until they opt in (like `layout`). An opt-in block runs
   // generic ops checks on a cron and routes ACTIONABLE alerts through a policy-free
-  // sink with cross-run debounce and batched delivery. See MONITOR.md / index.d.ts.
+  // sink with cross-run debounce and batched delivery. See docs/MONITOR-DESIGN-REVIEW.md / index.d.ts.
   //   monitor: {
   //     disk: { minFreeKiB: 524288, minFreeInodes: 10000 },   // omit to skip
   //     backup: { id: 'db', stampFile: '/var/lib/app/backups/.last-success', maxAgeHours: 30 },
