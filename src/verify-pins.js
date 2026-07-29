@@ -18,13 +18,38 @@ const path = require('path');
 const GITHUB_SPEC_RE = /^(?:github:)?([\w.-]+)\/([\w.-]+)(?:#(\S+))?$/;
 
 // A ref that names an exact semver version, with or without a leading `v`,
-// including prerelease (`v1.8.0-rc.1`). Anything else pinned to a ref — a
-// branch (`main`), a commit SHA, an npm `semver:` RANGE, or a missing ref —
-// cannot be compared to a single installed `version` field, so checkPin()
-// reports it unverifiable rather than silently treating it as passing.
-const SEMVER_TAG_RE = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)$/;
+// optionally prefixed with npm's own `semver:` selector (`semver:1.2.3`,
+// `semver:v1.2.3` — npm honours this as an exact version, distinct from a
+// `semver:` RANGE like `semver:^1.2.0`, which is handled separately below).
+// Includes prerelease (`v1.8.0-rc.1`) and build metadata (`v1.2.3+build.1` —
+// build metadata does not affect precedence per semver.org but IS part of a
+// valid exact tag). Anything else pinned to a ref — a branch (`main`), a
+// commit SHA, a `semver:` RANGE, or a missing ref — cannot be compared to a
+// single installed `version` field, so checkPin() reports it unverifiable
+// rather than silently treating it as passing. The version grammar itself
+// (SEMVER_VERSION_RE below) is the canonical semver.org regex, so `01.2.3`,
+// `1.2.3-rc..1`, `1.2.3-rc.`, and `1.2.3-` are rejected as unverifiable
+// rather than silently accepted or crashing.
+//
+// Canonical semver 2.0.0 version regex, from
+// https://semver.org/#is-there-a-suggested-regular-expression-regex-to-check-a-semver-string
+// (capture groups renamed to match this file's usage; no npm dependency
+// added — see the module doc for why this stays dependency-free).
+const SEMVER_VERSION_RE = '(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)(?:-(?:(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+[0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*)?';
+const SEMVER_TAG_RE = new RegExp(`^(?:semver:)?v?(${SEMVER_VERSION_RE})$`);
 
-const DEP_FIELDS = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+const ABSENT_TOLERANT_FIELDS = new Set(['optionalDependencies', 'peerDependencies']);
+
+// Precedence order for a name declared in MORE THAN ONE dep field of the same
+// manifest — npm installs one physical copy per name, not one per field, so
+// verify-pins must classify it once too, following npm's own effective
+// precedence: `optionalDependencies` wins over a plain `dependencies` entry
+// of the same name (an npm-documented override — see
+// https://docs.npmjs.com/cli/v10/configuring-npm/package-json#optionaldependencies).
+// Without this, a name pinned in both fields produced TWO entries for one
+// installed package — one correctly tolerated `absent`, one wrongly failing
+// `missing` — for a state npm itself does not consider a failure.
+const DEP_FIELD_PRECEDENCE = ['optionalDependencies', 'dependencies', 'devDependencies', 'peerDependencies'];
 
 // Parse a dependency specifier into { owner, repo, ref } if it is a GitHub
 // shorthand pin, else null. `ref` is null when the specifier has no `#<ref>`
@@ -37,21 +62,37 @@ function parseGithubSpecifier(specifier) {
 }
 
 // Every GitHub-shorthand pin across dependencies/devDependencies/
-// optionalDependencies/peerDependencies, tagged with which field it came from.
+// optionalDependencies/peerDependencies, tagged with which field it came
+// from — deduped by name per DEP_FIELD_PRECEDENCE when the same name appears
+// in more than one field (see the comment there).
 function collectPins(pkg) {
-  const pins = [];
-  for (const field of DEP_FIELDS) {
+  const claimed = new Map(); // name -> { field, specifier }
+  for (const field of DEP_FIELD_PRECEDENCE) {
     const deps = pkg[field];
     if (!deps || typeof deps !== 'object') continue;
     for (const [name, specifier] of Object.entries(deps)) {
-      const parsed = parseGithubSpecifier(specifier);
-      if (parsed) pins.push({
-        name, field, specifier, owner: parsed.owner, repo: parsed.repo, ref: parsed.ref,
-      });
+      if (claimed.has(name)) continue; // already claimed by a higher-precedence field
+      claimed.set(name, { field, specifier });
     }
+  }
+  const pins = [];
+  for (const [name, { field, specifier }] of claimed) {
+    const parsed = parseGithubSpecifier(specifier);
+    if (parsed) pins.push({
+      name, field, specifier, owner: parsed.owner, repo: parsed.repo, ref: parsed.ref,
+    });
   }
   return pins;
 }
+
+// Sentinel returned by resolveInstalled when node_modules/<name>/package.json
+// EXISTS but cannot be read or parsed — distinct from "not found" (null).
+// Collapsing the two used to make a corrupt install look identical to an
+// absent one, which for an optional/peer pin was silently tolerated as
+// `absent` (Codex review, PKG-109 follow-up) — a corrupt install is a real
+// failure (something IS there, and it is not the package it claims to be),
+// never a "not installed" case, and must fail the run regardless of field.
+const CORRUPT_INSTALL = { corrupt: true };
 
 // Resolve the INSTALLED package the way node's own require resolution does,
 // but BOUNDED to the project — walk up from `startDir` looking for
@@ -68,6 +109,11 @@ function collectPins(pkg) {
 // package's node_modules — happened to have a same-named copy. A pnpm
 // symlinked layout resolves through this the same way — fs follows the
 // symlink to its real target.
+//
+// Returns: the parsed package.json object (found + readable), `null` (never
+// found within the bound), or the CORRUPT_INSTALL sentinel (found, but
+// unreadable/unparsable) — see CORRUPT_INSTALL above for why that third case
+// is never folded into `null`.
 function resolveInstalled(startDir, name, boundaryDir = startDir) {
   const boundary = path.resolve(boundaryDir);
   let dir = path.resolve(startDir);
@@ -77,7 +123,7 @@ function resolveInstalled(startDir, name, boundaryDir = startDir) {
       try {
         return JSON.parse(fs.readFileSync(candidate, 'utf8'));
       } catch {
-        return null; // present but unreadable/corrupt — treat as not resolvable
+        return CORRUPT_INSTALL;
       }
     }
     if (fs.existsSync(path.join(dir, '.git')) || dir === boundary) return null;
@@ -94,6 +140,35 @@ function remediationCommand({ owner, repo, ref }) {
   return `npm install "github:${owner}/${repo}#${ref}" --save`;
 }
 
+// A bare version string — no `semver:` selector prefix (that only ever
+// appears on the REF side), optionally `v`-prefixed. Used to validate the
+// INSTALLED side, which checkPin used to trust blindly: `semverEquals`
+// normalizes by stripping a leading `v` and everything from `+` on, which
+// made a garbage installed value like `1.2.3+` or `1.2.3+build..1` (invalid
+// build metadata — an empty dot-separated identifier) normalize down to a
+// clean `1.2.3` and pass as `ok` (Codex review, PKG-109 follow-up). Both
+// sides of a comparison must be valid semver BEFORE normalizing away `v`/
+// build-metadata cosmetics, not after.
+const INSTALLED_VERSION_RE = new RegExp(`^v?${SEMVER_VERSION_RE}$`);
+
+function isValidSemverString(version) {
+  return typeof version === 'string' && INSTALLED_VERSION_RE.test(version);
+}
+
+// Compare two semver strings the way semver equality actually works: a
+// leading `v` is cosmetic on EITHER side (ref or installed `version` field),
+// and build metadata (`+...`) never affects equality per semver.org — only
+// the prerelease identifier (if any) must match exactly. Callers must
+// validate both operands with isValidSemverString first — this function does
+// not re-validate, so it must never be handed an unvalidated installed value.
+function normalizeSemver(version) {
+  return String(version).replace(/^v/, '').replace(/\+.*$/, '');
+}
+
+function semverEquals(a, b) {
+  return normalizeSemver(a) === normalizeSemver(b);
+}
+
 // Check one pin against what's actually installed in `dir`, bounded to
 // `boundaryDir` (defaults to `dir` — see resolveInstalled). Pure given the
 // parsed pin and directories — the testable core `checkPin` builds on.
@@ -103,12 +178,35 @@ function checkPin(pin, dir, boundaryDir = dir) {
 
   const expectedVersion = semverMatch[1];
   const installed = resolveInstalled(dir, pin.name, boundaryDir);
+
+  // A present-but-corrupt install is never "not installed" — something IS on
+  // disk at that path, and it fails to parse as the package it claims to be.
+  // That is a real failure for EVERY dep field, including optional/peer:
+  // ABSENT_TOLERANT_FIELDS only tolerates a genuine absence, not a broken
+  // install (Codex review, PKG-109 follow-up — this used to collapse into
+  // the same `null` as "not found" and got silently tolerated as `absent`).
+  if (installed === CORRUPT_INSTALL) {
+    return {
+      ...pin, status: 'corrupt', expectedVersion, remediation: remediationCommand(pin),
+    };
+  }
   if (!installed) {
+    // An optional/peer dep is allowed to be absent — npm never guarantees it
+    // gets installed at all (an optional dep can fail to build and is
+    // skipped; a peer dep is often left for the consumer to provide). A pin
+    // in one of those fields with nothing installed is therefore not a lie
+    // the manifest is telling — it's tolerated, and reported separately so
+    // it can never be mistaken for "checked and fine" either. A regular
+    // dependency or devDependency still fails as `missing` — see
+    // ABSENT_TOLERANT_FIELDS above.
+    if (ABSENT_TOLERANT_FIELDS.has(pin.field)) {
+      return { ...pin, status: 'absent', expectedVersion };
+    }
     return {
       ...pin, status: 'missing', expectedVersion, remediation: remediationCommand(pin),
     };
   }
-  if (installed.version !== expectedVersion) {
+  if (!isValidSemverString(installed.version) || !semverEquals(installed.version, expectedVersion)) {
     return {
       ...pin,
       status: 'mismatch',
@@ -296,10 +394,17 @@ function readPackageJson(pkgPath) {
 // resolution to the project (finding 2): a same-named package that only
 // exists outside that boundary is reported `missing`, never `ok`.
 //
-// `ok` is false on any mismatch or missing pin (the two outcomes meaning the
-// manifest and node_modules disagree). An unverifiable ref never fails the
-// run — there's nothing to compare it to — but is always counted separately
-// so it can't be mistaken for "checked and fine".
+// `ok` is false on any mismatch, missing, or corrupt pin (the three outcomes
+// meaning the manifest and node_modules disagree, or node_modules cannot even
+// be read). An unverifiable ref never fails the run — there's nothing to
+// compare it to — but is always counted separately so it can't be mistaken
+// for "checked and fine". An `absent` optional/peer pin (see
+// ABSENT_TOLERANT_FIELDS / checkPin) never fails the run either — npm never
+// guarantees those get installed — but is likewise counted and reported
+// separately, distinct from `missing` (a hard failure for a non-optional/peer
+// field), `corrupt` (a hard failure for EVERY field — something IS installed
+// but isn't readable, which is never mistaken for "not installed"), and
+// `unverifiable` (no assertable version at all).
 function verifyPins({ dir = process.cwd() } = {}) {
   const rootDir = path.resolve(dir);
   const rootPkgPath = path.join(rootDir, 'package.json');
@@ -325,9 +430,11 @@ function verifyPins({ dir = process.cwd() } = {}) {
     mismatch: entries.filter((e) => e.status === 'mismatch').length,
     missing: entries.filter((e) => e.status === 'missing').length,
     unverifiable: entries.filter((e) => e.status === 'unverifiable').length,
+    absent: entries.filter((e) => e.status === 'absent').length,
+    corrupt: entries.filter((e) => e.status === 'corrupt').length,
     manifests: manifests.length,
   };
-  const ok = summary.mismatch === 0 && summary.missing === 0;
+  const ok = summary.mismatch === 0 && summary.missing === 0 && summary.corrupt === 0;
   return { ok, entries, summary };
 }
 
@@ -337,14 +444,16 @@ function describePin({ name, ref }) {
 
 // Format a verifyPins() result into human-readable report lines + the one-line
 // summary. Pure — no I/O — so the exact wording is independently testable.
-// Problems (mismatch/missing) and unverifiable refs are returned separately so
-// the CLI can print them at different severities (error vs warning). Every
-// line names the repo-relative manifest path a problem was found in — a bare
-// package name is not actionable once a run covers more than one manifest
-// (PKG-108 finding 1).
+// Problems (mismatch/missing), unverifiable refs, and tolerated-absent
+// optional/peer pins are returned as three SEPARATE arrays so the CLI can
+// print each at its own severity (error / warning / info). Every line names
+// the repo-relative manifest path a problem was found in — a bare package
+// name is not actionable once a run covers more than one manifest (PKG-108
+// finding 1).
 function formatReport(result) {
   const problemLines = [];
   const unverifiableLines = [];
+  const absentLines = [];
   for (const e of result.entries) {
     if (e.status === 'mismatch') {
       problemLines.push(`MISMATCH  ${e.manifest}  ${describePin(e)} (want ${e.expectedVersion}), installed ${e.installedVersion}`);
@@ -352,19 +461,26 @@ function formatReport(result) {
     } else if (e.status === 'missing') {
       problemLines.push(`MISSING   ${e.manifest}  ${describePin(e)} (want ${e.expectedVersion}), not installed`);
       problemLines.push(`  fix: ${e.remediation}`);
+    } else if (e.status === 'corrupt') {
+      problemLines.push(`CORRUPT   ${e.manifest}  ${describePin(e)} (want ${e.expectedVersion}) — installed node_modules/${e.name}/package.json exists but could not be read/parsed`);
+      problemLines.push(`  fix: ${e.remediation}`);
     } else if (e.status === 'unverifiable') {
       unverifiableLines.push(`unverifiable  ${e.manifest}  ${describePin(e)} — not a semver tag, cannot verify against an installed version`);
+    } else if (e.status === 'absent') {
+      absentLines.push(`absent    ${e.manifest}  ${describePin(e)} (want ${e.expectedVersion}) — optional/peer, not installed (tolerated)`);
     }
   }
   const {
-    ok, mismatch, missing, unverifiable, manifests,
+    ok, mismatch, missing, unverifiable, absent, corrupt, manifests,
   } = result.summary;
   // Manifest count is folded into the summary line only when there's more
   // than one manifest, so a plain single-package run's summary text is
   // unchanged from before this fix.
   const manifestSuffix = manifests > 1 ? ` across ${manifests} manifests` : '';
-  const summaryLine = `verify-pins: ${ok} ok, ${mismatch} MISMATCH, ${missing} missing, ${unverifiable} unverifiable (non-semver refs)${manifestSuffix}`;
-  return { problemLines, unverifiableLines, summaryLine };
+  const summaryLine = `verify-pins: ${ok} ok, ${mismatch} MISMATCH, ${missing} missing, ${unverifiable} unverifiable (non-semver refs), ${absent} absent, ${corrupt} corrupt${manifestSuffix}`;
+  return {
+    problemLines, unverifiableLines, absentLines, summaryLine,
+  };
 }
 
 module.exports = {

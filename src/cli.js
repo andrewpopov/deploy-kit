@@ -336,9 +336,12 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
       console.log(JSON.stringify(result, null, 2));
       return result.ok ? 0 : 1;
     }
-    const { problemLines, unverifiableLines, summaryLine } = formatReport(result);
+    const {
+      problemLines, unverifiableLines, absentLines, summaryLine,
+    } = formatReport(result);
     for (const line of problemLines) log.error(line);
     for (const line of unverifiableLines) log.warning(line);
+    for (const line of absentLines) log.info(line);
     if (result.ok) log.success(summaryLine); else log.error(summaryLine);
     return result.ok ? 0 : 1;
   }
