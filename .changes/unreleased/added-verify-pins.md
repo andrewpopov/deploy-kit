@@ -1,0 +1,6 @@
+---
+kind: added
+summary: "`deploy-kit verify-pins` — fail loudly when a `github:` pin did not actually install"
+---
+
+`npm install` does not re-resolve a `github:owner/repo#vX.Y.Z` dependency when only the TAG changes — the lockfile is keyed on the already-resolved commit — so bumping a pin can exit 0 while leaving the OLD code in `node_modules`. For a security kit that means a fix you shipped, tagged, and deployed can silently not be running, with every gate green. `deploy-kit verify-pins` asserts that every `github:` pin is installed at the version its tag claims, exits non-zero naming each mismatch alongside the exact re-install command, and resolves packages the way node does so workspace hoisting and pnpm's symlinked layout both work. Refs that carry no assertable version (a branch, a commit SHA, a `semver:` range) are counted and reported as **unverifiable** rather than silently skipped, so the summary never claims more coverage than it has. Standalone like `port-guard` — it reads no `.deploy-kit.config.json` and can gate a deploy via `preRestartChecks`. On its first run across the fleet it found three real problems, including a project running a version older than the one its manifest pinned.

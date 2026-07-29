@@ -9,6 +9,7 @@ const tunnel = require('./tunnel');
 const initMod = require('./init');
 const monitorMod = require('./monitor');
 const portGuardMod = require('./port-guard');
+const verifyPinsMod = require('./verify-pins');
 const alertDiscordMod = require('./alert-discord');
 const announceDiscordMod = require('./announce-discord');
 const hostOperationsMod = require('./host-operations');
@@ -28,6 +29,9 @@ const { startTunnel } = tunnel;
 const { init } = initMod;
 const { monitor } = monitorMod;
 const { checkPortGuard } = portGuardMod;
+const {
+  parseGithubSpecifier, resolveInstalled, checkPin, verifyPins, formatReport: formatVerifyPinsReport,
+} = verifyPinsMod;
 const { formatDiscordMessage, alertDiscord, DEFAULT_WEBHOOK_ENV, DEFAULT_SERVICE, DISCORD_CONTENT_LIMIT, MAX_STDIN_BYTES } = alertDiscordMod;
 const {
   formatDiscordMessage: formatReleaseDiscordMessage, announceDiscord, DEFAULT_WEBHOOK_ENV: DEFAULT_RELEASE_WEBHOOK_ENV,
@@ -66,6 +70,13 @@ module.exports = {
   init,
   // port-guard CLI
   checkPortGuard,
+  // verify-pins CLI (PKG-108) — assert a package.json github: pin matches what's
+  // actually installed, catching npm's silent no-op on a bumped-tag-only pin.
+  parseGithubSpecifier,
+  resolveInstalled,
+  checkPin,
+  verifyPins,
+  formatVerifyPinsReport,
   // alert-discord CLI (opt-in convenience alert.command; monitor stays policy-free)
   formatDiscordMessage,
   alertDiscord,
