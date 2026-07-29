@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
+const path = require('path');
 const { loadConfig } = require('./config');
 const { log } = require('./log');
 const { deploy, rollback } = require('./deploy');
@@ -10,11 +11,13 @@ const { checkPortGuard } = require('./port-guard');
 const { alertDiscord, DEFAULT_WEBHOOK_ENV } = require('./alert-discord');
 const { announceDiscord, DEFAULT_WEBHOOK_ENV: DEFAULT_RELEASE_WEBHOOK_ENV } = require('./announce-discord');
 const { runHostOperations, runCairnOperations } = require('./host-operations');
+const { verifyPins, formatReport } = require('./verify-pins');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
   '--skip-migrate', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
+  '--dir', '--json',
 ];
 
 // Flags that take a following positional value. Kept in sync with the arity
@@ -23,7 +26,7 @@ const KNOWN_FLAGS = [
 // of its own (e.g. `--service --skip-build` must not read `--skip-build` as
 // a used flag; parseOptions consumes it as --service's value).
 const VALUE_FLAGS = new Set([
-  '--lines', '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
+  '--lines', '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env', '--dir',
 ]);
 
 // The set of flags each command actually reads. KNOWN_FLAGS above is only
@@ -37,6 +40,7 @@ const COMMAND_FLAGS = {
   'announce-discord': ['--webhook-env', '--service'],
   'run-host-operations': ['--action', '--api-url-env', '--api-key-env'],
   'run-cairn-operations': [],
+  'verify-pins': ['--dir', '--json'],
   deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--no-stash', '--dry-run', '--steal-lock', '--no-lock'],
   rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock'],
   monitor: ['--steal-lock', '--no-lock'],
@@ -111,6 +115,8 @@ function parseOptions(args) {
     else if (a === '--action' && args[i + 1]) { options.action = args[i + 1]; i += 1; }
     else if (a === '--api-url-env' && args[i + 1]) { options.apiUrlEnv = args[i + 1]; i += 1; }
     else if (a === '--api-key-env' && args[i + 1]) { options.apiKeyEnv = args[i + 1]; i += 1; }
+    else if (a === '--dir' && args[i + 1]) { options.dir = args[i + 1]; i += 1; }
+    else if (a === '--json') { options.json = true; }
     else {
       throw new Error(
         `Unknown argument: ${a}\nValid options: ${KNOWN_FLAGS.join(', ')}`
@@ -128,6 +134,13 @@ Commands:
   init                                     scaffold .deploy-kit.config.json + scripts
   port-guard <port> <pm2-process-name>     fail if <port> is held by a process
                                             other than <pm2-process-name>'s pm2 tree
+  verify-pins [--dir <path>] [--json]      assert every package.json github: pin
+                                            (owner/repo#<semver-tag>) matches what is
+                                            actually installed in node_modules — npm
+                                            does NOT re-resolve a bumped tag once the
+                                            old commit is already resolved in the
+                                            lockfile, so a shipped fix can silently
+                                            not land. --dir defaults to cwd.
   alert-discord [--webhook-env NAME]       convenience alert.command: read bounded
     [--service NAME]                       monitor alert JSON on stdin, post it to
                                             a Discord webhook (env NAME, default
@@ -247,6 +260,12 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   // Surface the resolved version: a stale node_modules (manifest pinned newer
   // than what is installed) is otherwise invisible until a flag silently
   // misbehaves. See BRAIN-18 — `npm install` does not re-resolve a github: tag.
+  //
+  // This banner is only a HINT, and only about deploy-kit itself — it relies on
+  // an operator noticing a wrong number. `verify-pins` (PKG-108) is the actual
+  // assertion, and covers every github: pin in the project rather than just
+  // this one. Prefer it for gating; the banner stays because the running
+  // version is worth having in the log regardless.
   if (!options.dryRun) {
     log.info(`deploy-kit v${require('../package.json').version}`);
   }
@@ -289,6 +308,31 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
       fetchImpl,
       log,
     }));
+  }
+
+  // verify-pins takes no positional args (only the generic `--dir`/`--json`
+  // flags), so — like alert-discord/announce-discord — it is safe to dispatch
+  // AFTER parseOptions. Dispatched here, before loadConfig, because it is a
+  // standalone utility: it checks ANY directory's package.json against its
+  // node_modules, not a deploy-kit project, and must not require
+  // .deploy-kit.config.json to exist.
+  if (command === 'verify-pins') {
+    let result;
+    try {
+      result = verifyPins({ dir: path.resolve(cwd, options.dir || '.') });
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
+    if (options.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return result.ok ? 0 : 1;
+    }
+    const { problemLines, unverifiableLines, summaryLine } = formatReport(result);
+    for (const line of problemLines) log.error(line);
+    for (const line of unverifiableLines) log.warning(line);
+    if (result.ok) log.success(summaryLine); else log.error(summaryLine);
+    return result.ok ? 0 : 1;
   }
 
   let config;

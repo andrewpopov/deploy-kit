@@ -197,6 +197,44 @@ target immediately before the restart, gating it):
 ]
 ```
 
+### `verify-pins` (did the pin you bumped actually install?)
+
+`npm install` does **not** re-resolve a `github:owner/repo#tag` dependency when
+only the tag changes — the lockfile is keyed on the already-resolved commit. So
+this sequence is silent and green, and leaves you running the old code:
+
+```
+pinned #v0.2.0  ->  installed 0.2.0
+   (bump the manifest to #v0.3.0, npm install, exit 0)
+pinned #v0.3.0  ->  installed 0.2.0      <-- manifest and reality disagree
+```
+
+For an ordinary dependency that is an annoyance. For a security kit it means a
+fix you shipped, tagged, and deployed can silently not be running, with every
+gate green. `deploy-kit verify-pins` turns that into a loud failure:
+
+```
+$ npx deploy-kit verify-pins
+✗ MISMATCH  @andrewpopov/release-kit: pinned #v0.3.0 (want 0.3.0), installed 0.2.0
+✗   fix: npm install "github:andrewpopov/release-kit#v0.3.0" --save
+✗ verify-pins: 0 ok, 1 MISMATCH, 0 missing, 0 unverifiable (non-semver refs)
+```
+
+It resolves each package the way node does, walking up parent directories, so
+workspace hoisting and pnpm's symlinked layout both work. Pins whose ref is a
+branch, a commit SHA, or a `semver:` range carry no assertable version; those
+are counted and printed as **unverifiable** rather than dropped, so the summary
+never claims more coverage than it has.
+
+Run it wherever you want the guarantee — a `verify` script, or as a
+`preRestartChecks` command to gate a deploy:
+
+```json
+"preRestartChecks": [
+  { "name": "pins", "command": "npx deploy-kit verify-pins" }
+]
+```
+
 ### Monitoring (`deploy-kit monitor`)
 
 Add a `monitor` block to turn on cron-driven ops monitoring + alerting. It runs the
@@ -314,6 +352,7 @@ npx deploy-kit logs [--lines N] [--follow] [--errors]
 | --- | --- | --- |
 | `init` | — | Write a `.deploy-kit.config.json` skeleton (never overwrites) + print the scripts block. |
 | `port-guard <port> <pm2-process-name>` | — | Exit 0 if `<port>` is free or held only by `<pm2-process-name>`'s pm2 process tree; exit 1 (naming the PID) if a foreign process holds it, or if neither `lsof` nor `ss` is available (fails closed). Meant to run ON the target as a `preRestartChecks` command — see below. |
+| `verify-pins` | `--dir PATH` `--json` | Assert that every `github:owner/repo#vX.Y.Z` dependency is actually **installed** at the version its pin claims. `npm install` does not re-resolve a `github:` tag, so bumping a pin can exit 0 while leaving the old code in `node_modules`. Exits 1 naming each mismatch and the exact re-install command that fixes it. Reports pins whose ref carries no assertable version (`#main`, a commit SHA) rather than silently skipping them. Standalone — reads no `.deploy-kit.config.json`. See below. |
 | `alert-discord` | `--webhook-env NAME` `--service NAME` | Convenience `alert.command`: read bounded monitor alert JSON on stdin and POST a length-safe message to Discord (env var `NAME`, default `DISCORD_ALERT_WEBHOOK`). Invalid/empty input exits 0 so a poison batch cannot retry forever; an unset webhook or failed POST remains non-zero. Opt-in — the monitor stays policy-free. |
 | `announce-discord` | `--webhook-env NAME` `--service NAME` | Convenience `deliveryEvent.command`: read the post-deploy delivery event on stdin, POST a release announcement to a Discord webhook (env var `NAME`, default `DISCORD_RELEASE_WEBHOOK`). Always exits 0 — an unset env var, malformed stdin, or a failed/timed-out POST is a clear stderr warning, never a failure, since a broken announcement must never fail an already-succeeded deploy. Opt-in — deploy/release stay policy-free. |
 | `run-host-operations` | `--action NAME` `--api-url-env ENV` `--api-key-env ENV` | Host-agent command. Requires a base URL and a narrowly scoped API key, read from the env vars named by `--api-url-env`/`--api-key-env` (default `HOST_OPERATIONS_API_URL` / `HOST_OPERATIONS_API_KEY`). Claims at most one request matching `--action`, runs this checkout's existing configured deploy pipeline, and completes the short-lived lease with a redacted result. It never executes a command, host, or path supplied by the operations API. Example: a Cairn-hosted operations API polling for `DEPLOY_CAIRN_PRODUCTION` requests would run `deploy-kit run-host-operations --action DEPLOY_CAIRN_PRODUCTION --api-url-env CAIRN_OPERATIONS_API_URL --api-key-env CAIRN_OPERATIONS_API_KEY`. |
