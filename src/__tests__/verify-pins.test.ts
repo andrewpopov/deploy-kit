@@ -99,7 +99,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
     const result = verifyPins({ dir });
 
     expect(result.ok).toBe(true);
-    expect(result.summary).toEqual({ ok: 1, mismatch: 0, missing: 0, unverifiable: 0, manifests: 1 });
+    expect(result.summary).toEqual({ ok: 1, mismatch: 0, missing: 0, unverifiable: 0, absent: 0, corrupt: 0, manifests: 1 });
     expect(result.entries[0]).toMatchObject({
       name: 'url-guard', status: 'ok', expectedVersion: '0.3.0', installedVersion: '0.3.0',
     });
@@ -115,7 +115,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
     const result = verifyPins({ dir });
 
     expect(result.ok).toBe(false);
-    expect(result.summary).toEqual({ ok: 0, mismatch: 1, missing: 0, unverifiable: 0, manifests: 1 });
+    expect(result.summary).toEqual({ ok: 0, mismatch: 1, missing: 0, unverifiable: 0, absent: 0, corrupt: 0, manifests: 1 });
     const entry = result.entries[0];
     expect(entry).toMatchObject({
       name: 'url-guard', status: 'mismatch', expectedVersion: '0.3.0', installedVersion: '0.2.0',
@@ -128,7 +128,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
     expect(text).toMatch(/want 0\.3\.0/);
     expect(text).toContain('installed 0.2.0');
     expect(text).toContain('npm install "github:andrewpopov/url-guard#v0.3.0" --save');
-    expect(summaryLine).toBe('verify-pins: 0 ok, 1 MISMATCH, 0 missing, 0 unverifiable (non-semver refs)');
+    expect(summaryLine).toBe('verify-pins: 0 ok, 1 MISMATCH, 0 missing, 0 unverifiable (non-semver refs), 0 absent, 0 corrupt');
   });
 
   it('a pinned-but-not-installed package FAILS as missing', () => {
@@ -139,7 +139,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
     const result = verifyPins({ dir });
 
     expect(result.ok).toBe(false);
-    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 1, unverifiable: 0, manifests: 1 });
+    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 1, unverifiable: 0, absent: 0, corrupt: 0, manifests: 1 });
     const entry = result.entries[0];
     expect(entry).toMatchObject({ name: 'ghost-pkg', status: 'missing', expectedVersion: '1.0.0' });
     expect(entry.installedVersion).toBeUndefined();
@@ -162,7 +162,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
     const result = verifyPins({ dir });
 
     expect(result.ok).toBe(true); // unverifiable never fails the run
-    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 0, unverifiable: 3, manifests: 1 });
+    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 0, unverifiable: 3, absent: 0, corrupt: 0, manifests: 1 });
     expect(result.entries.every((e) => e.status === 'unverifiable')).toBe(true);
 
     const { problemLines, unverifiableLines, summaryLine } = formatReport(result);
@@ -172,7 +172,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
     expect(text).toMatch(/on-main/);
     expect(text).toMatch(/pinned-sha/);
     expect(text).toMatch(/range-pin/);
-    expect(summaryLine).toBe('verify-pins: 0 ok, 0 MISMATCH, 0 missing, 3 unverifiable (non-semver refs)');
+    expect(summaryLine).toBe('verify-pins: 0 ok, 0 MISMATCH, 0 missing, 3 unverifiable (non-semver refs), 0 absent, 0 corrupt');
   });
 
   it('handles both a v-prefixed and a bare semver tag', () => {
@@ -221,7 +221,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
 
     expect(result.entries).toHaveLength(0);
     expect(result.ok).toBe(true);
-    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 0, unverifiable: 0, manifests: 1 });
+    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 0, unverifiable: 0, absent: 0, corrupt: 0, manifests: 1 });
   });
 
   // PKG-108 finding 2: hoisting resolution is legitimate ONLY for a genuine,
@@ -460,5 +460,324 @@ describe('CLI: deploy-kit verify-pins', () => {
 
     expect(code).toBe(1);
     expect(out).toMatch(/verify-pins: cannot read/);
+  });
+});
+
+describe('PKG-109: edge cases', () => {
+  describe('Fix 1: optionalDependencies/peerDependencies absence is tolerated', () => {
+    it('an optional pin absent from node_modules is status "absent", not "missing" — and does not fail the run', () => {
+      const dir = freshDir();
+      writeManifest(dir, { 'opt-pkg': 'github:andrewpopov/opt-pkg#v1.0.0' }, 'optionalDependencies');
+      // no install() call — never installed, which is legal for an optional dep
+
+      const result = verifyPins({ dir });
+
+      expect(result.ok).toBe(true);
+      expect(result.summary).toMatchObject({ ok: 0, mismatch: 0, missing: 0, absent: 1 });
+      expect(result.entries[0]).toMatchObject({
+        name: 'opt-pkg', status: 'absent', expectedVersion: '1.0.0', field: 'optionalDependencies',
+      });
+
+      const { absentLines, problemLines, summaryLine } = formatReport(result);
+      expect(problemLines).toHaveLength(0);
+      expect(absentLines).toHaveLength(1);
+      expect(absentLines[0]).toMatch(/opt-pkg/);
+      expect(absentLines[0]).toMatch(/want 1\.0\.0/);
+      expect(summaryLine).toMatch(/1 absent/);
+    });
+
+    it('a peer pin absent from node_modules is status "absent" and does not fail the run', () => {
+      const dir = freshDir();
+      writeManifest(dir, { 'peer-pkg': 'github:andrewpopov/peer-pkg#v2.0.0' }, 'peerDependencies');
+
+      const result = verifyPins({ dir });
+
+      expect(result.ok).toBe(true);
+      expect(result.entries[0]).toMatchObject({ name: 'peer-pkg', status: 'absent', field: 'peerDependencies' });
+      expect(result.summary.absent).toBe(1);
+    });
+
+    it('a plain dependency (not optional/peer) that is absent is still "missing" and still FAILS', () => {
+      const dir = freshDir();
+      writeManifest(dir, { 'ghost-pkg': 'github:andrewpopov/ghost-pkg#v1.0.0' });
+
+      const result = verifyPins({ dir });
+
+      expect(result.ok).toBe(false);
+      expect(result.entries[0]).toMatchObject({ status: 'missing' });
+      expect(result.summary.absent).toBe(0);
+    });
+
+    it('REGRESSION: a PRESENT but version-mismatched optional pin is still "mismatch" and still FAILS', () => {
+      const dir = freshDir();
+      writeManifest(dir, { 'opt-pkg': 'github:andrewpopov/opt-pkg#v1.0.0' }, 'optionalDependencies');
+      install(dir, 'opt-pkg', '0.9.0');
+
+      const result = verifyPins({ dir });
+
+      expect(result.ok).toBe(false);
+      expect(result.entries[0]).toMatchObject({
+        status: 'mismatch', expectedVersion: '1.0.0', installedVersion: '0.9.0',
+      });
+      expect(result.summary.absent).toBe(0);
+    });
+
+    it('REGRESSION: a PRESENT but version-mismatched peer pin is still "mismatch" and still FAILS', () => {
+      const dir = freshDir();
+      writeManifest(dir, { 'peer-pkg': 'github:andrewpopov/peer-pkg#v1.0.0' }, 'peerDependencies');
+      install(dir, 'peer-pkg', '0.9.0');
+
+      const result = verifyPins({ dir });
+
+      expect(result.ok).toBe(false);
+      expect(result.entries[0]).toMatchObject({ status: 'mismatch' });
+    });
+  });
+
+  describe('Fix 2: `#semver:<exact>` and build-metadata refs are verifiable', () => {
+    it('a `semver:<exact>` ref is verifiable and compared like a tag', () => {
+      const dir = freshDir();
+      writeManifest(dir, { 'sem-pkg': 'github:andrewpopov/sem-pkg#semver:1.2.3' });
+      install(dir, 'sem-pkg', '1.2.3');
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries[0]).toMatchObject({ status: 'ok', expectedVersion: '1.2.3' });
+    });
+
+    it('a `semver:v<exact>` ref is verifiable too', () => {
+      const dir = freshDir();
+      writeManifest(dir, { 'sem-pkg': 'github:andrewpopov/sem-pkg#semver:v1.2.3' });
+      install(dir, 'sem-pkg', '1.2.3');
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries[0]).toMatchObject({ status: 'ok', expectedVersion: '1.2.3' });
+    });
+
+    it('a `semver:` RANGE (^, x, comparator set) stays unverifiable', () => {
+      const dir = freshDir();
+      writeManifest(dir, {
+        caret: 'github:andrewpopov/caret#semver:^1.2.0',
+        xrange: 'github:andrewpopov/xrange#semver:1.x',
+        comparator: 'github:andrewpopov/comparator#semver:>=1.0.0 <2.0.0',
+      });
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries.every((e) => e.status === 'unverifiable')).toBe(true);
+    });
+
+    it('a build-metadata tag (`#v1.2.3+build.1`) is a valid exact tag, not rejected', () => {
+      const dir = freshDir();
+      writeManifest(dir, { 'build-pkg': 'github:andrewpopov/build-pkg#v1.2.3+build.1' });
+      install(dir, 'build-pkg', '1.2.3');
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries[0].status).not.toBe('unverifiable');
+    });
+  });
+
+  describe('Fix 3: semver equality (v-prefix + build metadata ignored on both sides), tightened grammar', () => {
+    it('pin `#v1.2.3+build.1` vs installed `1.2.3` (no v, no build) is ok', () => {
+      const dir = freshDir();
+      writeManifest(dir, { pkg: 'github:andrewpopov/pkg#v1.2.3+build.1' });
+      install(dir, 'pkg', '1.2.3');
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries[0]).toMatchObject({ status: 'ok' });
+    });
+
+    it('pin `#1.2.3` vs installed `v1.2.3` (installed carries a leading v) is ok', () => {
+      const dir = freshDir();
+      writeManifest(dir, { pkg: 'github:andrewpopov/pkg#1.2.3' });
+      install(dir, 'pkg', 'v1.2.3');
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries[0]).toMatchObject({ status: 'ok' });
+    });
+
+    it('pin `#1.2.3+build.9` vs installed `v1.2.3+build.1` (different build metadata, both sides decorated) is ok', () => {
+      const dir = freshDir();
+      writeManifest(dir, { pkg: 'github:andrewpopov/pkg#1.2.3+build.9' });
+      install(dir, 'pkg', 'v1.2.3+build.1');
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries[0]).toMatchObject({ status: 'ok' });
+    });
+
+    it('prerelease must still compare exactly: 1.2.3-rc.1 != 1.2.3', () => {
+      const dir = freshDir();
+      writeManifest(dir, { pkg: 'github:andrewpopov/pkg#1.2.3-rc.1' });
+      install(dir, 'pkg', '1.2.3');
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries[0]).toMatchObject({ status: 'mismatch' });
+    });
+
+    it('rejects a leading zero in a numeric identifier (01.2.3) as unverifiable, not a crash', () => {
+      const dir = freshDir();
+      writeManifest(dir, { pkg: 'github:andrewpopov/pkg#01.2.3' });
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries[0].status).toBe('unverifiable');
+    });
+
+    it('rejects consecutive dots in prerelease (1.2.3-rc..1) as unverifiable', () => {
+      const dir = freshDir();
+      writeManifest(dir, { pkg: 'github:andrewpopov/pkg#1.2.3-rc..1' });
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries[0].status).toBe('unverifiable');
+    });
+
+    it('rejects a trailing dot in prerelease (1.2.3-rc.) as unverifiable', () => {
+      const dir = freshDir();
+      writeManifest(dir, { pkg: 'github:andrewpopov/pkg#1.2.3-rc.' });
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries[0].status).toBe('unverifiable');
+    });
+
+    it('rejects an empty prerelease (1.2.3-) as unverifiable', () => {
+      const dir = freshDir();
+      writeManifest(dir, { pkg: 'github:andrewpopov/pkg#1.2.3-' });
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries[0].status).toBe('unverifiable');
+    });
+  });
+
+  describe('CLI: absentLines are printed as non-error, and the summary carries the absent count', () => {
+    it('an optional-dep absence prints as a warning/info line, not an error, and still exits 0', () => {
+      const dir = freshDir();
+      writeManifest(dir, { 'opt-pkg': 'github:andrewpopov/opt-pkg#v1.0.0' }, 'optionalDependencies');
+
+      const { code, out } = captureCli(['verify-pins', '--dir', dir]);
+
+      expect(code).toBe(0);
+      expect(out).not.toMatch(/^MISMATCH|^MISSING/m);
+      expect(out).toMatch(/opt-pkg/);
+      expect(out).toMatch(/1 absent/);
+    });
+  });
+
+  it('a MISMATCHED `semver:<exact>` pin still fails (not just the matching path)', () => {
+    const dir = freshDir();
+    writeManifest(dir, { 'sem-pkg': 'github:andrewpopov/sem-pkg#semver:1.2.3' });
+    install(dir, 'sem-pkg', '1.2.4');
+
+    const result = verifyPins({ dir });
+
+    expect(result.ok).toBe(false);
+    expect(result.entries[0]).toMatchObject({
+      status: 'mismatch', expectedVersion: '1.2.3', installedVersion: '1.2.4',
+    });
+  });
+
+  describe('Codex review follow-up: a corrupt installed manifest must FAIL, for ANY dep field', () => {
+    function installCorrupt(dir: string, name: string) {
+      const pkgDir = join(dir, 'node_modules', name);
+      mkdirSync(pkgDir, { recursive: true });
+      writeFileSync(join(pkgDir, 'package.json'), '{ not valid json');
+    }
+
+    it('a corrupt installed manifest for an ordinary dependency FAILS as its own status, not "missing"', () => {
+      const dir = freshDir();
+      writeManifest(dir, { 'dep-pkg': 'github:andrewpopov/dep-pkg#v1.0.0' });
+      installCorrupt(dir, 'dep-pkg');
+
+      const result = verifyPins({ dir });
+
+      expect(result.ok).toBe(false);
+      expect(result.entries[0].status).toBe('corrupt');
+      expect(result.entries[0].status).not.toBe('missing');
+    });
+
+    it('a corrupt installed manifest for an OPTIONAL dependency still FAILS — it must NOT be tolerated as "absent"', () => {
+      const dir = freshDir();
+      writeManifest(dir, { 'opt-pkg': 'github:andrewpopov/opt-pkg#v1.0.0' }, 'optionalDependencies');
+      installCorrupt(dir, 'opt-pkg');
+
+      const result = verifyPins({ dir });
+
+      expect(result.ok).toBe(false);
+      expect(result.entries[0].status).toBe('corrupt');
+      expect(result.entries[0].status).not.toBe('absent');
+    });
+
+    it('a corrupt installed manifest for a PEER dependency still FAILS — it must NOT be tolerated as "absent"', () => {
+      const dir = freshDir();
+      writeManifest(dir, { 'peer-pkg': 'github:andrewpopov/peer-pkg#v1.0.0' }, 'peerDependencies');
+      installCorrupt(dir, 'peer-pkg');
+
+      const result = verifyPins({ dir });
+
+      expect(result.ok).toBe(false);
+      expect(result.entries[0].status).toBe('corrupt');
+    });
+
+    it('formatReport prints a corrupt entry as a problem line (error severity), and it counts in the summary', () => {
+      const dir = freshDir();
+      writeManifest(dir, { 'dep-pkg': 'github:andrewpopov/dep-pkg#v1.0.0' });
+      installCorrupt(dir, 'dep-pkg');
+
+      const result = verifyPins({ dir });
+      expect(result.summary.corrupt).toBe(1);
+
+      const { problemLines } = formatReport(result);
+      expect(problemLines.join('\n')).toMatch(/dep-pkg/i);
+      expect(problemLines.join('\n')).toMatch(/corrupt/i);
+    });
+  });
+
+  describe('Codex review follow-up: the INSTALLED version is also validated against the semver grammar', () => {
+    it('an installed version with trailing invalid build metadata (`1.2.3+`) is a mismatch, not silently accepted', () => {
+      const dir = freshDir();
+      writeManifest(dir, { pkg: 'github:andrewpopov/pkg#1.2.3' });
+      install(dir, 'pkg', '1.2.3+');
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries[0]).toMatchObject({ status: 'mismatch', installedVersion: '1.2.3+' });
+    });
+
+    it('an installed version with malformed build metadata (`1.2.3+build..1`) is a mismatch, not silently accepted', () => {
+      const dir = freshDir();
+      writeManifest(dir, { pkg: 'github:andrewpopov/pkg#1.2.3' });
+      install(dir, 'pkg', '1.2.3+build..1');
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries[0]).toMatchObject({ status: 'mismatch', installedVersion: '1.2.3+build..1' });
+    });
+  });
+
+  describe('Codex review follow-up: optionalDependencies takes precedence over dependencies for the same name', () => {
+    it('a name pinned in BOTH dependencies and optionalDependencies, absent from node_modules, is classified once as tolerated "absent" — not also as a failing "missing"', () => {
+      const dir = freshDir();
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({
+        name: 'consumer',
+        version: '1.0.0',
+        dependencies: { 'dual-pkg': 'github:andrewpopov/dual-pkg#v1.0.0' },
+        optionalDependencies: { 'dual-pkg': 'github:andrewpopov/dual-pkg#v1.0.0' },
+      }, null, 2));
+      // no install() call
+
+      const result = verifyPins({ dir });
+
+      expect(result.entries).toHaveLength(1);
+      expect(result.entries[0]).toMatchObject({ name: 'dual-pkg', status: 'absent', field: 'optionalDependencies' });
+      expect(result.ok).toBe(true);
+    });
   });
 });

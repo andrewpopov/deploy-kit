@@ -217,7 +217,7 @@ gate green. `deploy-kit verify-pins` turns that into a loud failure:
 $ npx deploy-kit verify-pins
 ✗ MISMATCH  package.json  @andrewpopov/release-kit: pinned #v0.3.0 (want 0.3.0), installed 0.2.0
 ✗   fix: npm install "github:andrewpopov/release-kit#v0.3.0" --save
-✗ verify-pins: 0 ok, 1 MISMATCH, 0 missing, 0 unverifiable (non-semver refs)
+✗ verify-pins: 0 ok, 1 MISMATCH, 0 missing, 0 unverifiable (non-semver refs), 0 absent, 0 corrupt
 ```
 
 Run at a workspace root — npm/yarn's `workspaces` field or pnpm's
@@ -229,7 +229,7 @@ member manifest**, naming which one each problem is in (the summary line adds
 $ npx deploy-kit verify-pins
 ✗ MISMATCH  packages/api/package.json  ghost-pkg: pinned #v1.0.0 (want 1.0.0), installed 0.9.0
 ✗   fix: npm install "github:andrewpopov/ghost-pkg#v1.0.0" --save
-✗ verify-pins: 12 ok, 1 MISMATCH, 0 missing, 0 unverifiable (non-semver refs) across 3 manifests
+✗ verify-pins: 12 ok, 1 MISMATCH, 0 missing, 0 unverifiable (non-semver refs), 0 absent, 0 corrupt across 3 manifests
 ```
 
 Each pin is resolved the way node does — walking up from its manifest's
@@ -239,10 +239,36 @@ and pnpm's symlinked layouts both work, and the root's own pins (or any
 standalone, non-workspace project's) never walk past their own directory at
 all. A same-named package that only exists further up — an unrelated sibling
 project's `node_modules`, say — is reported `missing`, not `ok`; the tool
-never resolves past a `.git` directory either way. Pins whose ref is a branch,
-a commit SHA, or a `semver:` range carry no assertable version; those are
-counted and printed as **unverifiable** rather than dropped, so the summary
-never claims more coverage than it has.
+never resolves past a `.git` directory either way. Pins whose ref is a branch
+or a commit SHA — or a `semver:` RANGE (`semver:^1.0.0`, `semver:1.x`) — carry
+no single assertable version; those are counted and printed as
+**unverifiable** rather than dropped, so the summary never claims more
+coverage than it has. An exact npm `semver:<version>` selector
+(`semver:1.2.3`) and build metadata on a tag (`#v1.2.3+build.1`) ARE
+verifiable — compared like an ordinary tag, with a leading `v` and build
+metadata ignored on both the pin and the installed version (only the
+prerelease identifier, if any, must match exactly). The INSTALLED version is
+validated against the same semver grammar before that comparison — a garbage
+installed `version` field (`1.2.3+`, `1.2.3+build..1`) is a `MISMATCH`, never
+silently normalized down to something that happens to match.
+
+A pin in `optionalDependencies` or `peerDependencies` that isn't installed at
+all is reported **absent**, not `missing` — npm never guarantees either gets
+installed (an optional dep can fail to build and is skipped; a peer dep is
+often left for the consumer to provide), so an absent one doesn't fail the
+run. A present-but-wrong-version optional/peer pin is still a `MISMATCH` and
+still fails — `absent` only covers "never installed", not "installed wrong".
+If `node_modules/<name>/package.json` EXISTS but can't be read or parsed,
+that's reported **corrupt**, never `absent` — something IS on disk and it
+isn't the package it claims to be, which fails the run for every dep field,
+optional/peer included.
+
+If the same package name is pinned in more than one dependency field of the
+same manifest (e.g. both `dependencies` and `optionalDependencies`), only ONE
+entry is reported, for the field npm gives effective precedence to —
+currently just `optionalDependencies` winning over `dependencies` — so an
+absent optional/peer duplicate is never also double-reported as a failing
+`missing` for the same install.
 
 Run it wherever you want the guarantee — a `verify` script, or as a
 `preRestartChecks` command to gate a deploy:

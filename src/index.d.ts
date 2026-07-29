@@ -316,19 +316,33 @@ export function parseGithubSpecifier(specifier: unknown): GithubPin | null;
  * been checked — default `startDir`, i.e. no ancestor walk at all. A `.git`
  * directory is an additional hard ceiling regardless of `boundaryDir`. Pass
  * a workspace root as `boundaryDir` to resolve a nested workspace package's
- * dependency hoisted to that root's node_modules. null if not found (or its
- * package.json is unreadable). */
-export function resolveInstalled(startDir: string, name: string, boundaryDir?: string): Record<string, unknown> | null;
+ * dependency hoisted to that root's node_modules. `null` if never found
+ * within the bound; a distinct sentinel object `{ corrupt: true }` if
+ * node_modules/<name>/package.json EXISTS but cannot be read/parsed — never
+ * folded into `null`, so a broken install is never mistaken for "not
+ * installed" (see `VerifyPinsStatus`'s `corrupt`). */
+export function resolveInstalled(startDir: string, name: string, boundaryDir?: string): Record<string, unknown> | { corrupt: true } | null;
 
-export type VerifyPinsStatus = 'ok' | 'mismatch' | 'missing' | 'unverifiable';
+export type VerifyPinsStatus = 'ok' | 'mismatch' | 'missing' | 'absent' | 'corrupt' | 'unverifiable';
 
 /** One dependency's github: pin checked against what's actually installed.
  * `expectedVersion`/`installedVersion`/`remediation` are present only for the
- * statuses that have them (`unverifiable` has neither; `missing` has no
- * `installedVersion`). `manifest` is the repo-relative path (relative to the
- * `verifyPins` root `dir`) of the package.json this pin was read from — the
- * root's own package.json is `"package.json"`; a workspace member is e.g.
- * `"packages/api/package.json"`. */
+ * statuses that have them (`unverifiable` and `absent` have no
+ * `installedVersion`; `unverifiable` has no `expectedVersion` either;
+ * `missing`/`absent` have no `installedVersion`). `manifest` is the
+ * repo-relative path (relative to the `verifyPins` root `dir`) of the
+ * package.json this pin was read from — the root's own package.json is
+ * `"package.json"`; a workspace member is e.g. `"packages/api/package.json"`.
+ *
+ * `absent`: pinned in `optionalDependencies`/`peerDependencies` and not
+ * installed — tolerated, does not fail the run (npm never guarantees either
+ * gets installed). `corrupt`: node_modules/<name>/package.json exists but
+ * could not be read/parsed — fails the run for EVERY dep field, including
+ * optional/peer (a broken install is never "absent"). When the same name is
+ * pinned in more than one dep field of the same manifest, only ONE entry is
+ * emitted, for the field npm gives effective precedence to — currently just
+ * `optionalDependencies` over `dependencies` — see `collectPins`'s
+ * `DEP_FIELD_PRECEDENCE` in verify-pins.js. */
 export interface VerifyPinsEntry extends GithubPin {
   name: string;
   field: 'dependencies' | 'devDependencies' | 'optionalDependencies' | 'peerDependencies';
@@ -337,14 +351,16 @@ export interface VerifyPinsEntry extends GithubPin {
   manifest: string;
   expectedVersion?: string;
   installedVersion?: string;
-  /** The exact `npm install ... --save` command that fixes a mismatch/missing
-   * pin — npm's known workaround for not re-resolving a bumped tag. */
+  /** The exact `npm install ... --save` command that fixes a mismatch/missing/
+   * corrupt pin — npm's known workaround for not re-resolving a bumped tag. */
   remediation?: string;
 }
 
 export interface VerifyPinsResult {
-  /** false on any `mismatch` or `missing` entry — the two outcomes meaning the
-   * manifest and node_modules disagree. An `unverifiable` ref never fails this. */
+  /** false on any `mismatch`, `missing`, or `corrupt` entry — outcomes meaning
+   * the manifest and node_modules disagree, or node_modules cannot even be
+   * read. An `unverifiable` ref or a tolerated `absent` optional/peer pin
+   * never fails this. */
   ok: boolean;
   entries: VerifyPinsEntry[];
   summary: {
@@ -352,6 +368,12 @@ export interface VerifyPinsResult {
     mismatch: number;
     missing: number;
     unverifiable: number;
+    /** Pinned in optionalDependencies/peerDependencies and not installed —
+     * tolerated, never fails the run. */
+    absent: number;
+    /** Installed node_modules/<name>/package.json exists but could not be
+     * read/parsed — fails the run for every dep field. */
+    corrupt: number;
     /** Total package.json manifests scanned — 1 for a standalone project, or
      * the root plus every workspace member for a workspace root run. */
     manifests: number;
@@ -378,12 +400,15 @@ export function checkPin(
  * package.json, cannot be read/parsed. */
 export function verifyPins(options?: { dir?: string }): VerifyPinsResult;
 
-/** Format a `verifyPins()` result into human-readable report lines (mismatch/
- * missing "problems" separate from "unverifiable" refs, since the CLI logs
- * them at different severities) plus the one-line summary. Pure — no I/O. */
+/** Format a `verifyPins()` result into human-readable report lines — mismatch/
+ * missing/corrupt "problems", "unverifiable" refs, and tolerated-`absent`
+ * optional/peer pins are three SEPARATE arrays, since the CLI logs each at
+ * its own severity (error / warning / info) — plus the one-line summary.
+ * Pure — no I/O. */
 export function formatVerifyPinsReport(result: VerifyPinsResult): {
   problemLines: string[];
   unverifiableLines: string[];
+  absentLines: string[];
   summaryLine: string;
 };
 
