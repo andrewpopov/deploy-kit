@@ -236,7 +236,9 @@ export function runOnTarget(
   ok: boolean;
   /** Captured STDOUT only, so parsers (JSON, df numbers) stay unaffected. */
   output: string;
-  /** Captured STDERR — populated on the failure path; '' on success. */
+  /** Captured STDERR. Non-empty ONLY when `capture: true` and the command failed;
+   * '' on success, and '' on failure when `capture` is false (stderr was inherited
+   * by the terminal, never captured). */
   stderr: string;
   error?: unknown;
 };

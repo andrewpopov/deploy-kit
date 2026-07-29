@@ -80,10 +80,12 @@ function buildTargetCommand(command, { mode, host, projectDir, ssh }) {
 }
 
 // Run one command on the target. Returns { ok, output, stderr }. With capture:false
-// the child inherits stdio (live logs); with capture:true stdout is returned as
-// `output`. `stderr` is populated on the FAILURE path only — execFileSync returns
-// stdout as its value and exposes the captured stderr solely on the thrown error,
-// so a successful run has no stderr to hand back. That asymmetry is fine for the
+// the child inherits stdio (live logs, nothing captured); with capture:true stdout
+// is returned as `output`. `stderr` is non-empty ONLY when capture:true AND the
+// command failed — execFileSync returns stdout as its value and exposes captured
+// stderr solely on the thrown error, and with capture:false stderr went straight to
+// the terminal. So `stderr` is '' on success, and '' on failure when not capturing
+// (which is most of this module's ~30 call sites). That asymmetry is fine for the
 // callers that need it: stderr matters precisely when a command failed, and it is
 // where well-behaved CLIs write their diagnostics. Keeping it a SEPARATE field
 // (rather than folding it into `output`) preserves `output` as pure stdout for the

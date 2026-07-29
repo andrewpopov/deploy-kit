@@ -78,14 +78,42 @@ describe('checkCustom failure detail', () => {
     expect(results[0].message.indexOf('THE REASON')).toBeLessThan(results[0].message.indexOf('xxx'));
   });
 
-  it('still bounds and sanitizes the combined detail', () => {
+  it('bounds the combined detail, filling the budget from stderr and excluding stdout', () => {
     const results = checkCustom(cfg([{ id: 'huge' }]), {
-      runtime: failingRuntime({ stdout: 'b'.repeat(500), stderr: `a${'a'.repeat(500)}` }),
+      runtime: failingRuntime({ stdout: 'b'.repeat(500), stderr: 'a'.repeat(500) }),
       log: noopLog,
     });
     const detail = results[0].message.replace('huge: failed — ', '');
     expect(detail.length).toBeLessThanOrEqual(300);
     expect(detail).not.toMatch(/[^\x20-\x7e]/);
+    // The assertions that actually pin the fix: the budget is filled from STDERR and
+    // stdout is excluded entirely. Asserting only length+printability passed even with
+    // the fix fully reverted (300 'b's of stdout is also 300 printable chars), which
+    // made this a decoration rather than a guard.
+    expect(detail).toMatch(/^a+\.\.\.$/);
+    expect(detail).not.toContain('b');
+  });
+
+  it('marks a truncated detail with an ellipsis instead of a dangling separator', () => {
+    // 297 stderr chars + ' | ' puts the 300-char cut inside the separator, which used
+    // to emit an alert ending in a bare '|' -- indistinguishable from a command that
+    // printed garbage.
+    const results = checkCustom(cfg([{ id: 'edge' }]), {
+      runtime: failingRuntime({ stderr: 's'.repeat(297), stdout: 'STDOUT' }),
+      log: noopLog,
+    });
+    const detail = results[0].message.replace('edge: failed — ', '');
+    expect(detail.length).toBeLessThanOrEqual(300);
+    expect(detail.endsWith('...')).toBe(true);
+    expect(detail).not.toMatch(/\|\s*$/);
+  });
+
+  it('leaves a detail that fits entirely unmarked', () => {
+    const results = checkCustom(cfg([{ id: 'small' }]), {
+      runtime: failingRuntime({ stderr: 'short reason' }),
+      log: noopLog,
+    });
+    expect(results[0].message).toBe('small: failed — short reason');
   });
 
   it('honours the configured warn level', () => {
