@@ -232,7 +232,16 @@ export function runOnTarget(
     /** Per-command wall-clock timeout; falls back to config.stepTimeoutSeconds. */
     timeoutSeconds?: number | null;
   },
-): { ok: boolean; output: string; error?: unknown };
+): {
+  ok: boolean;
+  /** Captured STDOUT only, so parsers (JSON, df numbers) stay unaffected. */
+  output: string;
+  /** Captured STDERR. Non-empty ONLY when `capture: true` and the command failed;
+   * '' on success, and '' on failure when `capture` is false (stderr was inherited
+   * by the terminal, never captured). */
+  stderr: string;
+  error?: unknown;
+};
 export function buildHealthCommand(config: DeployConfig, check?: HealthCheck): string;
 
 export interface MonitorCheckResult {

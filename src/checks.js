@@ -11,6 +11,10 @@ const { runOnTarget } = require('./exec');
 // restart baseline). Secrets (probe headers) never appear in message/detail.
 
 const DEFAULT_CHECK_TIMEOUT = 20;
+// Upper bound on a custom check's failure detail inside the alert message. A check
+// that reports many problems at once (mizen's queue check can report six) will be
+// cut here, so a check SHOULD order its most actionable problem first.
+const DETAIL_MAX_CHARS = 300;
 
 function cap(config, ctx, command, timeoutSeconds) {
   return runOnTarget(command, config, { capture: true, runtime: ctx.runtime, timeoutSeconds });
@@ -178,7 +182,22 @@ function checkCustom(config, ctx) {
     if (res.ok) return { id, status: 'ok', message: `${c.id}: ok` };
     if (res.error && res.error.code === 'ETIMEDOUT') return { id, status: 'unknown', message: `${c.id}: check timed out` };
     const level = c.level === 'warn' ? 'warn' : 'crit';
-    const detail = String(res.output || '').replace(/[^\x20-\x7e]/g, ' ').slice(0, 300).trim();
+    // STDERR FIRST, then stdout. A failing check's reason is conventionally on
+    // stderr; stdout usually holds progress noise that would otherwise crowd the
+    // reason out of the 300-char budget. Reading only stdout (as this did) meant a
+    // check that reported its reason the normal way alerted as a bare "failed" —
+    // the operator learned WHICH check broke and nothing about WHY.
+    // Slice AFTER the join but mark the cut. Slicing the joined string blindly can
+    // land inside the ' | ' separator, leaving an alert ending in a bare '|' — the
+    // operator cannot tell whether the detail was truncated or the command emitted
+    // garbage. An explicit ellipsis makes truncation unambiguous.
+    const joined = [res.stderr, res.output]
+      .map((stream) => String(stream || '').replace(/[^\x20-\x7e]/g, ' ').trim())
+      .filter(Boolean)
+      .join(' | ');
+    const detail = (joined.length > DETAIL_MAX_CHARS
+      ? `${joined.slice(0, DETAIL_MAX_CHARS - 3).trimEnd()}...`
+      : joined).trim();
     return { id, status: level, message: `${c.id}: failed${detail ? ` — ${detail}` : ''}` };
   });
 }
