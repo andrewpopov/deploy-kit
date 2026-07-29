@@ -5,6 +5,7 @@ import {
 } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { spawnSync } from 'child_process';
 
 const require = createRequire(__filename);
 const verifyPinsMod = require('../verify-pins.js') as typeof import('../verify-pins');
@@ -98,7 +99,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
     const result = verifyPins({ dir });
 
     expect(result.ok).toBe(true);
-    expect(result.summary).toEqual({ ok: 1, mismatch: 0, missing: 0, unverifiable: 0 });
+    expect(result.summary).toEqual({ ok: 1, mismatch: 0, missing: 0, unverifiable: 0, manifests: 1 });
     expect(result.entries[0]).toMatchObject({
       name: 'url-guard', status: 'ok', expectedVersion: '0.3.0', installedVersion: '0.3.0',
     });
@@ -114,7 +115,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
     const result = verifyPins({ dir });
 
     expect(result.ok).toBe(false);
-    expect(result.summary).toEqual({ ok: 0, mismatch: 1, missing: 0, unverifiable: 0 });
+    expect(result.summary).toEqual({ ok: 0, mismatch: 1, missing: 0, unverifiable: 0, manifests: 1 });
     const entry = result.entries[0];
     expect(entry).toMatchObject({
       name: 'url-guard', status: 'mismatch', expectedVersion: '0.3.0', installedVersion: '0.2.0',
@@ -138,7 +139,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
     const result = verifyPins({ dir });
 
     expect(result.ok).toBe(false);
-    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 1, unverifiable: 0 });
+    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 1, unverifiable: 0, manifests: 1 });
     const entry = result.entries[0];
     expect(entry).toMatchObject({ name: 'ghost-pkg', status: 'missing', expectedVersion: '1.0.0' });
     expect(entry.installedVersion).toBeUndefined();
@@ -161,7 +162,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
     const result = verifyPins({ dir });
 
     expect(result.ok).toBe(true); // unverifiable never fails the run
-    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 0, unverifiable: 3 });
+    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 0, unverifiable: 3, manifests: 1 });
     expect(result.entries.every((e) => e.status === 'unverifiable')).toBe(true);
 
     const { problemLines, unverifiableLines, summaryLine } = formatReport(result);
@@ -220,33 +221,68 @@ describe('verifyPins: the core PKG-108 bug', () => {
 
     expect(result.entries).toHaveLength(0);
     expect(result.ok).toBe(true);
-    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 0, unverifiable: 0 });
+    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 0, unverifiable: 0, manifests: 1 });
   });
 
-  it('resolves a dependency HOISTED to a PARENT directory node_modules (workspace hoisting)', () => {
+  // PKG-108 finding 2: hoisting resolution is legitimate ONLY for a genuine,
+  // declared workspace member — the walk is bounded to the workspace root
+  // (see resolveInstalled's boundaryDir), never further. These two cases used
+  // to hoist from a bare nested directory with NO workspace declaration at
+  // all (verifyPins({ dir: nested }) directly, no root manifest even
+  // present) — that was the unbounded-ancestor-walk bug itself, not a real
+  // hoisting scenario a package manager would ever produce. Rewritten here to
+  // run at the declared workspace ROOT, which is how real hoisting happens.
+  it('resolves a workspace member\'s dependency HOISTED to the workspace ROOT node_modules', () => {
     const root = freshDir();
+    writeFileSync(join(root, 'package.json'), JSON.stringify({
+      name: 'monorepo', version: '1.0.0', workspaces: ['packages/*'],
+    }, null, 2));
     const nested = join(root, 'packages', 'api');
     mkdirSync(nested, { recursive: true });
     writeManifest(nested, { 'hoisted-pkg': 'github:andrewpopov/hoisted-pkg#v1.5.0' });
-    install(root, 'hoisted-pkg', '1.5.0'); // installed at the repo ROOT, not packages/api
+    install(root, 'hoisted-pkg', '1.5.0'); // installed at the workspace ROOT, not packages/api
 
-    const result = verifyPins({ dir: nested });
+    const result = verifyPins({ dir: root });
 
     expect(result.ok).toBe(true);
-    expect(result.entries[0]).toMatchObject({ status: 'ok', installedVersion: '1.5.0' });
+    const entry = result.entries.find((e: any) => e.name === 'hoisted-pkg');
+    expect(entry).toMatchObject({ status: 'ok', installedVersion: '1.5.0' });
   });
 
   it('a mismatched HOISTED dependency still fails correctly', () => {
     const root = freshDir();
+    writeFileSync(join(root, 'package.json'), JSON.stringify({
+      name: 'monorepo', version: '1.0.0', workspaces: ['packages/*'],
+    }, null, 2));
     const nested = join(root, 'packages', 'api');
     mkdirSync(nested, { recursive: true });
     writeManifest(nested, { 'hoisted-pkg': 'github:andrewpopov/hoisted-pkg#v1.5.0' });
     install(root, 'hoisted-pkg', '1.4.0');
 
+    const result = verifyPins({ dir: root });
+
+    expect(result.ok).toBe(false);
+    const entry = result.entries.find((e: any) => e.name === 'hoisted-pkg');
+    expect(entry).toMatchObject({ status: 'mismatch', expectedVersion: '1.5.0', installedVersion: '1.4.0' });
+  });
+
+  it('a STANDALONE (non-workspace) manifest does NOT hoist-resolve past its own directory', () => {
+    // Same shape as the two tests above, but the root package.json declares
+    // no `workspaces` — so `nested` is just an ordinary nested directory, not
+    // a workspace member, and its pin must NOT be satisfied by the parent's
+    // node_modules. This is finding 2's actual invariant: hoisting requires a
+    // real, declared project boundary, not merely "a parent happens to have
+    // it".
+    const root = freshDir();
+    const nested = join(root, 'packages', 'api');
+    mkdirSync(nested, { recursive: true });
+    writeManifest(nested, { 'hoisted-pkg': 'github:andrewpopov/hoisted-pkg#v1.5.0' });
+    install(root, 'hoisted-pkg', '1.5.0'); // present at the parent, but nested has no workspace relation to it
+
     const result = verifyPins({ dir: nested });
 
     expect(result.ok).toBe(false);
-    expect(result.entries[0]).toMatchObject({ status: 'mismatch', expectedVersion: '1.5.0', installedVersion: '1.4.0' });
+    expect(result.entries[0]).toMatchObject({ status: 'missing' });
   });
 
   it('handles scoped package names (@andrewpopov/foo)', () => {
@@ -281,6 +317,71 @@ describe('verifyPins: the core PKG-108 bug', () => {
     expect(result.entries.map((e) => e.field).sort()).toEqual([
       'dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies',
     ]);
+  });
+});
+
+describe('PKG-108 review findings (confirmed, with reproductions)', () => {
+  // Finding 1 (HIGH): verifyPins reads exactly ONE package.json. Run at a
+  // workspace root, every sub-package's pins are silently never checked, and
+  // nothing about the summary hints that anything was skipped.
+  it('Finding 1: a workspace root run must also check every workspace member manifest, naming the offending manifest path', () => {
+    const root = freshDir();
+    writeFileSync(join(root, 'package.json'), JSON.stringify({
+      name: 'monorepo', version: '1.0.0', workspaces: ['packages/*'],
+    }, null, 2));
+    const apiDir = join(root, 'packages', 'api');
+    mkdirSync(apiDir, { recursive: true });
+    writeManifest(apiDir, { 'api-pkg': 'github:andrewpopov/api-pkg#v1.0.0' });
+    install(apiDir, 'api-pkg', '0.9.0'); // drifted — installed 0.9.0, pin wants 1.0.0
+
+    const result = verifyPins({ dir: root });
+
+    expect(result.ok).toBe(false);
+    const entry = result.entries.find((e: any) => e.name === 'api-pkg');
+    expect(entry).toBeDefined();
+    expect(entry).toMatchObject({ status: 'mismatch', expectedVersion: '1.0.0', installedVersion: '0.9.0' });
+    expect(entry.manifest).toBe(join('packages', 'api', 'package.json'));
+    expect(result.summary.manifests).toBe(2); // root + packages/api
+
+    const { problemLines } = formatReport(result);
+    expect(problemLines.join('\n')).toContain(join('packages', 'api', 'package.json'));
+  });
+
+  // Finding 2 (HIGH): resolveInstalled walks up to the FILESYSTEM ROOT, so a
+  // project that never installed a dependency passes if any ancestor
+  // directory happens to have an unrelated copy. Reproduced: outer has a
+  // stray node_modules/<pkg>; inner pins the same name and has NO
+  // node_modules of its own at all.
+  it('Finding 2: a pin is not satisfied by an unrelated package found by walking past the project boundary', () => {
+    const outer = freshDir();
+    install(outer, '@andrewpopov/ghost', '1.0.0'); // outer/node_modules/@andrewpopov/ghost — unrelated
+    const inner = join(outer, 'inner');
+    mkdirSync(inner, { recursive: true });
+    writeManifest(inner, { '@andrewpopov/ghost': 'github:andrewpopov/ghost#v1.0.0' });
+    // outer/inner/node_modules does NOT exist — no install() call for inner
+
+    const result = verifyPins({ dir: inner });
+
+    expect(result.ok).toBe(false);
+    expect(result.entries[0]).toMatchObject({ name: '@andrewpopov/ghost', status: 'missing' });
+  });
+
+  // Finding 3 (MEDIUM): the version banner is printed to stdout BEFORE the
+  // JSON, so `verify-pins --json | jq` fails. Assertions against a stubbed
+  // console.log (as the existing --json test does) don't catch this — only a
+  // real subprocess with a real stdout stream does.
+  it('Finding 3: the real CLI subprocess --json stdout is pure, parseable JSON (no banner)', () => {
+    const dir = freshDir();
+    writeManifest(dir, { 'good-pkg': 'github:andrewpopov/good-pkg#v1.0.0' });
+    install(dir, 'good-pkg', '1.0.0');
+
+    const cliPath = join(__dirname, '..', 'cli.js');
+    const proc = spawnSync(process.execPath, [cliPath, 'verify-pins', '--dir', dir, '--json'], { encoding: 'utf8' });
+
+    expect(proc.status).toBe(0);
+    const parsed = JSON.parse(proc.stdout); // throws if the banner polluted stdout
+    expect(parsed.ok).toBe(true);
+    expect(parsed.entries[0]).toMatchObject({ name: 'good-pkg', status: 'ok' });
   });
 });
 

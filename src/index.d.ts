@@ -311,22 +311,30 @@ export interface GithubPin {
 export function parseGithubSpecifier(specifier: unknown): GithubPin | null;
 
 /** Resolve the INSTALLED package.json for `name` the way node's own require
- * resolution does: walk up from `startDir` through node_modules/<name>, so a
- * nested workspace package resolves a dependency hoisted to a parent's
- * node_modules. null if not found (or its package.json is unreadable). */
-export function resolveInstalled(startDir: string, name: string): Record<string, unknown> | null;
+ * resolution does, but BOUNDED to the project: walk up from `startDir`
+ * through node_modules/<name>, stopping once `boundaryDir` (inclusive) has
+ * been checked — default `startDir`, i.e. no ancestor walk at all. A `.git`
+ * directory is an additional hard ceiling regardless of `boundaryDir`. Pass
+ * a workspace root as `boundaryDir` to resolve a nested workspace package's
+ * dependency hoisted to that root's node_modules. null if not found (or its
+ * package.json is unreadable). */
+export function resolveInstalled(startDir: string, name: string, boundaryDir?: string): Record<string, unknown> | null;
 
 export type VerifyPinsStatus = 'ok' | 'mismatch' | 'missing' | 'unverifiable';
 
 /** One dependency's github: pin checked against what's actually installed.
  * `expectedVersion`/`installedVersion`/`remediation` are present only for the
  * statuses that have them (`unverifiable` has neither; `missing` has no
- * `installedVersion`). */
+ * `installedVersion`). `manifest` is the repo-relative path (relative to the
+ * `verifyPins` root `dir`) of the package.json this pin was read from — the
+ * root's own package.json is `"package.json"`; a workspace member is e.g.
+ * `"packages/api/package.json"`. */
 export interface VerifyPinsEntry extends GithubPin {
   name: string;
   field: 'dependencies' | 'devDependencies' | 'optionalDependencies' | 'peerDependencies';
   specifier: string;
   status: VerifyPinsStatus;
+  manifest: string;
   expectedVersion?: string;
   installedVersion?: string;
   /** The exact `npm install ... --save` command that fixes a mismatch/missing
@@ -339,19 +347,35 @@ export interface VerifyPinsResult {
    * manifest and node_modules disagree. An `unverifiable` ref never fails this. */
   ok: boolean;
   entries: VerifyPinsEntry[];
-  summary: { ok: number; mismatch: number; missing: number; unverifiable: number };
+  summary: {
+    ok: number;
+    mismatch: number;
+    missing: number;
+    unverifiable: number;
+    /** Total package.json manifests scanned — 1 for a standalone project, or
+     * the root plus every workspace member for a workspace root run. */
+    manifests: number;
+  };
 }
 
-/** Check one already-parsed pin against what's installed in `dir`. Exported for
- * the `verifyPins` test suite; `verifyPins` is the entry point that reads
- * package.json and calls this per pin. */
-export function checkPin(pin: GithubPin & { name: string; field: string; specifier: string }, dir: string): VerifyPinsEntry;
+/** Check one already-parsed pin against what's installed in `dir`, bounded to
+ * `boundaryDir` (default `dir` — see `resolveInstalled`). Exported for the
+ * `verifyPins` test suite; `verifyPins` is the entry point that reads
+ * package.json and calls this per pin, per manifest. */
+export function checkPin(
+  pin: GithubPin & { name: string; field: string; specifier: string },
+  dir: string,
+  boundaryDir?: string,
+): Omit<VerifyPinsEntry, 'manifest'>;
 
 /** Read `<dir>/package.json` and assert every GitHub-shorthand pin
- * (dependencies/devDependencies/optionalDependencies/peerDependencies) matches
- * what is actually installed in node_modules. Never touches the network.
- * Backs the `deploy-kit verify-pins [--dir <path>] [--json]` CLI command.
- * Throws if `<dir>/package.json` cannot be read/parsed. */
+ * (dependencies/devDependencies/optionalDependencies/peerDependencies)
+ * matches what is actually installed in node_modules — the root manifest AND,
+ * if it declares a workspace (npm/yarn `workspaces`, or a
+ * pnpm-workspace.yaml), every workspace member manifest too. Never touches
+ * the network. Backs the `deploy-kit verify-pins [--dir <path>] [--json]` CLI
+ * command. Throws if `<dir>/package.json`, or any workspace member's
+ * package.json, cannot be read/parsed. */
 export function verifyPins(options?: { dir?: string }): VerifyPinsResult;
 
 /** Format a `verifyPins()` result into human-readable report lines (mismatch/

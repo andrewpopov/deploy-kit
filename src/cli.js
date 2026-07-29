@@ -266,7 +266,15 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   // assertion, and covers every github: pin in the project rather than just
   // this one. Prefer it for gating; the banner stays because the running
   // version is worth having in the log regardless.
-  if (!options.dryRun) {
+  //
+  // Suppressed under `--json`: log.info writes to stdout (see log.js), and
+  // `--json` promises stdout is ONLY the JSON document so `verify-pins --json
+  // | jq` works (PKG-108 finding 3 — the banner used to precede the JSON and
+  // broke every consumer of --json). `options.json` can only be true here for
+  // `verify-pins` — it's the only command in COMMAND_FLAGS that accepts
+  // `--json`, and validateCommandFlags() above already rejected it for any
+  // other command before this line runs.
+  if (!options.dryRun && !options.json) {
     log.info(`deploy-kit v${require('../package.json').version}`);
   }
 

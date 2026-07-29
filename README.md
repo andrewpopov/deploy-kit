@@ -215,15 +215,33 @@ gate green. `deploy-kit verify-pins` turns that into a loud failure:
 
 ```
 $ npx deploy-kit verify-pins
-✗ MISMATCH  @andrewpopov/release-kit: pinned #v0.3.0 (want 0.3.0), installed 0.2.0
+✗ MISMATCH  package.json  @andrewpopov/release-kit: pinned #v0.3.0 (want 0.3.0), installed 0.2.0
 ✗   fix: npm install "github:andrewpopov/release-kit#v0.3.0" --save
 ✗ verify-pins: 0 ok, 1 MISMATCH, 0 missing, 0 unverifiable (non-semver refs)
 ```
 
-It resolves each package the way node does, walking up parent directories, so
-workspace hoisting and pnpm's symlinked layout both work. Pins whose ref is a
-branch, a commit SHA, or a `semver:` range carry no assertable version; those
-are counted and printed as **unverifiable** rather than dropped, so the summary
+Run at a workspace root — npm/yarn's `workspaces` field or pnpm's
+`pnpm-workspace.yaml` — it checks the root manifest **and every workspace
+member manifest**, naming which one each problem is in (the summary line adds
+`across N manifests` once there's more than one):
+
+```
+$ npx deploy-kit verify-pins
+✗ MISMATCH  packages/api/package.json  ghost-pkg: pinned #v1.0.0 (want 1.0.0), installed 0.9.0
+✗   fix: npm install "github:andrewpopov/ghost-pkg#v1.0.0" --save
+✗ verify-pins: 12 ok, 1 MISMATCH, 0 missing, 0 unverifiable (non-semver refs) across 3 manifests
+```
+
+Each pin is resolved the way node does — walking up from its manifest's
+directory through `node_modules/<name>` — but **bounded to the project**: a
+workspace member's walk stops at (and includes) the workspace root, so hoisted
+and pnpm's symlinked layouts both work, and the root's own pins (or any
+standalone, non-workspace project's) never walk past their own directory at
+all. A same-named package that only exists further up — an unrelated sibling
+project's `node_modules`, say — is reported `missing`, not `ok`; the tool
+never resolves past a `.git` directory either way. Pins whose ref is a branch,
+a commit SHA, or a `semver:` range carry no assertable version; those are
+counted and printed as **unverifiable** rather than dropped, so the summary
 never claims more coverage than it has.
 
 Run it wherever you want the guarantee — a `verify` script, or as a
