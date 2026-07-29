@@ -79,8 +79,15 @@ function buildTargetCommand(command, { mode, host, projectDir, ssh }) {
   return { file: 'ssh', args: [...sshHardeningArgs(ssh), host, remote] };
 }
 
-// Run one command on the target. Returns { ok, output }. With capture:false the
-// child inherits stdio (live logs); with capture:true stdout is returned.
+// Run one command on the target. Returns { ok, output, stderr }. With capture:false
+// the child inherits stdio (live logs); with capture:true stdout is returned as
+// `output`. `stderr` is populated on the FAILURE path only — execFileSync returns
+// stdout as its value and exposes the captured stderr solely on the thrown error,
+// so a successful run has no stderr to hand back. That asymmetry is fine for the
+// callers that need it: stderr matters precisely when a command failed, and it is
+// where well-behaved CLIs write their diagnostics. Keeping it a SEPARATE field
+// (rather than folding it into `output`) preserves `output` as pure stdout for the
+// parsers that depend on it — readPm2's JSON.parse, checkDisk's df/awk numbers.
 //
 // `input` (a string) is fed to the command's STDIN — the injection-safe way to
 // hand arbitrary data (a JSON alert payload, a message) to a target command without
@@ -112,7 +119,7 @@ function runOnTarget(command, config, { capture = false, runtime, input, timeout
   }
   try {
     const output = execFileSync(file, args, execOptions);
-    return { ok: true, output: capture ? String(output || '') : '' };
+    return { ok: true, output: capture ? String(output || '') : '', stderr: '' };
   } catch (error) {
     // execFileSync surfaces a timeout as ETIMEDOUT; on its own that tells the
     // operator nothing about which step hung or what the bound was.
@@ -120,7 +127,12 @@ function runOnTarget(command, config, { capture = false, runtime, input, timeout
       error.message =
         `Step exceeded the ${bound}s timeout bound and was killed: ${command}`;
     }
-    return { ok: false, output: capture ? String(error.stdout || '') : '', error };
+    return {
+      ok: false,
+      output: capture ? String(error.stdout || '') : '',
+      stderr: capture ? String(error.stderr || '') : '',
+      error,
+    };
   }
 }
 

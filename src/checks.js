@@ -178,7 +178,17 @@ function checkCustom(config, ctx) {
     if (res.ok) return { id, status: 'ok', message: `${c.id}: ok` };
     if (res.error && res.error.code === 'ETIMEDOUT') return { id, status: 'unknown', message: `${c.id}: check timed out` };
     const level = c.level === 'warn' ? 'warn' : 'crit';
-    const detail = String(res.output || '').replace(/[^\x20-\x7e]/g, ' ').slice(0, 300).trim();
+    // STDERR FIRST, then stdout. A failing check's reason is conventionally on
+    // stderr; stdout usually holds progress noise that would otherwise crowd the
+    // reason out of the 300-char budget. Reading only stdout (as this did) meant a
+    // check that reported its reason the normal way alerted as a bare "failed" —
+    // the operator learned WHICH check broke and nothing about WHY.
+    const detail = [res.stderr, res.output]
+      .map((stream) => String(stream || '').replace(/[^\x20-\x7e]/g, ' ').trim())
+      .filter(Boolean)
+      .join(' | ')
+      .slice(0, 300)
+      .trim();
     return { id, status: level, message: `${c.id}: failed${detail ? ` — ${detail}` : ''}` };
   });
 }
