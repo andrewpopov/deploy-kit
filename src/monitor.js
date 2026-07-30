@@ -70,7 +70,20 @@ function deliverAlert(config, ctx, event) {
 
 // The per-check state machine. Given the observed status and the persisted check
 // state, decide the new state and whether an alert fires. `unknown` HOLDS (never a
-// recovery or a confirmed failure) and clears the streaks. Returns { next, alert? }.
+// recovery or a confirmed failure) and PRESERVES the fail/recover streaks, so an
+// indeterminate run between two failures doesn't lose progress toward the threshold.
+// Returns { next, alert? }.
+//
+// This comment used to say `unknown` CLEARS the streaks — the opposite of what the
+// code does, and of what the body comment below has always said. Caught while
+// porting this function into alert-kit (PKG-113).
+//
+// CANONICAL COPY LIVES IN alert-kit (`stepCheck` in its `suppression` module). This
+// one stays duplicated ON PURPOSE: deploy-kit declares zero runtime dependencies, and
+// a transitive `github:` resolve onto ARM Pi hosts with no CI is a failure mode worth
+// more than the deduplication. `__tests__/suppression-conformance.test.ts` drives both
+// implementations through a transition matrix so the copy cannot drift silently — if
+// you change the logic here, change it there and let that test prove they agree.
 function stepCheck(prev, result, opts) {
   const { failAfterRuns, recoverAfterRuns, reAlertAfterMinutes, nowMs } = opts;
   const s = prev || { notif: 'healthy', failStreak: 0, recoverStreak: 0, lastAlertAtMs: 0, lastAlertedStatus: null };
