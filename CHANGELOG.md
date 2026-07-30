@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.16.0
+
+- `deploy-kit verify-pins` — fail loudly when a `github:` pin did not actually install
+  `npm install` does not re-resolve a `github:owner/repo#vX.Y.Z` dependency when only the TAG changes — the lockfile is keyed on the already-resolved commit — so bumping a pin can exit 0 while leaving the OLD code in `node_modules`. For a security kit that means a fix you shipped, tagged, and deployed can silently not be running, with every gate green. `deploy-kit verify-pins` asserts that every `github:` pin is installed at the version its tag claims, exits non-zero naming each mismatch alongside the exact re-install command, and resolves packages the way node does so workspace hoisting and pnpm's symlinked layout both work. Refs that carry no assertable version (a branch, a commit SHA, a `semver:` range) are counted and reported as **unverifiable** rather than silently skipped, so the summary never claims more coverage than it has. Standalone like `port-guard` — it reads no `.deploy-kit.config.json` and can gate a deploy via `preRestartChecks`. On its first run across the fleet it found three real problems, including a project running a version older than the one its manifest pinned.
+- custom monitor checks now report WHY they failed — stderr is no longer discarded
+  A failing `monitor.checks` entry alerted as a bare `<id>: failed`, with no
+  indication of what went wrong. `runOnTarget` piped the command's stderr but read
+  only `error.stdout` when building the failure detail, so the diagnostic that a
+  well-behaved CLI writes to stderr was captured and then thrown away. Every custom
+  check in every consumer was affected: the alert named which check broke and
+  nothing about why, which is exactly the information an operator needs at 3am.
+  `runOnTarget` now returns a separate `stderr` field (populated on the failure
+  path), and `checkCustom` composes its detail from stderr first, then stdout — so a
+  noisy stdout can no longer crowd the real reason out of the 300-character budget.
+  `output` remains pure stdout, so existing parsers (`pm2 jlist` JSON, `df` numbers)
+  are unaffected. TypeScript consumers of `runOnTarget` gain `stderr: string` on the
+  return type.
+- verify-pins: tolerate absent optional/peer pins (mismatch still fails), verify semver:<exact> and build-metadata refs, compare versions by semver equality, and fail corrupt installs
+  Describe the user-facing change in one short paragraph before releasing.
+
 ## 0.15.0
 
 - Reject flags a command does not consume, and RollbackResult is now a discriminated union
