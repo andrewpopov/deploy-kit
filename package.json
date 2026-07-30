@@ -1,6 +1,6 @@
 {
   "name": "@andrewpopov/deploy-kit",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "description": "Hook-driven SSH/local deploy pipeline + remote PM2 ops CLI + Cloudflare tunnel launcher",
   "author": "Andrew Popov",
   "main": "src/index.js",
@@ -40,6 +40,7 @@
     "verify:bins": "release-kit verify-bins"
   },
   "devDependencies": {
+    "@andrewpopov/alert-kit": "github:andrewpopov/alert-kit#v0.6.1",
     "@andrewpopov/release-kit": "github:andrewpopov/release-kit#v0.2.0",
     "@eslint/js": "^9.39.5",
     "@types/node": "^24.0.0",
