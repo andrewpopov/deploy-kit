@@ -30,13 +30,14 @@
     "test": "vitest run",
     "verify:pack": "node scripts/verify-pack.mjs",
     "verify:types": "tsc --noEmit -p tsconfig.types.json",
-    "verify": "npm run lint && npm run verify:types && npm test && npm run verify:pack && npm run release:check",
+    "verify": "npm run lint && npm run verify:types && npm test && npm run verify:pack && npm run verify:bins && npm run release:check",
     "release:note": "release-kit note",
     "release:notes": "release-kit notes",
     "release:bump": "release-kit bump",
     "release:cut": "release-kit cut",
     "release:check": "release-kit check",
-    "release:hygiene": "release-kit hygiene"
+    "release:hygiene": "release-kit hygiene",
+    "verify:bins": "release-kit verify-bins"
   },
   "devDependencies": {
     "@andrewpopov/release-kit": "github:andrewpopov/release-kit#v0.2.0",
