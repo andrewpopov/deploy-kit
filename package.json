@@ -30,7 +30,7 @@
     "test": "vitest run",
     "verify:pack": "node scripts/verify-pack.mjs",
     "verify:types": "tsc --noEmit -p tsconfig.types.json",
-    "verify": "npm run lint && npm run verify:types && npm test && npm run verify:pack",
+    "verify": "npm run lint && npm run verify:types && npm test && npm run verify:pack && npm run release:check",
     "release:note": "release-kit note",
     "release:notes": "release-kit notes",
     "release:bump": "release-kit bump",
