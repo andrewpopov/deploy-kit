@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { createRequire } from 'module';
 import { spawn } from 'child_process';
 import {
-  mkdtempSync, writeFileSync, readFileSync, rmSync,
+  mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync,
 } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
@@ -397,6 +397,72 @@ describe('pin gate', () => {
     const { buildPinCheckProgram } = require('../pin-gate.js') as { buildPinCheckProgram: () => string };
     const source = readFileSync(path.join(REPO_ROOT, 'src', 'verify-pins.js'), 'utf8');
     expect(buildPinCheckProgram().startsWith(source)).toBe(true);
+  });
+
+  // The assertions above only inspect the assembled STRING. That is not enough:
+  // concatenating a module's source with an epilogue can produce something that
+  // does not parse or does not run (a Codex review of this change predicted
+  // exactly that — a top-level redeclaration of `verifyPins` — which the IIFE
+  // wrapper in fact prevents). The only way to know is to execute it the way the
+  // target does, so these two drive the real program through a real `node -`
+  // against real fixture directories.
+  describe('the assembled program, executed by a real node', () => {
+    const { spawnSync } = require('child_process') as typeof import('child_process');
+    const { buildPinCheckProgram } = require('../pin-gate.js') as { buildPinCheckProgram: () => string };
+
+    function fixture(manifestRef: string, installedVersion: string | null) {
+      const dir = mkdtempSync(path.join(tmpdir(), 'pin-gate-'));
+      writeFileSync(path.join(dir, 'package.json'), JSON.stringify({
+        name: 'fixture',
+        version: '1.0.0',
+        dependencies: { '@andrewpopov/db-backup': `github:andrewpopov/db-backup#${manifestRef}` },
+      }));
+      if (installedVersion) {
+        const installed = path.join(dir, 'node_modules', '@andrewpopov', 'db-backup');
+        mkdirSync(installed, { recursive: true });
+        writeFileSync(path.join(installed, 'package.json'), JSON.stringify({
+          name: '@andrewpopov/db-backup', version: installedVersion,
+        }));
+      }
+      return dir;
+    }
+
+    // spawnSync, not execFileSync: the runner reports on STDERR (so a deploy's
+    // inherited stdio shows it at the right severity), and execFileSync returns
+    // only stdout on success — which silently made the pass-case assertion read
+    // an empty string.
+    function runProgram(dir: string) {
+      const res = spawnSync(process.execPath, ['-'], {
+        cwd: dir, input: buildPinCheckProgram(), encoding: 'utf8',
+      });
+      return { code: res.status, output: `${res.stdout || ''}${res.stderr || ''}` };
+    }
+
+    it('exits 1 and names the package when the installed version does not match the pin', () => {
+      const dir = fixture('v0.20.0', '0.18.0');
+      try {
+        const { code, output } = runProgram(dir);
+        expect(code).toBe(1);
+        expect(output).toContain('MISMATCH');
+        expect(output).toContain('@andrewpopov/db-backup');
+        // No SyntaxError / ReferenceError leaked through as a "failure".
+        expect(output).not.toContain('SyntaxError');
+        expect(output).not.toContain('already been declared');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('exits 0 when the installed version matches the pin', () => {
+      const dir = fixture('v0.20.0', '0.20.0');
+      try {
+        const { code, output } = runProgram(dir);
+        expect(code).toBe(0);
+        expect(output).toContain('1 ok, 0 MISMATCH');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 });
 

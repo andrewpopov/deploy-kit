@@ -273,6 +273,11 @@ function deployRelease(config, options = {}, ctx = {}) {
   const paths = releasePaths(config);
   const {
     skipMigrate = false, stealLock = false, skipBuild = false, skipDeps = false, stash,
+    // Same precedence as the legacy pipeline: an explicitly supplied option
+    // (`--skip-pin-check`) wins over config, and with neither the gate is on.
+    // Previously this path ANDed the two, so a config `verifyPins: false` could
+    // not be re-enabled per-run while the legacy path allowed it (Codex review).
+    verifyPins = config.verifyPins !== false,
   } = options;
 
   // `--no-stash` (options.stash === false) has no analog under the release
@@ -499,7 +504,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // Same gate as the legacy pipeline, inside the candidate. Cheaper here than
     // anywhere else: the candidate is not serving yet, so a lying pin costs a
     // discarded release directory and nothing else.
-    if (options.verifyPins !== false && config.verifyPins !== false) {
+    if (verifyPins) {
       st.phase = 'verify-pins';
       log.step('Verifying dependency pins in the candidate release');
       runInDir(st.releaseDir, PIN_CHECK_COMMAND, config, c, { input: buildPinCheckProgram() });
