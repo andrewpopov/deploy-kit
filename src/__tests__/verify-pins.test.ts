@@ -781,3 +781,56 @@ describe('PKG-109: edge cases', () => {
     });
   });
 });
+
+describe('devDependency absence on a production install is tolerated', () => {
+  // A production deploy target is installed with `npm ci --omit=dev` (levelup's
+  // deploy hook does exactly this), so its devDependencies are CORRECTLY absent.
+  // Grading that as a fatal `missing` made the deploy pin gate abort a perfectly
+  // healthy deploy — caught by running this checker against the real hosts before
+  // the gate reached them.
+  it('a devDependency absent from node_modules is "absent", not "missing", and does not fail the run', () => {
+    const dir = freshDir();
+    writeManifest(dir, { 'lint-cfg': 'github:andrewpopov/lint-cfg#v0.2.0' }, 'devDependencies');
+    // no install() — exactly what `npm ci --omit=dev` leaves behind
+
+    const result = verifyPins({ dir });
+
+    expect(result.ok).toBe(true);
+    expect(result.summary).toMatchObject({ ok: 0, mismatch: 0, missing: 0, absent: 1 });
+    expect(result.entries[0]).toMatchObject({
+      name: 'lint-cfg', status: 'absent', expectedVersion: '0.2.0', field: 'devDependencies',
+    });
+
+    const { problemLines, absentLines } = formatReport(result);
+    expect(problemLines).toHaveLength(0);
+    expect(absentLines[0]).toMatch(/lint-cfg/);
+  });
+
+  // Tolerance is only about ABSENCE. An installed-but-wrong devDependency is
+  // still the manifest lying about what is on disk, and still fails.
+  it('a devDependency INSTALLED at the wrong version still FAILS as mismatch', () => {
+    const dir = freshDir();
+    writeManifest(dir, { 'lint-cfg': 'github:andrewpopov/lint-cfg#v0.2.0' }, 'devDependencies');
+    install(dir, 'lint-cfg', '0.1.0');
+
+    const result = verifyPins({ dir });
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toMatchObject({ mismatch: 1, missing: 0, absent: 0 });
+    expect(result.entries[0]).toMatchObject({
+      name: 'lint-cfg', status: 'mismatch', expectedVersion: '0.2.0', installedVersion: '0.1.0',
+    });
+  });
+
+  // A plain `dependencies` pin is code the app says it needs at runtime; absence
+  // there is still fatal and must not be swept up by this change.
+  it('a plain dependencies pin that is absent STILL fails as missing', () => {
+    const dir = freshDir();
+    writeManifest(dir, { 'ghost-runtime': 'github:andrewpopov/ghost-runtime#v1.0.0' });
+
+    const result = verifyPins({ dir });
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toMatchObject({ missing: 1, absent: 0 });
+  });
+});
