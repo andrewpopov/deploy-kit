@@ -38,7 +38,23 @@ const GITHUB_SPEC_RE = /^(?:github:)?([\w.-]+)\/([\w.-]+)(?:#(\S+))?$/;
 const SEMVER_VERSION_RE = '(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)(?:-(?:(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+[0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*)?';
 const SEMVER_TAG_RE = new RegExp(`^(?:semver:)?v?(${SEMVER_VERSION_RE})$`);
 
-const ABSENT_TOLERANT_FIELDS = new Set(['optionalDependencies', 'peerDependencies']);
+// Fields where a pin with NOTHING installed is not a lie the manifest is telling.
+//
+// optional/peer: npm never guarantees they get installed at all — an optional dep
+// can fail to build and be skipped, a peer dep is often left to the consumer.
+//
+// devDependencies: a PRODUCTION install deliberately omits them. `npm ci
+// --omit=dev` is the documented way to install a deploy target, and levelup's
+// deploy hook uses exactly that. Grading a correctly-absent devDependency as a
+// fatal `missing` made the deploy gate abort a healthy deploy — found by running
+// this checker against the real hosts before the gate could reach them, where
+// levelup reported `1 missing` for @andrewpopov/eslint-config, a devDependency
+// that SHOULD NOT be on a production host.
+//
+// Tolerance here is only about ABSENCE. A devDependency that IS installed at the
+// wrong version still fails as `mismatch` below, which is the case that actually
+// means the manifest is lying.
+const ABSENT_TOLERANT_FIELDS = new Set(['optionalDependencies', 'peerDependencies', 'devDependencies']);
 
 // Precedence order for a name declared in MORE THAN ONE dep field of the same
 // manifest — npm installs one physical copy per name, not one per field, so
@@ -191,14 +207,12 @@ function checkPin(pin, dir, boundaryDir = dir) {
     };
   }
   if (!installed) {
-    // An optional/peer dep is allowed to be absent — npm never guarantees it
-    // gets installed at all (an optional dep can fail to build and is
-    // skipped; a peer dep is often left for the consumer to provide). A pin
-    // in one of those fields with nothing installed is therefore not a lie
-    // the manifest is telling — it's tolerated, and reported separately so
-    // it can never be mistaken for "checked and fine" either. A regular
-    // dependency or devDependency still fails as `missing` — see
-    // ABSENT_TOLERANT_FIELDS above.
+    // optional/peer/dev pins are allowed to be absent — see
+    // ABSENT_TOLERANT_FIELDS above for why each one is. Tolerated absences are
+    // reported separately so they can never be mistaken for "checked and fine"
+    // either. A regular `dependencies` pin with nothing installed still fails
+    // as `missing`: that IS a lie the manifest is telling, and on a deploy
+    // target it means the app is missing code it declares it needs.
     if (ABSENT_TOLERANT_FIELDS.has(pin.field)) {
       return { ...pin, status: 'absent', expectedVersion };
     }
