@@ -1,6 +1,7 @@
 'use strict';
 
 const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
+const { buildPinCheckProgram, PIN_CHECK_COMMAND } = require('./pin-gate');
 const {
   lockDir, prevShaFile, ensureStateDir, acquireLock,
 } = require('./lock');
@@ -122,6 +123,9 @@ function deploy(config, options = {}, ctx = {}) {
     // first then stop only for the DB work). Default false = build after migrate,
     // while apps are paused (bewks' model). Option or config both work.
     buildBeforeMigrate = config.buildBeforeMigrate === true,
+    // `--skip-pin-check` (options) overrides `verifyPins: false` (config); with
+    // neither, the gate is on.
+    verifyPins = config.verifyPins !== false,
   } = options;
 
   const run = (message, command, opts) => {
@@ -231,6 +235,19 @@ function deploy(config, options = {}, ctx = {}) {
     if (!skipDeps) {
       run('Installing dependencies', config.hooks.install);
       steps.push('install');
+    }
+
+    // Gate the deploy on the installed tree matching what package.json asserts.
+    // Placed IMMEDIATELY after install and before the backup/stop/migrate/build
+    // block, so a pin that installed stale code aborts while everything is still
+    // running and nothing has been mutated — a failure here costs a deploy, not
+    // an outage. Runs even under --skip-deps: the question it answers is "is the
+    // code on this host the code the manifest claims", and skipping the install
+    // makes a stale tree MORE likely, not less. See pin-gate.js for why the
+    // checker is shipped to the target rather than invoked there.
+    if (verifyPins) {
+      run('Verifying dependency pins', PIN_CHECK_COMMAND, { input: buildPinCheckProgram() });
+      steps.push('verify-pins');
     }
 
     const doBuild = !skipBuild && config.hooks.build;

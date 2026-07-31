@@ -94,7 +94,7 @@ describe('deploy pipeline', () => {
   it('runs steps in the correct order with the safety gates', () => {
     const { runtime, calls } = makeRuntime();
     const result = deploy(baseConfig, {}, ctxWith(runtime));
-    expect(result.steps).toEqual(['stash', 'pull:master', 'install', 'backup', 'migrate', 'build', 'restart', 'health']);
+    expect(result.steps).toEqual(['stash', 'pull:master', 'install', 'verify-pins', 'backup', 'migrate', 'build', 'restart', 'health']);
     const joined = calls.join('\n');
     // PKG-82 Bug 1: db-bound apps are paused BEFORE the backup is taken (a writer
     // left online during the snapshot would produce an inconsistent backup), and
@@ -178,7 +178,7 @@ describe('deploy pipeline', () => {
     const { runtime, calls } = makeRuntime();
     const result = deploy(mergeConfig(baseConfig, { buildBeforeMigrate: true }), {}, ctxWith(runtime));
     // build now precedes backup/stop/migrate (only one build)
-    expect(result.steps).toEqual(['stash', 'pull:master', 'install', 'build', 'backup', 'migrate', 'restart', 'health']);
+    expect(result.steps).toEqual(['stash', 'pull:master', 'install', 'verify-pins', 'build', 'backup', 'migrate', 'restart', 'health']);
     const joined = calls.join('\n');
     expect(joined.indexOf('npm run build')).toBeLessThan(joined.indexOf('db:backup'));
     expect(joined.indexOf('npm run build')).toBeLessThan(joined.indexOf('pm2 stop app'));
@@ -214,7 +214,7 @@ describe('deploy pipeline', () => {
     const { runtime, calls } = makeRuntime();
     const result = deploy(ensureConfig, {}, ctxWith(runtime));
     expect(result.steps).toEqual(
-      ['stash', 'pull:master', 'install', 'backup', 'migrate', 'build', 'restart', 'ensure', 'health'],
+      ['stash', 'pull:master', 'install', 'verify-pins', 'backup', 'migrate', 'build', 'restart', 'ensure', 'health'],
     );
     const joined = calls.join('\n');
     expect(joined).toContain('pm2 start ecosystem.config.cjs --only app-tunnel --update-env 2>/dev/null || pm2 restart app-tunnel --update-env');
@@ -295,7 +295,7 @@ describe('deploy pipeline', () => {
     const { runtime, calls } = makeRuntime();
     const result = deploy(restartCheckConfig, {}, ctxWith(runtime));
     expect(result.steps).toEqual(
-      ['stash', 'pull:master', 'install', 'backup', 'migrate', 'build', 'pre-restart-check:port-safe', 'restart', 'health'],
+      ['stash', 'pull:master', 'install', 'verify-pins', 'backup', 'migrate', 'build', 'pre-restart-check:port-safe', 'restart', 'health'],
     );
     const joined = calls.join('\n');
     expect(joined.indexOf('npm run build')).toBeLessThan(joined.indexOf('npx deploy-kit port-guard'));
@@ -337,10 +337,66 @@ describe('deploy pipeline', () => {
     expect(joined.indexOf('npx deploy-kit port-guard')).toBeLessThan(joined.indexOf('pm2 restart app'));
   });
 
-  it('skips deps/build/migrate when requested', () => {
+  it('skips deps/build/migrate when requested — but still verifies pins', () => {
     const { runtime } = makeRuntime();
     const result = deploy(baseConfig, { skipDeps: true, skipBuild: true, skipMigrate: true, stash: false }, ctxWith(runtime));
-    expect(result.steps).toEqual(['pull:master', 'restart', 'health']);
+    // --skip-deps deliberately does NOT skip the pin check. The question the gate
+    // answers is "is the code on this host the code package.json claims", and
+    // skipping the install makes a stale tree more likely, not less. Opting out is
+    // `--skip-pin-check`/`verifyPins: false`, which say so explicitly.
+    expect(result.steps).toEqual(['pull:master', 'verify-pins', 'restart', 'health']);
+  });
+});
+
+describe('pin gate', () => {
+  it('runs the check on the target immediately after install, before backup', () => {
+    const { runtime, calls } = makeRuntime();
+    const result = deploy(baseConfig, { stash: false }, ctxWith(runtime));
+    expect(result.steps).toEqual(['pull:master', 'install', 'verify-pins', 'backup', 'migrate', 'build', 'restart', 'health']);
+    const joined = calls.join('\n');
+    expect(joined.indexOf('npm ci')).toBeLessThan(joined.indexOf('node -'));
+    expect(joined.indexOf('node -')).toBeLessThan(joined.indexOf('db:backup'));
+  });
+
+  it('feeds the checker program on STDIN, never on the command line', () => {
+    const { runtime, inputs } = makeRuntime();
+    deploy(baseConfig, { stash: false }, ctxWith(runtime));
+    const check = inputs.find((i) => i.command.endsWith('node -'));
+    expect(check).toBeDefined();
+    // The program is the real verify-pins source plus the runner — not a
+    // reimplementation, and not interpolated into the remote command string.
+    expect(check!.input).toContain('function verifyPins');
+    expect(check!.input).toContain('process.exit(result.ok ? 0 : 1)');
+    expect(check!.command).not.toContain('verifyPins');
+  });
+
+  it('aborts the deploy when the target reports a pin mismatch', () => {
+    // The fake fails any command containing 'node -', i.e. the pin check exits
+    // non-zero exactly as it does on a real target with a stale install.
+    const { runtime, calls } = makeRuntime({ fail: ['node -'] });
+    expect(() => deploy(baseConfig, { stash: false }, ctxWith(runtime)))
+      .toThrow(/Verifying dependency pins/);
+    // It aborts BEFORE anything is stopped, backed up, migrated, or restarted.
+    const joined = calls.join('\n');
+    expect(joined).not.toContain('db:backup');
+    expect(joined).not.toContain('pm2 stop');
+    expect(joined).not.toContain('pm2 restart');
+  });
+
+  it('is off when verifyPins is false in config, or --skip-pin-check is passed', () => {
+    const { runtime: r1 } = makeRuntime();
+    const viaConfig = deploy({ ...baseConfig, verifyPins: false }, { stash: false }, ctxWith(r1));
+    expect(viaConfig.steps).not.toContain('verify-pins');
+
+    const { runtime: r2 } = makeRuntime();
+    const viaFlag = deploy(baseConfig, { stash: false, verifyPins: false }, ctxWith(r2));
+    expect(viaFlag.steps).not.toContain('verify-pins');
+  });
+
+  it('the shipped program is the verify-pins module source, so it cannot drift', () => {
+    const { buildPinCheckProgram } = require('../pin-gate.js') as { buildPinCheckProgram: () => string };
+    const source = readFileSync(path.join(REPO_ROOT, 'src', 'verify-pins.js'), 'utf8');
+    expect(buildPinCheckProgram().startsWith(source)).toBe(true);
   });
 });
 

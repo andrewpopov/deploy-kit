@@ -5,6 +5,7 @@ const { acquireLock } = require('./lock');
 const { log: defaultLog } = require('./log');
 const { backupIdFromOutput, isSafeBackupId, backupReferenceFromId } = require('./backup-reference');
 const { resolveBranch } = require('./branch');
+const { buildPinCheckProgram, PIN_CHECK_COMMAND } = require('./pin-gate');
 
 // Bump when the on-host layout changes shape. The host migration writes this
 // version into .deploy-kit-layout; a release deploy refuses a host whose marker
@@ -493,6 +494,16 @@ function deployRelease(config, options = {}, ctx = {}) {
       log.step('Installing dependencies in the candidate release');
       runInDir(st.releaseDir, `npm_config_cache=${paths.npmCache} ${config.hooks.install}`, config, c);
       steps.push('install');
+    }
+
+    // Same gate as the legacy pipeline, inside the candidate. Cheaper here than
+    // anywhere else: the candidate is not serving yet, so a lying pin costs a
+    // discarded release directory and nothing else.
+    if (options.verifyPins !== false && config.verifyPins !== false) {
+      st.phase = 'verify-pins';
+      log.step('Verifying dependency pins in the candidate release');
+      runInDir(st.releaseDir, PIN_CHECK_COMMAND, config, c, { input: buildPinCheckProgram() });
+      steps.push('verify-pins');
     }
 
     // ---- Phase: build (inside the candidate) ----

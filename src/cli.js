@@ -15,7 +15,7 @@ const { verifyPins, formatReport } = require('./verify-pins');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
-  '--skip-migrate', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
+  '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
   '--dir', '--json',
 ];
@@ -41,7 +41,7 @@ const COMMAND_FLAGS = {
   'run-host-operations': ['--action', '--api-url-env', '--api-key-env'],
   'run-cairn-operations': [],
   'verify-pins': ['--dir', '--json'],
-  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--no-stash', '--dry-run', '--steal-lock', '--no-lock'],
+  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock'],
   rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock'],
   monitor: ['--steal-lock', '--no-lock'],
   status: [],
@@ -106,6 +106,7 @@ function parseOptions(args) {
     else if (a === '--skip-build') options.skipBuild = true;
     else if (a === '--skip-deps') options.skipDeps = true;
     else if (a === '--skip-migrate') options.skipMigrate = true;
+    else if (a === '--skip-pin-check') options.verifyPins = false;
     else if (a === '--no-stash') options.stash = false;
     else if (a === '--dry-run') options.dryRun = true;
     else if (a === '--steal-lock') options.stealLock = true;
@@ -159,8 +160,13 @@ Commands:
                                             the Cairn defaults (DEPLOY_CAIRN_PRODUCTION action,
                                             CAIRN_OPERATIONS_API_URL / CAIRN_OPERATIONS_API_KEY);
                                             takes no flags
-  deploy [--skip-build|--skip-deps|--skip-migrate]
+  deploy [--skip-build|--skip-deps|--skip-migrate|--skip-pin-check]
          [--no-stash] [--dry-run] [--steal-lock] [--no-lock]
+                                            --skip-pin-check disables the post-install
+                                            check that the installed tree matches what
+                                            package.json pins. It is the escape hatch for
+                                            a target you knowingly cannot fix right now —
+                                            not a way to make a red deploy green.
   rollback [--skip-build|--skip-deps] [--dry-run] [--steal-lock] [--no-lock]
                                             (NOT --skip-migrate or --no-stash — rollback
                                             never reads them)

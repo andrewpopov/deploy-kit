@@ -103,7 +103,7 @@ describe('release deploy — happy path', () => {
     const { runtime, calls } = makeReleaseRuntime();
     const result = release.deployRelease(relConfig(), {}, ctx(runtime));
     expect(result.steps).toEqual(
-      ['materialize', 'shared', 'install', 'build', 'validate', 'backup', 'migrate', 'flip', 'health', 'prune'],
+      ['materialize', 'shared', 'install', 'verify-pins', 'build', 'validate', 'backup', 'migrate', 'flip', 'health', 'prune'],
     );
     expect(result.sha).toBe(SHA);
     expect(result.release).toBe('a1b2c3d4e5f6-20260710T090000Z');
