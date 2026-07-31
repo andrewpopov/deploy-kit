@@ -78,6 +78,12 @@ const DEFAULT_CONFIG = {
   // Build before the backup/stop/migrate block (apps stay up during build) so the
   // paused window is just migration. Default false = build after migrate (paused).
   buildBeforeMigrate: false,
+  // Abort the deploy when the target's installed packages disagree with what its
+  // package.json pins. ON by default, because the failure it catches is silent by
+  // construction: neither `npm install` nor `npm ci` re-resolves a changed
+  // `github:owner/repo#ref`, so without this gate a stale dependency ships under a
+  // green deploy. Set false only for a target you accept cannot be verified.
+  verifyPins: true,
   // Deploy layout. null (default) = legacy in-place deploy on the live worktree —
   // exactly the behavior every app has today. An opt-in typed block switches an app
   // to artifact-first release deploys (SMH-112): each deploy builds an immutable
@@ -174,6 +180,7 @@ const KEY_TYPES = {
   stepTimeoutSeconds: 'number?',
   lock: 'boolean',
   buildBeforeMigrate: 'boolean',
+  verifyPins: 'boolean',
   layout: 'object?',
   monitor: 'object?',
   deliveryEvent: 'object?',

@@ -132,6 +132,11 @@ export interface DeployConfig {
   stepTimeoutSeconds?: number | null;
   lock?: boolean;
   buildBeforeMigrate?: boolean;
+  /** Abort the deploy when the target's installed packages disagree with what its
+   * package.json pins. Default `true`. Neither `npm install` nor `npm ci`
+   * re-resolves a changed `github:owner/repo#ref`, so without this gate a stale
+   * dependency ships under a green deploy. */
+  verifyPins?: boolean;
   /** Opt-in artifact-first release layout (SMH-112). Absent/null = legacy in-place. */
   layout?: ReleaseLayout | null;
   /** Opt-in fleet monitoring + alerting (SMH-116). Absent/null = disabled. */
@@ -148,6 +153,8 @@ export interface DeployOptions {
   stash?: boolean;
   stealLock?: boolean;
   buildBeforeMigrate?: boolean;
+  /** `--skip-pin-check`. Overrides the config's `verifyPins`. */
+  verifyPins?: boolean;
 }
 
 export interface RollbackOptions {

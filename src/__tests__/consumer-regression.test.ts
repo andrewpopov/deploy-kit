@@ -39,7 +39,7 @@ const { loadConfig } = kit;
 // "ssh hardening" suite in `deploy-kit.test.ts`. What THIS file actually
 // verifies is narrower and complementary: that deploy.js's/release.js's own
 // pipeline logic (step order, gating, which commands get built and when) is
-// byte-identical to v0.9.4 except for the three documented `applyPkg82Deltas`
+// byte-identical to v0.9.4 except for the three documented `applyIntentionalDeltas`
 // deltas below. Only log.js is genuinely unchanged since v0.9.4 (verified:
 // `git diff v0.9.4 HEAD -- src/log.js` is empty).
 function loadAtTag(relFile: string, tag: string, overrides: Record<string, unknown> = {}) {
@@ -122,13 +122,13 @@ function makeUniversalRuntime(appNames: string[]) {
 
 const ctx = (runtime: unknown) => ({ runtime, sleep: () => {} });
 
-// PKG-82 deliberately changed deploy behavior (legacy and/or release layout) in
-// four ways. This function encodes exactly those four deltas, narrowly and
-// anchored, so they can be applied to the v0.9.4 sequence and diffed against the
-// CURRENT kit's output. Anything the current kit does that ISN'T one of these
-// four deltas will still show up as a mismatch — that's the whole point of
-// keeping the v0.9.4 anchor instead of just re-snapshotting today's output.
-function applyPkg82Deltas(oldSeq: string[], config: unknown): string[] {
+// Deploy behavior has deliberately diverged from v0.9.4 in five ways: four from
+// PKG-82, plus the pin gate. This function encodes exactly those deltas, narrowly
+// and anchored, so they can be applied to the v0.9.4 sequence and diffed against
+// the CURRENT kit's output. Anything the current kit does that ISN'T one of these
+// deltas will still show up as a mismatch — that's the whole point of keeping the
+// v0.9.4 anchor instead of just re-snapshotting today's output.
+function applyIntentionalDeltas(oldSeq: string[], config: unknown): string[] {
   // Delta 1 (security): the remote/branch used to be interpolated unquoted into a
   // remote shell command (`git fetch origin --prune`, `git pull --ff-only origin
   // master`). The branch is derived from the target's own `origin/HEAD`, so a
@@ -212,6 +212,38 @@ function applyPkg82Deltas(oldSeq: string[], config: unknown): string[] {
     }
     return next;
   });
+
+  // Delta 5 (correctness gate): a `node -` pin check now runs on the target
+  // immediately after the install hook, in the same directory the install ran in,
+  // and aborts the deploy when the installed tree disagrees with what
+  // package.json pins. This one is NOT config-gated in the way PKG-82's phases
+  // were — it is on by default (`verifyPins !== false`), so it is a real,
+  // intended change to the command sequence of all 7 consumers, which is why it
+  // belongs here as an explicit delta rather than as a silently re-snapshotted
+  // expectation. It exists because neither `npm install` NOR `npm ci`
+  // re-resolves a changed `github:owner/repo#ref` (verified against npm 11.9.0),
+  // so before this gate a stale dependency shipped under a green deploy.
+  //
+  // Anchored to the install line itself: find the command whose payload is this
+  // config's install hook (the `cd <dir> && ` prefix and the release layout's
+  // `npm_config_cache=<path> ` prefix are both preserved from that same line, so
+  // the inserted entry lands in the right directory for either pipeline) and
+  // insert exactly one entry after it. If the install hook is absent from the
+  // sequence — a --skip-deps run, which this file never exercises — nothing is
+  // inserted and the sequence is untouched.
+  const installHook = (config as { hooks?: { install?: string } })?.hooks?.install;
+  if (installHook) {
+    const installIndex = seq.findIndex((cmd) => cmd.endsWith(installHook));
+    if (installIndex !== -1) {
+      const installLine = seq[installIndex];
+      const payloadStart = installLine.length - installHook.length;
+      // Everything before the hook text is `cd <dir> && ` plus, in the release
+      // layout, `npm_config_cache=<path> `. The pin check wants the `cd` but not
+      // the npm cache env var.
+      const prefix = installLine.slice(0, payloadStart).replace(/npm_config_cache=\S+ $/, '');
+      seq = [...seq.slice(0, installIndex + 1), `${prefix}node -`, ...seq.slice(installIndex + 1)];
+    }
+  }
 
   return seq;
 }
@@ -345,7 +377,7 @@ describe('consumer regression: v0.9.4 command sequence is byte-identical (preRes
       const oldRun = run(oldDeploy.deploy, config, appNames);
       const newRun = run(kit.deploy, config, appNames);
 
-      expect(newRun.calls).toEqual(applyPkg82Deltas(oldRun.calls, config));
+      expect(newRun.calls).toEqual(applyIntentionalDeltas(oldRun.calls, config));
       expect(newRun.error).toEqual(oldRun.error);
 
       // Guard against this test silently going vacuous again (the release-id

@@ -1,6 +1,7 @@
 'use strict';
 
 const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
+const { buildPinCheckProgram, PIN_CHECK_COMMAND } = require('./pin-gate');
 const {
   lockDir, prevShaFile, ensureStateDir, acquireLock,
 } = require('./lock');
@@ -122,6 +123,9 @@ function deploy(config, options = {}, ctx = {}) {
     // first then stop only for the DB work). Default false = build after migrate,
     // while apps are paused (bewks' model). Option or config both work.
     buildBeforeMigrate = config.buildBeforeMigrate === true,
+    // `--skip-pin-check` (options) overrides `verifyPins: false` (config); with
+    // neither, the gate is on.
+    verifyPins = config.verifyPins !== false,
   } = options;
 
   const run = (message, command, opts) => {
@@ -231,6 +235,28 @@ function deploy(config, options = {}, ctx = {}) {
     if (!skipDeps) {
       run('Installing dependencies', config.hooks.install);
       steps.push('install');
+    }
+
+    // Gate the deploy on the installed tree matching what package.json asserts.
+    // Placed IMMEDIATELY after install and before the backup/stop/migrate/build
+    // block: a failure here aborts with every service still running and no
+    // schema touched, so it costs a deploy rather than an outage.
+    //
+    // It is NOT a clean rollback point, and the changelog should not claim one.
+    // By now the legacy pipeline has already pulled the live worktree and run
+    // the install hook in it, so source and node_modules have changed underneath
+    // the running processes — a later crash or manual restart would pick up the
+    // unverified tree. Aborting here bounds the damage to that, which is the
+    // best a legacy in-place deploy can offer; the release layout does better
+    // (its gate runs inside a candidate that is never activated).
+    //
+    // Runs even under --skip-deps: the question it answers is "is the code on
+    // this host the code the manifest claims", and skipping the install makes a
+    // stale tree MORE likely, not less. See pin-gate.js for why the checker is
+    // shipped to the target rather than invoked there.
+    if (verifyPins) {
+      run('Verifying dependency pins', PIN_CHECK_COMMAND, { input: buildPinCheckProgram() });
+      steps.push('verify-pins');
     }
 
     const doBuild = !skipBuild && config.hooks.build;
