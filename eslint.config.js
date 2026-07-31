@@ -14,7 +14,18 @@ const globals = require('globals');
 
 module.exports = tseslint.config(
   {
-    ignores: ['node_modules/**', 'coverage/**', '*.tgz'],
+    // `.worktree/**` is a NESTED CHECKOUT, not source of this working tree: it
+    // holds another branch's copy of the repo (the standard place a feature
+    // branch is developed). Linting it is wrong twice over — it reports on code
+    // that is not what you are editing, and its files do not match the
+    // path-scoped blocks below, which are resolved against the LINT ROOT. A
+    // worktree copy of `scripts/verify-pack.mjs` lands at
+    // `.worktree/<slug>/scripts/verify-pack.mjs`, which `scripts/**/*.mjs` does
+    // not match, so it fell through to a config with no Node globals and every
+    // `console`/`process` became `no-undef`. That failed `lint`, and `verify`
+    // starts with `lint` — so anyone with a worktree open, which is the normal
+    // way work happens here, could not run the battery at all (PKG-118).
+    ignores: ['node_modules/**', 'coverage/**', '*.tgz', '.worktree/**'],
   },
 
   // Baseline recommended rules for everything JS-ish.
