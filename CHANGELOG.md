@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.17.0
+
+- Deploys now abort when the target's installed packages disagree with what package.json pins
+  Neither `npm install` nor `npm ci` re-resolves a `github:owner/repo#<ref>` dependency when only the ref changes — verified against npm 11.9.0: with a lockfile at the v0.19.0 commit and a manifest asserting `#v0.20.0`, both commands exit 0 and leave 0.19.0 on disk. The whole install fallback chain is therefore silent about it, and a deploy reports success while shipping code the manifest says was replaced.
+  
+  A `verify-pins` step now runs on the target immediately after install — before backup, migrate, build, and restart — and aborts the deploy on a mismatch, so the cost is a failed deploy rather than an outage or a security fix that never lands. It runs under `--skip-deps` too, since skipping the install makes a stale tree more likely, not less.
+  
+  The checker is shipped to the target on stdin (the verbatim `verify-pins.js` source plus a runner, `fs`/`path` only) rather than invoked there, so it works on hosts whose installed deploy-kit predates the feature and needs no dependency on the target. Opt out with `verifyPins: false` or `--skip-pin-check`.
+- `npm run lint` no longer fails just because a git worktree is open
+  ESLint linted `.worktree/<slug>/`, a nested checkout holding another branch's copy of the repo. The path-scoped config blocks resolve against the lint root, so a worktree copy of `scripts/verify-pack.mjs` never matched `scripts/**/*.mjs`, fell through to a config with no Node globals, and every `console`/`process` reference became `no-undef` — 8 errors from files that are not this working tree's source. Because `verify` starts with `lint`, anyone with a worktree open could not run the battery at all. `.worktree/**` is now ignored.
+- The declared release-kit pin now matches the one actually installed
+  `package.json` pinned `release-kit#v0.2.0` while `package-lock.json` resolved to the v0.3.1 commit — a committed disagreement, not stale local state, so `npm ci` installed v0.3.1 while the manifest claimed v0.2.0 and an `npm install` from the manifest could have downgraded it. PKG-98 installed the new version here but never saved the manifest, which is the same class of silent drift the deploy-time pin gate now catches.
+
 ## 0.16.1
 
 - monitor: correct the stepCheck header comment and pin the copy to alert-kit with a conformance test
