@@ -179,10 +179,27 @@ Commands:
 
 // A runtime that prints the exact command stream instead of executing it. Health
 // probes return 200 so a dry-run walks the full happy path.
+//
+// `dryRun: true` opts into exec.js's `readOnly` escape hatch: a handful of
+// call sites (release.js's preflight, interrupted-deploy check, and current/
+// previous symlink reads — see their `readOnly: true` call sites) are
+// genuinely non-mutating probes of state that already exists on the host, and
+// are marked as such precisely so they can run for REAL here instead of
+// through the fake `execFileSync` below. Before this (PKG-127) every one of
+// those reads came back '' under `--dry-run`, so `--dry-run` could never
+// complete against a real release-layout host — the marker read alone made a
+// genuinely migrated host look unmigrated and abort the dry run with "Release
+// deploy requires a migrated host". `realExecFileSync` is left unset here, so
+// exec.js's normalizeRuntime() falls back to the real Node execFileSync — a
+// live, read-only ssh/local call. Every other command (anything not marked
+// readOnly — every mutation: install, build, migrate, the symlink flip, pm2
+// restarts, …) still only ever hits the fake execFileSync below, which never
+// touches the target.
 function dryRunContext() {
   return {
     sleep: () => {},
     runtime: {
+      dryRun: true,
       execFileSync: (file, args) => {
         const rendered = [file, ...args].join(' ');
         log.step(`[dry-run] ${rendered}`);

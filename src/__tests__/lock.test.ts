@@ -158,6 +158,75 @@ describe('lock: --steal-lock', () => {
   });
 });
 
+describe('lock: a transport/auth failure must never be reported as a held lock (PKG-127)', () => {
+  // The clipd incident: ssh rejected with "Permission denied (publickey)" (no
+  // authorized_keys for that account) — no lock existed on the host at all —
+  // and deploy-kit reported "Another deploy holds the lock" and recommended
+  // --steal-lock, which is useless against an auth failure and destructive
+  // against a real one. The lock-acquire script (see lock.js) always completes
+  // with a real `exit 1` when it genuinely determines the lock is held; ssh
+  // failing to even reach the target exits some OTHER way (255 is ssh's own
+  // connection/auth failure code; a spawn failure has no status at all).
+  function makeTransportFailureRuntime(status: number | null) {
+    const calls: string[] = [];
+    const execFileSync = (_file: string, args: string[]) => {
+      calls.push(args[args.length - 1]);
+      const err: any = new Error('ssh: connect to host app failed: Permission denied (publickey).');
+      if (status != null) err.status = status;
+      throw err;
+    };
+    return { runtime: { execFileSync }, calls };
+  }
+
+  it('non-steal acquire: an ssh auth failure (exit 255) is surfaced as a connection failure, NOT a held lock', () => {
+    const config = lockConfig();
+    const { runtime } = makeTransportFailureRuntime(255);
+    expect(() => lock.acquireLock(config, { runtime })).toThrow(/connection or authentication failure/);
+    // Must NOT contain the lock-contention message or its dangerous suggestion.
+    try {
+      lock.acquireLock(config, { runtime });
+      throw new Error('expected acquireLock to throw');
+    } catch (e: any) {
+      expect(e.message).not.toMatch(/Another deploy holds the lock/);
+      expect(e.message).not.toMatch(/pass --steal-lock/);
+      expect(e.message).toMatch(/Permission denied \(publickey\)/); // the real cause survives
+    }
+  });
+
+  it('non-steal acquire: a spawn failure (no exit status at all, e.g. ssh missing) is also NOT reported as a held lock', () => {
+    const config = lockConfig();
+    const { runtime } = makeTransportFailureRuntime(null);
+    expect(() => lock.acquireLock(config, { runtime })).not.toThrow(/Another deploy holds the lock/);
+    expect(() => lock.acquireLock(config, { runtime })).toThrow(/connection or authentication failure/);
+  });
+
+  it('--steal-lock: an ssh auth failure is surfaced as a connection failure, NOT "lost a race"', () => {
+    const config = lockConfig();
+    const { runtime } = makeTransportFailureRuntime(255);
+    expect(() => lock.acquireLock(config, { runtime }, { steal: true })).not.toThrow(/lost a race/);
+    expect(() => lock.acquireLock(config, { runtime }, { steal: true })).toThrow(/connection or authentication failure/);
+  });
+
+  it('sanity: a CONFIRMED exit 1 (genuine remote script verdict) still gets the original, correct messages', () => {
+    // Regression guard for the fix itself: only status===1 keeps the original
+    // lock-contention wording; this must keep passing or the distinction above
+    // is meaningless.
+    const config = lockConfig();
+    const confirmed = (message: string) => {
+      const execFileSync = (_file: string, _args: string[]) => {
+        const err: any = new Error(message);
+        err.status = 1;
+        throw err;
+      };
+      return { execFileSync };
+    };
+    expect(() => lock.acquireLock(config, { runtime: confirmed('fake failure') }))
+      .toThrow(/Another deploy holds the lock .* --steal-lock/);
+    expect(() => lock.acquireLock(config, { runtime: confirmed('fake failure') }, { steal: true }))
+      .toThrow(/lost a race for the lock/);
+  });
+});
+
 describe('lock: takeover disposal is rename-based, not rm-before-mkdir (PKG-82 Blocker 1)', () => {
   // Two concurrent racers could previously both "win": A `rm -rf`s the stale
   // dir, A `mkdir`s (wins), A writes its owner file, then B's OWN `rm -rf`

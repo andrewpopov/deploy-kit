@@ -18,9 +18,19 @@ function shQuote(value) {
 
 // Runtime seam so deploy/remote logic is unit-testable: tests inject a fake
 // execFileSync and assert the exact command stream (no real ssh/pm2 needed).
+//
+// `dryRun`/`realExecFileSync` exist for exactly one caller: cli.js's
+// `--dry-run` runtime. It sets `dryRun: true` and (in production) leaves
+// `realExecFileSync` unset, so it falls back to the real `nodeExecFileSync`
+// below -- see runOnTarget's `readOnly` handling for why. A plain fake runtime
+// (every existing test) sets neither, so `dryRun` is false and nothing here
+// changes: `execFileSync` is used for every call, exactly as before this option
+// existed.
 function normalizeRuntime(runtime = {}) {
   return {
     execFileSync: runtime.execFileSync || nodeExecFileSync,
+    realExecFileSync: runtime.realExecFileSync || nodeExecFileSync,
+    dryRun: runtime.dryRun === true,
   };
 }
 
@@ -96,8 +106,23 @@ function buildTargetCommand(command, { mode, host, projectDir, ssh }) {
 // interpolating it into the shell string. ssh forwards stdin to the remote command,
 // so it works in both modes. `timeoutSeconds` overrides the per-command bound for
 // this call (monitor checks want short bounds, not the 30-minute deploy default).
-function runOnTarget(command, config, { capture = false, runtime, input, timeoutSeconds } = {}) {
-  const { execFileSync } = normalizeRuntime(runtime);
+//
+// `readOnly: true` marks a call as a genuinely non-mutating probe (a `cat`/
+// `test -f`/`readlink`/`df`/`mv --version` type read) that a caller wants to be
+// TRUE regardless of `--dry-run` -- see cli.js's dry-run runtime. It only has
+// an effect when the injected runtime also has `dryRun: true`: in that case the
+// call bypasses the dry-run fake and runs for real (via `realExecFileSync`),
+// so `--dry-run` can preflight a host truthfully instead of asserting every
+// read comes back empty (PKG-127: that false-empty read made a real,
+// migrated release-layout host look unmigrated and abort the dry run). A
+// normal deploy run (no `dryRun` on the runtime) is completely unaffected:
+// `readOnly` only ever changes behavior under `--dry-run`. Never set this on
+// a call that mutates anything.
+function runOnTarget(command, config, {
+  capture = false, runtime, input, timeoutSeconds, readOnly = false,
+} = {}) {
+  const normalized = normalizeRuntime(runtime);
+  const execFileSync = (readOnly && normalized.dryRun) ? normalized.realExecFileSync : normalized.execFileSync;
   const { file, args } = buildTargetCommand(command, config);
   const hasInput = input != null;
   const execOptions = {

@@ -133,6 +133,20 @@ const DEFAULT_CONFIG = {
     // Prefer the offline cache first so a GitHub outage can't break a deploy that
     // changes no dependencies (STANDARDS.md "The Pi deploy failure mode").
     install: 'npm ci --prefer-offline || npm ci || npm install',
+    // Codegen that writes into node_modules (e.g. `prisma generate`), run
+    // unconditionally right after install, before build. Deliberately a
+    // SEPARATE hook from `build`: a build tool with its own cache (Nx, Turbo)
+    // can replay a cache HIT for the build command and skip everything inside
+    // it, including a generate step baked into that script — `dist/` comes
+    // back from the cache but node_modules/.prisma (wiped by `npm ci` above)
+    // never gets regenerated, so the tree install just produced looks fine
+    // and is actually unrunnable (PKG-127: clipd's api build was `prisma
+    // generate && tsc -b`; Nx replayed 4/4 tasks from cache, `prisma
+    // generate` never ran, and the app crash-looped in prod with
+    // `@prisma/client did not initialize yet`). deploy-kit invokes this hook
+    // directly — no build tool sits between it and the command, so no cache
+    // can intercept it. null = skip (most apps have no codegen step).
+    generate: null, // e.g. 'npx prisma generate'. null = skip.
     backup: null, // pre-migration backup gate; abort deploy if it fails. null = skip.
     migrate: null, // e.g. 'npm run db:migrate:prod'. null = skip.
     build: null, // e.g. 'npm run build'. null = skip.
