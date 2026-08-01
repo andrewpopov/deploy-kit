@@ -37,6 +37,13 @@ function makeRuntime({ fail = [] as string[], backupOutput = '' } = {}) {
     if (fail.some((f) => remoteCmd.includes(f))) {
       const err: any = new Error(`fake failure: ${remoteCmd}`);
       err.stdout = '';
+      // A real target shell that runs a command and rejects it exits 1 (see
+      // lock.js's PKG-127 fix, which now distinguishes a confirmed `exit 1`
+      // from a transport/auth failure that never got to run anything).
+      // Simulating that here keeps every `fail: [...]` command in this file a
+      // faithful stand-in for "the remote command ran and failed", not "ssh
+      // never connected".
+      err.status = 1;
       throw err;
     }
     if (remoteCmd.includes('curl')) return '200';
@@ -104,6 +111,37 @@ describe('deploy pipeline', () => {
     expect(joined.indexOf('db:migrate')).toBeLessThan(joined.indexOf('npm run build'));
     expect(joined).toContain("git pull --ff-only 'origin' 'master'");
     expect(joined).toContain("http://localhost:3000/api/health");
+  });
+
+  // PKG-127 defect 1: clipd's api build was `prisma generate && tsc -b`; an Nx
+  // cache HIT replayed 4/4 tasks and `prisma generate` never ran, leaving
+  // node_modules/.prisma missing (npm ci wipes it) even though the deploy
+  // reported success. `hooks.generate` is a separate, always-invoked step no
+  // build-tool cache sits in front of.
+  it('hooks.generate runs right after install, before build — a step no build-tool cache can skip', () => {
+    const { runtime, calls } = makeRuntime();
+    const cfg = mergeConfig(baseConfig, { hooks: { ...baseConfig.hooks, generate: 'npx prisma generate' } });
+    const result = deploy(cfg, {}, ctxWith(runtime));
+    expect(result.steps).toEqual(
+      ['stash', 'pull:master', 'install', 'generate', 'verify-pins', 'backup', 'migrate', 'build', 'restart', 'health'],
+    );
+    const joined = calls.join('\n');
+    expect(joined.indexOf('npm ci')).toBeLessThan(joined.indexOf('prisma generate'));
+    expect(joined.indexOf('prisma generate')).toBeLessThan(joined.indexOf('npm run build'));
+  });
+
+  it('a failing hooks.generate aborts the deploy before build/migrate — never ships silently', () => {
+    const { runtime, calls } = makeRuntime({ fail: ['prisma generate'] });
+    const cfg = mergeConfig(baseConfig, { hooks: { ...baseConfig.hooks, generate: 'npx prisma generate' } });
+    expect(() => deploy(cfg, {}, ctxWith(runtime))).toThrow(/Running post-install generation failed/);
+    expect(calls.some((c) => c.includes('db:migrate'))).toBe(false);
+    expect(calls.some((c) => c.includes('npm run build'))).toBe(false);
+  });
+
+  it('no hooks.generate configured (default null) — no generate step, unchanged from before PKG-127', () => {
+    const { runtime } = makeRuntime();
+    const result = deploy(baseConfig, {}, ctxWith(runtime));
+    expect(result.steps).not.toContain('generate');
   });
 
   it('aborts BEFORE migrating if the backup gate fails', () => {
@@ -1135,6 +1173,24 @@ describe('rollback', () => {
     rollback(rbCfg, {}, { runtime, sleep: () => {} });
     expect(seen.some((c) => c.includes(`git reset --hard ${sha}`))).toBe(true);
   });
+
+  it('PKG-127: hooks.generate also runs on rollback, right after install and before build', () => {
+    const sha = 'c'.repeat(40);
+    const seen: string[] = [];
+    const runtime = {
+      execFileSync: (_f: string, a: string[]) => {
+        const cmd = a[a.length - 1];
+        seen.push(cmd);
+        if (cmd.includes('prev-sha')) return sha;
+        return cmd.includes('curl') ? '200' : '';
+      },
+    };
+    const cfg = mergeConfig(rbCfg, { hooks: { ...rbCfg.hooks, generate: 'npx prisma generate' } });
+    rollback(cfg, {}, { runtime, sleep: () => {} });
+    const joined = seen.join('\n');
+    expect(joined.indexOf('npm ci')).toBeLessThan(joined.indexOf('prisma generate'));
+    expect(joined.indexOf('prisma generate')).toBeLessThan(joined.indexOf('npm run build'));
+  });
 });
 
 describe('init scaffold', () => {
@@ -1350,5 +1406,51 @@ describe('backup-reference: backupIdFromOutput contract (PKG-29)', () => {
       expect(backupIdFromOutput(output, { log })).toBeTruthy();
       expect(warnings).toEqual([]);
     }
+  });
+});
+
+// PKG-127 defect 3: `--dry-run` against a release-layout host used to always
+// read '' for every non-curl command, so a genuinely-migrated host's
+// `.deploy-kit-layout` marker came back empty and preflight refused with
+// "Release deploy requires a migrated host" — the exact host the check exists
+// to let through. `runOnTarget`'s `readOnly` option (only meaningful when the
+// injected runtime carries `dryRun: true`) lets a caller mark a specific probe
+// as safe to run for real under dry-run instead of through the fake. These
+// tests exercise that dispatch directly, at the exec.js level.
+describe('exec: readOnly probes under --dry-run (PKG-127)', () => {
+  it('readOnly:true + runtime.dryRun:true bypasses the fake execFileSync and calls realExecFileSync', () => {
+    const fakeCalls: string[] = [];
+    const realCalls: string[] = [];
+    const runtime = {
+      dryRun: true,
+      execFileSync: (_f: string, args: string[]) => { fakeCalls.push(args[args.length - 1]); return ''; },
+      realExecFileSync: (_f: string, args: string[]) => { realCalls.push(args[args.length - 1]); return 'REAL-VALUE'; },
+    };
+    const res = runOnTarget('cat marker', { mode: 'local', projectDir: '/srv/app' }, { capture: true, runtime, readOnly: true });
+    expect(res.output).toBe('REAL-VALUE');
+    expect(realCalls).toHaveLength(1);
+    expect(fakeCalls).toHaveLength(0);
+  });
+
+  it('a mutating call (readOnly omitted/false) still goes through the dry-run fake, never realExecFileSync', () => {
+    const fakeCalls: string[] = [];
+    const realCalls: string[] = [];
+    const runtime = {
+      dryRun: true,
+      execFileSync: (_f: string, args: string[]) => { fakeCalls.push(args[args.length - 1]); return ''; },
+      realExecFileSync: (_f: string, args: string[]) => { realCalls.push(args[args.length - 1]); return 'REAL-VALUE'; },
+    };
+    const res = runOnTarget('npm ci', { mode: 'local', projectDir: '/srv/app' }, { capture: true, runtime });
+    expect(res.output).toBe('');
+    expect(fakeCalls).toHaveLength(1);
+    expect(realCalls).toHaveLength(0);
+  });
+
+  it('readOnly:true WITHOUT runtime.dryRun (every existing test\'s shape) is unaffected — still uses the injected fake', () => {
+    const fakeCalls: string[] = [];
+    const runtime = { execFileSync: (_f: string, args: string[]) => { fakeCalls.push(args[args.length - 1]); return 'FAKE'; } };
+    const res = runOnTarget('cat marker', { mode: 'local', projectDir: '/srv/app' }, { capture: true, runtime, readOnly: true });
+    expect(res.output).toBe('FAKE');
+    expect(fakeCalls).toHaveLength(1);
   });
 });

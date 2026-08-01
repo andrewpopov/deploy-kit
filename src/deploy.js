@@ -235,6 +235,14 @@ function deploy(config, options = {}, ctx = {}) {
     if (!skipDeps) {
       run('Installing dependencies', config.hooks.install);
       steps.push('install');
+      // Always run right after install, never folded into `hooks.build` — see
+      // config.js's `hooks.generate` comment (PKG-127) for why a build tool's
+      // own cache (Nx/Turbo) can silently skip a generator baked into the
+      // build script, shipping a tree that installed cleanly but can't run.
+      if (config.hooks.generate) {
+        run('Running post-install generation', config.hooks.generate);
+        steps.push('generate');
+      }
     }
 
     // Gate the deploy on the installed tree matching what package.json asserts.
@@ -426,7 +434,13 @@ function rollback(config, options = {}, ctx = {}) {
     };
 
     run(`Resetting to ${sha.slice(0, 12)}`, `git reset --hard ${sha}`);
-    if (!options.skipDeps) run('Installing dependencies', config.hooks.install);
+    if (!options.skipDeps) {
+      run('Installing dependencies', config.hooks.install);
+      // Same rationale as the forward deploy (PKG-127): a generator baked into
+      // `hooks.build` can be skipped by a build tool's cache, so it must run
+      // as its own always-invoked step, never folded into build.
+      if (config.hooks.generate) run('Running post-install generation', config.hooks.generate);
+    }
     if (!options.skipBuild && config.hooks.build) run('Building', config.hooks.build);
     // Same gate as the forward deploy, immediately before restart — a rollback
     // restart is just as capable of colliding with a squatting process as a

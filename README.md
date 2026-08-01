@@ -92,6 +92,7 @@ unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 | `buildBeforeMigrate` | `boolean` | `false` | both | 0.2 | Build while apps are UP (paused window = just migration). |
 | `verifyPins` | `boolean` | `true` | both | 0.17 | Abort the deploy when the target's installed packages disagree with what its `package.json` pins. Runs on the target right after install, before backup/migrate/build/restart, so a stale install costs a deploy rather than an outage. Neither `npm install` nor `npm ci` re-resolves a changed `github:owner/repo#ref` (verified against npm 11.9.0), so without this a dependency the manifest says was replaced ships silently. Escape hatch: `--skip-pin-check`. |
 | `hooks.install` | `string` | `npm ci --prefer-offline \|\| npm ci \|\| npm install` | both | 0.1 | Dependency install; offline-first so a GitHub outage can't break a no-dep-change deploy. |
+| `hooks.generate` | `string \| null` | `null` | both | unreleased | Codegen that writes into `node_modules` (e.g. `npx prisma generate`). Runs unconditionally right after install, before build. Keep this OUT of `hooks.build`: a build tool's own cache (Nx/Turbo) can replay a cache hit and skip the build command entirely, silently skipping a generator baked into it while `npm ci` has already wiped what it was supposed to regenerate. `null` = skip. |
 | `hooks.backup` | `string \| null` | `null` | both | 0.1 | Pre-migration backup **gate** — a failure aborts before any schema change. Preferred output contract: JSON on stdout with a top-level `backupId` (db-backup >= 0.18.0 emits this). Legacy fallbacks remain supported: `id`, `created.fullPath`, `created.fileName`, or a safe final-line id/path. The parsed id is correlated to `deliveryEvent` as a leaf-only `backupReference`; if nothing parses, deploy-kit logs a loud warning (restore correlation unavailable) but never fails the deploy over it. |
 | `hooks.migrate` | `string \| null` | `null` | both | 0.1 | Migration command; runs with `dbBoundApps` paused. |
 | `hooks.build` | `string \| null` | `null` | both | 0.1 | Build command. |
@@ -130,7 +131,12 @@ the live worktree** — `npm ci` and build mutate the very `node_modules`/genera
 tree the running process is loading, which is how a mid-deploy restart hits
 `@prisma/client did not initialize yet` and crash-loops. Adding a `layout` block
 switches an app to an immutable-release layout where install and build never touch
-the live tree:
+the live tree. Note this does NOT by itself protect a generator (e.g. `prisma
+generate`) baked into `hooks.build`: a build tool's own cache (Nx/Turbo) is
+typically keyed by content, not by directory, so a cache hit inside a freshly
+materialized release can still skip the generator entirely. Use `hooks.generate`
+(see the config reference) for anything that must run every time regardless of
+any build cache, under either layout:
 
 ```
 /srv/<app>/
@@ -174,6 +180,16 @@ Release deploy **requires a migrated host** (the `.deploy-kit-layout` marker) an
 stable `ecosystemFile` whose `cwd` is the literal `…/current`. deploy-kit never
 performs the one-time host restructure — that is a separate, per-app, reversible
 migration. A legacy deploy against a migrated host (or vice-versa) fails closed.
+
+`--dry-run` against a release-layout host runs preflight's reads for real (the
+layout marker, GNU `mv`, free disk, the interrupted-deploy state file, and the
+`current`/`previous` pointers) — all pre-existing host state, none of it changed
+by anything a dry run does — so a genuinely migrated host preflights cleanly
+instead of every read coming back empty and preflight refusing with "requires a
+migrated host" (unreleased fix, PKG-127). Everything past that point (worktree
+materialize, install, build, the symlink flip, restarts, …) stays simulated:
+none of it is real state the dry run could safely read, since a dry run never
+actually performs the earlier mutating steps it depends on.
 
 ### `port-guard` (shared-host port-conflict guard)
 
@@ -383,7 +399,7 @@ npx deploy-kit announce-discord [--webhook-env NAME] [--service NAME]  # conveni
 npx deploy-kit run-host-operations --action DEPLOY_PRODUCTION  # claim one allowlisted operations-API request and run this configured deploy
 npx deploy-kit run-cairn-operations  # deprecated alias: same as above with the Cairn defaults
 npx deploy-kit deploy            # full pipeline
-npx deploy-kit deploy --dry-run  # print the command stream, execute nothing
+npx deploy-kit deploy --dry-run  # print the command stream; mutates nothing (a few read-only preflight checks run for real — see "--dry-run" below)
 npx deploy-kit rollback          # git reset to the pre-last-deploy SHA + rebuild + restart
 npx deploy-kit dashboard         # status + health + git
 npx deploy-kit status|health|resources|git
@@ -404,6 +420,7 @@ npx deploy-kit logs [--lines N] [--follow] [--errors]
 | `run-cairn-operations` | — | **Deprecated** alias for `run-host-operations` with the old fixed defaults (action `DEPLOY_CAIRN_PRODUCTION`, env vars `CAIRN_OPERATIONS_API_URL` / `CAIRN_OPERATIONS_API_KEY`). Kept for existing Cairn consumers; new integrations should use `run-host-operations` directly. |
 | `deploy` | `--skip-build` `--skip-deps` `--skip-migrate` `--no-stash` `--dry-run` `--steal-lock` `--no-lock` | Run the full pipeline. Under the release layout, `--no-stash` is rejected (nothing to stash — see Release layout below). |
 | `rollback` | `--skip-build` `--skip-deps` `--dry-run` `--steal-lock` `--no-lock` | Reset to the recorded pre-deploy SHA, rebuild, restart, health-gate. Does **not** accept `--skip-migrate` or `--no-stash` — rollback never reads them. Under the release layout, `--skip-build`/`--skip-deps` are rejected (rollback is an instant flip to an already-built release — see Release layout below). |
+| — `--dry-run` | | Prints the exact command stream and mutates nothing. A handful of genuinely read-only preflight probes (release-layout host migration marker, interrupted-deploy state, `current`/`previous` pointers, GNU `mv`, free disk) run for real against the target so `--dry-run` reflects the host's actual state instead of asserting every read comes back empty — see Release layout below. |
 | `monitor` | `--steal-lock` `--no-lock` | Run the `monitor` checks, alert on transitions, exit `0`/`1`/`2`. For a cron. |
 | `status` / `health` / `resources` / `git` / `dashboard` | — | Read-only target inspection. |
 | `start` / `stop` / `restart` | — | PM2 lifecycle over `appNames`. Take **no** flags — including no `--dry-run`; these always run for real, and passing any flag (e.g. a typo'd `--dry-run`) is rejected rather than silently ignored. |

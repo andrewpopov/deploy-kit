@@ -2,6 +2,11 @@ export type DeployMode = 'ssh' | 'local';
 
 export interface DeployHooks {
   install?: string;
+  /** Codegen that writes into node_modules (e.g. `prisma generate`). Runs
+   * unconditionally right after install, before build — never fold this into
+   * `build`, whose output a build-tool cache (Nx/Turbo) can replay without
+   * ever running the underlying command. null = skip. */
+  generate?: string | null;
   backup?: string | null;
   migrate?: string | null;
   build?: string | null;

@@ -68,8 +68,13 @@ function runInDir(dir, command, config, ctx, { capture = false, tolerate = false
 }
 
 // Capture trimmed stdout of a command on the target (returns '' on failure).
-function capture(dir, command, config, ctx) {
-  const res = runOnTarget(command, { ...config, projectDir: dir }, { capture: true, runtime: ctx.runtime });
+// `readOnly: true` (see exec.js) lets a caller mark a genuinely non-mutating
+// read so it runs for real under `--dry-run` instead of coming back fake-empty
+// (PKG-127) — used only by preflight-style reads of pre-existing host state,
+// never by a read whose answer depends on something a dry run only PRETENDED
+// to have done (e.g. a materialized release directory that doesn't exist yet).
+function capture(dir, command, config, ctx, { readOnly = false } = {}) {
+  const res = runOnTarget(command, { ...config, projectDir: dir }, { capture: true, runtime: ctx.runtime, readOnly });
   return (res.output || '').trim();
 }
 
@@ -196,8 +201,9 @@ function assertSafeTarget(target, label) {
 // the symlinks — never inferred from directory listings. Targets are NOT validated
 // here (a caller that needs a safe target calls assertSafeTarget).
 function readPointers(config, paths, ctx) {
-  const current = capture(paths.root, `readlink ${paths.currentLink} 2>/dev/null || true`, config, ctx);
-  const previous = capture(paths.root, `readlink ${paths.previousLink} 2>/dev/null || true`, config, ctx);
+  const readOnly = { readOnly: true };
+  const current = capture(paths.root, `readlink ${paths.currentLink} 2>/dev/null || true`, config, ctx, readOnly);
+  const previous = capture(paths.root, `readlink ${paths.previousLink} 2>/dev/null || true`, config, ctx, readOnly);
   return { current: current || null, previous: previous || null };
 }
 
@@ -205,7 +211,14 @@ function readPointers(config, paths, ctx) {
 // (mv -T is namespace-atomic), a stable ecosystem file is configured, and there is
 // enough free disk. Any failure aborts before a single file is written.
 function preflight(config, paths, ctx) {
-  const marker = capture(paths.root, `cat ${paths.markerFile} 2>/dev/null || true`, config, ctx);
+  // Every read in preflight() answers a question about state that ALREADY
+  // exists on the host, independent of anything this deploy will do -- so
+  // under `--dry-run` these are marked readOnly to run for real (see
+  // capture()/exec.js's readOnly doc). Before this fix (PKG-127) the marker
+  // read came back fake-empty under every dry run, so `--dry-run` could never
+  // complete against a real release-layout host — it always aborted here with
+  // "requires a migrated host", even when the host genuinely was migrated.
+  const marker = capture(paths.root, `cat ${paths.markerFile} 2>/dev/null || true`, config, ctx, { readOnly: true });
   if (!marker) {
     throw new Error(
       `Release deploy requires a migrated host: ${paths.markerFile} is missing. Run the one-time host `
@@ -230,13 +243,13 @@ function preflight(config, paths, ctx) {
     if (!config.hooks.backup) throw new Error('Release deploy with a `migrate` hook requires a `backup` hook (no consistent pre-migration snapshot otherwise).');
     if (!config.hooks.restore) throw new Error('Release deploy with a `migrate` hook requires a `restore` hook (recovery from a failed migration would otherwise be manual-only).');
   }
-  const mvGnu = capture(paths.root, 'mv --version 2>/dev/null | head -1', config, ctx);
+  const mvGnu = capture(paths.root, 'mv --version 2>/dev/null | head -1', config, ctx, { readOnly: true });
   if (!/GNU|coreutils/i.test(mvGnu)) {
     throw new Error('Release deploy requires GNU coreutils `mv` (for the atomic `mv -T` symlink swap); not detected on target.');
   }
   // A full filesystem during `npm ci` can corrupt the live SQLite app, so an
   // UNREADABLE disk result must also abort — fail closed, not open.
-  const avail = parseInt(capture(paths.root, `df -kP ${paths.root} | awk 'NR==2{print $4}'`, config, ctx), 10);
+  const avail = parseInt(capture(paths.root, `df -kP ${paths.root} | awk 'NR==2{print $4}'`, config, ctx, { readOnly: true }), 10);
   if (!Number.isFinite(avail)) {
     throw new Error(`Could not read free disk on ${paths.root} (df returned no usable value); refusing to deploy.`);
   }
@@ -250,7 +263,10 @@ function preflight(config, paths, ctx) {
 // loss). Turns "silently manual" into "loud, refuse until resolved" — full
 // auto-resume of an interrupted deploy is a tracked follow-up.
 function assertNoInterruptedDeploy(config, paths, ctx) {
-  const raw = capture(paths.root, `cat ${paths.stateFile} 2>/dev/null || true`, config, ctx);
+  // Same pre-existing-state read as preflight() above — readOnly so a dry run
+  // reports the real interrupted-deploy status of the host instead of always
+  // reading empty.
+  const raw = capture(paths.root, `cat ${paths.stateFile} 2>/dev/null || true`, config, ctx, { readOnly: true });
   if (!raw) return;
   let state;
   try { state = JSON.parse(raw); } catch { return; } // unreadable → best-effort, don't block
@@ -499,6 +515,16 @@ function deployRelease(config, options = {}, ctx = {}) {
       log.step('Installing dependencies in the candidate release');
       runInDir(st.releaseDir, `npm_config_cache=${paths.npmCache} ${config.hooks.install}`, config, c);
       steps.push('install');
+      // Always run right after install, never folded into `hooks.build` — a
+      // fresh worktree can still hit a build tool's GLOBAL cache (Nx/Turbo
+      // caches are typically keyed by content, not by directory), so the
+      // release layout is not itself immune to PKG-127's failure mode. See
+      // config.js's `hooks.generate` comment for the full incident.
+      if (config.hooks.generate) {
+        log.step('Running post-install generation in the candidate release');
+        runInDir(st.releaseDir, config.hooks.generate, config, c);
+        steps.push('generate');
+      }
     }
 
     // Same gate as the legacy pipeline, inside the candidate. Cheaper here than

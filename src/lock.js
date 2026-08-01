@@ -78,6 +78,39 @@ function ensureStateDir(config) {
   return `${ensureBase}\n${migrate}`;
 }
 
+// The acquire scripts below (both branches) are pure POSIX shell that ALWAYS
+// completes with `exit 0` (took/kept the lock) or `exit 1` (another deploy
+// genuinely holds it, or --steal-lock lost the mkdir race) -- every branch in
+// both scripts ends in one of those two exits, nothing else. So `runOnTarget`
+// reporting !ok with anything OTHER than a confirmed exit status of 1 means the
+// script never got to render a verdict at all: ssh failed to connect, auth was
+// rejected, the run was killed by a timeout, or some other transport-level
+// failure happened before the remote shell ever ran our mkdir logic. Before
+// this fix (PKG-127) that case was folded into the SAME "Another deploy holds
+// the lock" message the genuine case gets -- which is actively wrong (there is
+// no lock) and actively dangerous (it recommends --steal-lock, which does
+// nothing useful against an auth failure and IS destructive against a real
+// one; a clipd deploy sat 19 commits behind because the real cause -- no
+// authorized_keys for that account -- was hidden behind a fabricated
+// lock-contention diagnosis). `res.error.status` is the exit code
+// execFileSync's thrown error carries regardless of capture -- verified
+// empirically: a real `exit 1` sets status:1, while a spawn failure (ENOENT)
+// or a non-1 exit (ssh conventionally uses 255 for a connection/auth failure)
+// leaves status anything else.
+function isConfirmedScriptExit1(res) {
+  return res.error != null && res.error.status === 1;
+}
+
+// Build the "could not even run the check" message shared by both branches
+// below. Never claims a lock exists -- it says only what is true: the target
+// could not be reached to find out.
+function lockCheckFailedMessage(res, dir, action) {
+  const detail = (res.error && res.error.message) || 'unknown error';
+  return `Could not run the lock-${action} command against the target (${dir}). This is a connection or `
+    + `authentication failure, NOT a confirmed held lock -- --steal-lock would not help and must not be used `
+    + `here. Resolve connectivity/auth to the target, then retry. Underlying error: ${detail}`;
+}
+
 // Take the target lock (atomic mkdir), recording owner metadata (pid + start
 // time, for operator visibility in the stale-lock log line) plus a random
 // nonce inside it. Staleness is judged PURELY by the TTL clock (recorded ts vs
@@ -121,9 +154,12 @@ function acquireLock(config, ctx, { steal = false, suffix } = {}) {
       + `if mkdir -m 700 "${dir}" 2>/dev/null; then ${writeOwner}; else exit 1; fi`;
     const res = runOnTarget(script, config, { runtime: ctx.runtime });
     if (!res.ok) {
-      throw new Error(
-        `--steal-lock lost a race for the lock (${dir}) to another concurrent deploy; try again.`,
-      );
+      if (isConfirmedScriptExit1(res)) {
+        throw new Error(
+          `--steal-lock lost a race for the lock (${dir}) to another concurrent deploy; try again.`,
+        );
+      }
+      throw new Error(lockCheckFailedMessage(res, dir, 'takeover'));
     }
   } else {
     const script = [
@@ -149,9 +185,12 @@ function acquireLock(config, ctx, { steal = false, suffix } = {}) {
     ].join('\n');
     const res = runOnTarget(script, config, { runtime: ctx.runtime });
     if (!res.ok) {
-      throw new Error(
-        `Another deploy holds the lock (${dir}). Wait for it to finish, or pass --steal-lock.`,
-      );
+      if (isConfirmedScriptExit1(res)) {
+        throw new Error(
+          `Another deploy holds the lock (${dir}). Wait for it to finish, or pass --steal-lock.`,
+        );
+      }
+      throw new Error(lockCheckFailedMessage(res, dir, 'check'));
     }
   }
   // Read back the nonce THIS acquire just wrote (generated shell-side above, so
