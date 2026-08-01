@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.18.0
+
+- New `hooks.generate`, run by deploy-kit itself right after install and before build. A build served from an Nx/Turbo cache silently skips generation steps baked into the build script — the cache restores `dist/` but not artifacts written into `node_modules` — which put clipd into production crash-looping on "@prisma/client did not initialize yet". Because deploy-kit invokes this hook directly, no build tool's cache sits between it and the command, so a cache hit cannot skip it. Runs in the legacy pipeline, the release pipeline and legacy rollback.
+- `--dry-run` can now preflight a release-layout host. The dry-run runtime returned an empty string for every command, so the `.deploy-kit-layout` marker read came back empty and preflight aborted with "requires a migrated host" against hosts whose marker existed and was readable — failing on exactly the layout the check protects. Genuinely read-only preflight probes now execute for real; anything that mutates, or depends on this run's own simulated mutations, stays simulated.
+- An ssh transport or auth failure is no longer reported as a held lock. Acquiring the lock always ends in a genuine `exit 0` or `exit 1`, so anything else means the script never ran; only a confirmed `exit 1` now reports contention. Previously a `Permission denied (publickey)` surfaced as "Another deploy holds the lock ... pass --steal-lock" — recommending an action that was both useless and destructive, and hiding the real cause long enough that one host sat 19 commits behind.
+
 ## 0.17.1
 
 - A production install's absent devDependencies no longer abort the deploy
@@ -55,7 +61,6 @@
   are unaffected. TypeScript consumers of `runOnTarget` gain `stderr: string` on the
   return type.
 - verify-pins: tolerate absent optional/peer pins (mismatch still fails), verify semver:<exact> and build-metadata refs, compare versions by semver equality, and fail corrupt installs
-  Describe the user-facing change in one short paragraph before releasing.
 
 ## 0.15.0
 
