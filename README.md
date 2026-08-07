@@ -331,6 +331,13 @@ condition · `2` a monitor/config/delivery failure. Provider/scheduler-specific 
 belong in `checks[]` (statically-severitied) so they alert without flapping liveness —
 keep the app's own `/live` vs `/ready` split app-side.
 
+**`deploy-kit monitor --local`** (Since 0.19): forces `mode:'local'` for this run only,
+via the same validated config-override path `loadConfig()` already exposes — it does not
+touch the config file. Use it when a consumer repo commits an ssh-mode config for
+laptop-driven `deploy`/`rollback`, but the 24/7 `monitor` cron runs on the target box
+itself: every check and the alert sink then execute locally (no ssh), while `host` is
+left untouched and still identifies the target in the monitor header/alert event.
+
 #### `alert-discord` — bundled Discord sink (opt-in convenience, not a policy change)
 
 `monitor.alert` is deliberately **policy-free**: `monitor.js`/`checks.js` only know
@@ -421,7 +428,7 @@ npx deploy-kit logs [--lines N] [--follow] [--errors]
 | `deploy` | `--skip-build` `--skip-deps` `--skip-migrate` `--no-stash` `--dry-run` `--steal-lock` `--no-lock` | Run the full pipeline. Under the release layout, `--no-stash` is rejected (nothing to stash — see Release layout below). |
 | `rollback` | `--skip-build` `--skip-deps` `--dry-run` `--steal-lock` `--no-lock` | Reset to the recorded pre-deploy SHA, rebuild, restart, health-gate. Does **not** accept `--skip-migrate` or `--no-stash` — rollback never reads them. Under the release layout, `--skip-build`/`--skip-deps` are rejected (rollback is an instant flip to an already-built release — see Release layout below). |
 | — `--dry-run` | | Prints the exact command stream and mutates nothing. A handful of genuinely read-only preflight probes (release-layout host migration marker, interrupted-deploy state, `current`/`previous` pointers, GNU `mv`, free disk) run for real against the target so `--dry-run` reflects the host's actual state instead of asserting every read comes back empty — see Release layout below. |
-| `monitor` | `--steal-lock` `--no-lock` | Run the `monitor` checks, alert on transitions, exit `0`/`1`/`2`. For a cron. |
+| `monitor` | `--steal-lock` `--no-lock` `--local` | Run the `monitor` checks, alert on transitions, exit `0`/`1`/`2`. For a cron. `--local` (Since 0.19) forces `mode:'local'` for this run. |
 | `status` / `health` / `resources` / `git` / `dashboard` | — | Read-only target inspection. |
 | `start` / `stop` / `restart` | — | PM2 lifecycle over `appNames`. Take **no** flags — including no `--dry-run`; these always run for real, and passing any flag (e.g. a typo'd `--dry-run`) is rejected rather than silently ignored. |
 | `logs` | `--lines N` `--follow` `--errors` | Tail PM2 logs for `appNames`. |

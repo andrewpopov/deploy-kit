@@ -123,6 +123,53 @@ describe('rejected flags: one per command family, message names the flag', () =>
   });
 });
 
+describe('PTRY-489: monitor --local', () => {
+  it('`deploy --local` is rejected as an unknown flag (monitor-only)', () => {
+    const cap = captureLog();
+    const code = cli.run(['deploy', '--local'], { cwd: NO_CONFIG_CWD, env: {} });
+    const out = cap.out();
+    cap.restore();
+    expect(code).toBe(1);
+    expect(out).toMatch(/deploy does not support: --local/);
+  });
+
+  it('`monitor --local` parses and dispatches (not flag-rejected)', () => {
+    const cap = captureLog();
+    const code = cli.run(['monitor', '--local'], { cwd: NO_CONFIG_CWD, env: {} });
+    const out = cap.out();
+    cap.restore();
+    expect(code).toBe(2); // no `monitor` config block in this cwd's (nonexistent) config
+    expect(out).not.toMatch(/does not support/);
+    expect(out).toMatch(/No `monitor` config block/);
+  });
+
+  it('with --local, the config reaching monitor() has mode "local" even though the file says ssh', () => {
+    withConfig({ host: 'app@pi', projectDir: '/srv/app', appNames: ['app'], mode: 'ssh', monitor: { disk: { minFreeKiB: 1, minFreeInodes: 1 }, alert: { command: 'ALERT-SINK' } } }, (dir) => {
+      const monitorMod = require('../monitor.js');
+      const spy = vi.spyOn(monitorMod, 'monitor').mockReturnValue({ exitCode: 0 });
+      const code = cli.run(['monitor', '--local'], { cwd: dir, env: {} });
+      expect(code).toBe(0);
+      expect(spy).toHaveBeenCalledTimes(1);
+      const [config] = spy.mock.calls[0];
+      expect(config.mode).toBe('local');
+      expect(config.host).toBe('app@pi'); // host is untouched — still the target identity
+      spy.mockRestore();
+    });
+  });
+
+  it('without --local, a committed ssh-mode config reaches monitor() unchanged', () => {
+    withConfig({ host: 'app@pi', projectDir: '/srv/app', appNames: ['app'], mode: 'ssh', monitor: { disk: { minFreeKiB: 1, minFreeInodes: 1 }, alert: { command: 'ALERT-SINK' } } }, (dir) => {
+      const monitorMod = require('../monitor.js');
+      const spy = vi.spyOn(monitorMod, 'monitor').mockReturnValue({ exitCode: 0 });
+      const code = cli.run(['monitor'], { cwd: dir, env: {} });
+      expect(code).toBe(0);
+      const [config] = spy.mock.calls[0];
+      expect(config.mode).toBe('ssh');
+      spy.mockRestore();
+    });
+  });
+});
+
 describe('no regression: every currently-valid invocation still dispatches', () => {
   it('deploy with every one of its real flags + --dry-run completes (exit 0)', () => {
     withConfig({ host: 'app@pi', projectDir: '/srv/app', appNames: ['app'], mode: 'ssh' }, (dir) => {

@@ -28,11 +28,11 @@ function makeMonitorRuntime(over: any = {}) {
     ...over,
   };
   let stateStore = '';
-  const calls: { cmd: string; input?: string }[] = [];
+  const calls: { cmd: string; input?: string; file?: string }[] = [];
   const delivered: string[] = [];
   const execFileSync = (_file: string, args: string[], opts: any) => {
     const cmd = args[args.length - 1];
-    calls.push({ cmd, input: opts && opts.input });
+    calls.push({ cmd, input: opts && opts.input, file: _file });
     if (/mkdir .*\.lock/.test(cmd) || /rmdir/.test(cmd)) return '';
     if (cmd.includes('cat >') && cmd.includes('monitor-state.json')) { stateStore = opts.input; return ''; }
     if (cmd.includes('cat ') && cmd.includes('monitor-state.json')) return stateStore;
@@ -113,6 +113,30 @@ describe('monitor state machine (stepCheck)', () => {
 });
 
 // ---------------- monitor() end-to-end ----------------
+// PTRY-489: `deploy-kit monitor --local` forces mode:'local' via cli.js's
+// loadConfig override. Prove the effect at the layer that actually matters —
+// every command monitor() issues (checks + the alert sink) goes out through
+// `sh -c`, never `ssh`, once the config it's handed carries mode:'local'.
+describe('monitor() run: mode local issues sh, never ssh', () => {
+  it('runs every check and the alert sink via `sh -c`, with zero `ssh` invocations', () => {
+    const down = {
+      pm2: [{ name: 'app', pid: 0, pm2_env: { status: 'stopped', restart_time: 5 } }, { name: 'tun', pid: 2, pm2_env: { status: 'online' } }],
+      dfAvail: '1',
+      httpCode: '503',
+    };
+    const rt = makeMonitorRuntime(down);
+    const localConfig = monConfig({ alert: { command: 'ALERT-SINK', run: 'target' } });
+    localConfig.mode = 'local';
+    monitor(localConfig, {}, ctx(rt));          // run 1 (debounce)
+    monitor(localConfig, {}, ctx(rt));          // run 2 -> alert delivery
+
+    expect(rt.calls.length).toBeGreaterThan(0);
+    expect(rt.calls.every((c) => c.file === 'sh')).toBe(true);
+    expect(rt.calls.some((c) => c.file === 'ssh')).toBe(false);
+    expect(rt.delivered.length).toBe(1); // the alert sink itself also went over sh
+  });
+});
+
 describe('monitor() run', () => {
   it('all healthy: no alerts, exit 0, state persisted', () => {
     const rt = makeMonitorRuntime();

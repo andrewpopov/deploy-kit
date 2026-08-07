@@ -17,7 +17,7 @@ const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
   '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
-  '--dir', '--json',
+  '--dir', '--json', '--local',
 ];
 
 // Flags that take a following positional value. Kept in sync with the arity
@@ -43,7 +43,7 @@ const COMMAND_FLAGS = {
   'verify-pins': ['--dir', '--json'],
   deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock'],
   rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock'],
-  monitor: ['--steal-lock', '--no-lock'],
+  monitor: ['--steal-lock', '--no-lock', '--local'],
   status: [],
   health: [],
   dashboard: [],
@@ -118,6 +118,7 @@ function parseOptions(args) {
     else if (a === '--api-key-env' && args[i + 1]) { options.apiKeyEnv = args[i + 1]; i += 1; }
     else if (a === '--dir' && args[i + 1]) { options.dir = args[i + 1]; i += 1; }
     else if (a === '--json') { options.json = true; }
+    else if (a === '--local') { options.local = true; }
     else {
       throw new Error(
         `Unknown argument: ${a}\nValid options: ${KNOWN_FLAGS.join(', ')}`
@@ -171,6 +172,10 @@ Commands:
                                             (NOT --skip-migrate or --no-stash — rollback
                                             never reads them)
   monitor [--steal-lock] [--no-lock]       run fleet checks + alert on transitions (cron)
+    [--local]                               force mode:'local' for this run — every check
+                                            and the alert sink execute on this machine, no
+                                            ssh (Since 0.19; for a 24/7 cron running on the
+                                            target box against a committed ssh-mode config)
   status | health | dashboard | resources | git   (no flags)
   start | stop | restart                   (no flags — including no --dry-run; these
                                             commands only ever run for real)
@@ -369,9 +374,16 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     return result.ok ? 0 : 1;
   }
 
+  // --local is monitor-only (enforced above by COMMAND_FLAGS): forces mode:'local'
+  // via loadConfig's validated override param rather than mutating the loaded
+  // config afterward, so the same validation that applies to a config file also
+  // applies here. `host` is left untouched — it still identifies the target in
+  // the monitor header/alert event even when the run itself is local.
+  const configOverride = command === 'monitor' && options.local ? { mode: 'local' } : {};
+
   let config;
   try {
-    config = loadConfig({ cwd });
+    config = loadConfig({ cwd, override: configOverride });
   } catch (error) {
     log.error(error instanceof Error ? error.message : String(error));
     return 1;
