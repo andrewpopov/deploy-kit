@@ -321,7 +321,11 @@ describeOnPosix('lock: release() only removes a lock it still owns (PKG-82 Block
   });
 });
 
-describeOnPosix('lock: config.lock === false', () => {
+// Stays enabled on Windows on purpose: this proves that disabling the lock
+// performs NO shell operations at all, which is platform-independent and is
+// exactly the regression that would bite here - code accidentally taking the
+// POSIX lock path when it was told not to.
+describe('lock: config.lock === false', () => {
   it('disables the lock itself -- acquire/release make no LOCK exec calls (no dir/mkdir/rm for the lock path)', () => {
     const home = freshHome();
     const config = lockConfig({ lock: false });
