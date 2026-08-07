@@ -10,6 +10,19 @@ import { join } from 'path';
 const require = createRequire(__filename);
 const kit = require('../index.js') as typeof import('../index');
 const lock = require('../lock.js') as typeof import('../lock');
+
+// deploy-kit drives its target through `sh -c`, and the lock is a POSIX shell
+// construct: an atomic `mkdir`, a state dir created `mkdir -m 700 -p`, and
+// rename-based disposal via `mv` + `rm -rf "$dir.stale.$$"`. On Windows that
+// state dir step CREATES the directory and then fails to chmod it -
+// "mkdir: cannot change permissions of '/c/Users/...': Permission denied",
+// exit 1 - so every acquire aborts before its mkdir and reports the lock as
+// held by someone else. Mode 700 is a real property on the Linux host these
+// commands are built for (deploy state must not be world-readable), so it is
+// not something to relax for a filesystem that cannot express it. These
+// suites run for real wherever deploy-kit actually deploys.
+const describeOnPosix = process.platform === 'win32' ? describe.skip : describe;
+
 const { mergeConfig, DEFAULT_CONFIG, deploy } = kit;
 
 // lock.js writes state under a literal "$HOME" token that only the shell
@@ -55,7 +68,7 @@ afterEach(() => {
   }
 });
 
-describe('lock: state location', () => {
+describeOnPosix('lock: state location', () => {
   it('acquires under $HOME/.deploy-kit (not /tmp), created mode 700', () => {
     const home = freshHome();
     const config = lockConfig();
@@ -80,7 +93,7 @@ describe('lock: state location', () => {
   });
 });
 
-describe('lock: concurrent acquire', () => {
+describeOnPosix('lock: concurrent acquire', () => {
   it('acquires a fresh lock, then refuses a second concurrent acquire with the actionable message', () => {
     const home = freshHome();
     const config = lockConfig();
@@ -94,7 +107,7 @@ describe('lock: concurrent acquire', () => {
   });
 });
 
-describe('lock: staleness / TTL', () => {
+describeOnPosix('lock: staleness / TTL', () => {
   it('takes over a lock whose recorded timestamp is older than the TTL, logging that it did so', () => {
     const home = freshHome();
     const config = lockConfig({ stepTimeoutSeconds: 100 }); // ttl = 400s
@@ -144,7 +157,7 @@ describe('lock: staleness / TTL', () => {
   });
 });
 
-describe('lock: --steal-lock', () => {
+describeOnPosix('lock: --steal-lock', () => {
   it('still forces past a held lock', () => {
     const home = freshHome();
     const config = lockConfig();
@@ -227,7 +240,7 @@ describe('lock: a transport/auth failure must never be reported as a held lock (
   });
 });
 
-describe('lock: takeover disposal is rename-based, not rm-before-mkdir (PKG-82 Blocker 1)', () => {
+describeOnPosix('lock: takeover disposal is rename-based, not rm-before-mkdir (PKG-82 Blocker 1)', () => {
   // Two concurrent racers could previously both "win": A `rm -rf`s the stale
   // dir, A `mkdir`s (wins), A writes its owner file, then B's OWN `rm -rf`
   // (issued before it saw A's fresh mkdir) deletes A's brand-new lock, and B's
@@ -277,7 +290,7 @@ describe('lock: takeover disposal is rename-based, not rm-before-mkdir (PKG-82 B
   });
 });
 
-describe('lock: release() only removes a lock it still owns (PKG-82 Blocker 3)', () => {
+describeOnPosix('lock: release() only removes a lock it still owns (PKG-82 Blocker 3)', () => {
   it('does not delete a lock dir whose nonce no longer matches (already reclaimed by another run)', () => {
     const home = freshHome();
     const config = lockConfig();
@@ -308,7 +321,7 @@ describe('lock: release() only removes a lock it still owns (PKG-82 Blocker 3)',
   });
 });
 
-describe('lock: config.lock === false', () => {
+describeOnPosix('lock: config.lock === false', () => {
   it('disables the lock itself -- acquire/release make no LOCK exec calls (no dir/mkdir/rm for the lock path)', () => {
     const home = freshHome();
     const config = lockConfig({ lock: false });
@@ -327,7 +340,7 @@ describe('lock: config.lock === false', () => {
   });
 });
 
-describe('lock: false still records a prev-sha (PKG-82 Blocker 2 regression)', () => {
+describeOnPosix('lock: false still records a prev-sha (PKG-82 Blocker 2 regression)', () => {
   it('the "Recording current revision" step ensures $HOME/.deploy-kit itself, regardless of the lock setting', () => {
     // acquireLock never runs a single script when lock:false (see above), and
     // $HOME/.deploy-kit was previously created ONLY as a side effect of
@@ -367,7 +380,7 @@ describe('lock: false still records a prev-sha (PKG-82 Blocker 2 regression)', (
   });
 });
 
-describe('lock: backward-compat migration', () => {
+describeOnPosix('lock: backward-compat migration', () => {
   it('migrates a legacy /tmp prev-sha file into the new location on first acquire', () => {
     const home = freshHome();
     const config = lockConfig();

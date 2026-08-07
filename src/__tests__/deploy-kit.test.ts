@@ -530,7 +530,14 @@ describe('PKG-82 Bug 3: a dbBoundApp not also in appNames must still be restarte
   });
 });
 
-describe('PKG-82 Bug 2: SIGINT/SIGTERM mid-deploy', () => {
+// Real SIGINT delivered to a real child mid-deploy, with the lock released on
+// the way out. Windows has no POSIX signals - process.kill(pid, 'SIGINT')
+// terminates rather than delivering an interrupt a shell handler can trap -
+// and the lock this asserts on is itself a `sh -c` construct that cannot be
+// taken there (see lock.test.ts). It runs wherever deploy-kit deploys.
+const describeOnPosix = process.platform === 'win32' ? describe.skip : describe;
+
+describeOnPosix('PKG-82 Bug 2: SIGINT/SIGTERM mid-deploy', () => {
   // The old version of this test simulated Ctrl-C with `process.emit('SIGINT')`
   // IN-PROCESS while mocking `process.exit`. That stopped being safe once
   // deploy.js's/release.js's signal handler changed from `process.exit(1)` to
