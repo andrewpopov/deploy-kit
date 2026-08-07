@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.19.0
+
+- Add deploy-kit monitor --local to run the monitor and its alert sink on the local machine without ssh
+  `deploy-kit monitor` now accepts a `--local` flag that forces `mode: 'local'` for that
+  run only, via the existing validated `loadConfig` override. This lets a consumer repo
+  keep committing an ssh-mode config for laptop-driven `deploy`/`rollback` while still
+  running its 24/7 `monitor` cron directly on the target box — every check and the alert
+  sink execute with `sh -c`, no ssh, and `host` still identifies the target in alerts.
+
 ## 0.18.0
 
 - New `hooks.generate`, run by deploy-kit itself right after install and before build. A build served from an Nx/Turbo cache silently skips generation steps baked into the build script — the cache restores `dist/` but not artifacts written into `node_modules` — which put clipd into production crash-looping on "@prisma/client did not initialize yet". Because deploy-kit invokes this hook directly, no build tool's cache sits between it and the command, so a cache hit cannot skip it. Runs in the legacy pipeline, the release pipeline and legacy rollback.
