@@ -122,7 +122,7 @@ describe('deploy(): DB-bound app pause verification', () => {
   // A process that is mid-launch or scheduled to restart can still write to the
   // database, so checking for `online` alone would let it slip past the pause
   // and into the backup window.
-  it.each(['launching', 'one-launch-status', 'waiting restart'])(
+  it.each(['launching', 'one-launch-status', 'waiting restart', 'stopping'])(
     '(e) a %s app still in that state after the pause -> deploy aborts',
     (status) => {
       const { runtime, calls } = makeRuntime({
@@ -148,7 +148,9 @@ describe('deploy(): DB-bound app pause verification', () => {
   // pm2 prints update notices and deprecation warnings ahead of `jlist` JSON.
   // Failing open on a preamble would leave the pause silently unverified.
   it('(g) pm2 jlist with a non-JSON preamble is still parsed, and still aborts', () => {
-    const noisy = `npm notice New minor version of npm available!\n${onlineJlist('app')}`;
+    // pm2 prefixes its own notices with a literal "[PM2]", so the salvage must
+    // not anchor on the first '[' it sees.
+    const noisy = `[PM2] warning: something\n${onlineJlist('app')}`;
     const { runtime } = makeRuntime({ jlistResponses: [noisy, noisy] });
 
     expect(() => deploy(baseConfig, {}, ctxWith(runtime)))

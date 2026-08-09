@@ -97,7 +97,9 @@ function pm2StartOrRestart(names, config) {
 // states we treat as definitely-not-writing: checking for `online` alone would
 // let a process that is mid-launch or scheduled to restart slip past the pause
 // verification and into the backup window.
-const ACTIVE_PM2_STATUSES = new Set(['online', 'launching', 'one-launch-status', 'waiting restart']);
+const ACTIVE_PM2_STATUSES = new Set([
+  'online', 'launching', 'one-launch-status', 'waiting restart', 'stopping',
+]);
 
 // `pm2 jlist` is supposed to emit only JSON, but pm2 has a habit of printing
 // update notices and deprecation warnings ahead of it. Parse the array out of
@@ -112,15 +114,21 @@ function parsePm2List(output) {
   } catch {
     // fall through to preamble stripping
   }
-  const start = raw.indexOf('[');
+  // Do NOT assume the first '[' opens the array: pm2 prefixes its own notices
+  // with a literal "[PM2]", so anchoring on the first bracket picks up the
+  // warning and fails to parse — precisely the case this salvage exists for.
+  // Try every '[' in order and take the first that yields an array.
   const end = raw.lastIndexOf(']');
-  if (start === -1 || end === -1 || end <= start) return null;
-  try {
-    const salvaged = JSON.parse(raw.slice(start, end + 1));
-    return Array.isArray(salvaged) ? salvaged : null;
-  } catch {
-    return null;
+  if (end === -1) return null;
+  for (let start = raw.indexOf('['); start !== -1 && start < end; start = raw.indexOf('[', start + 1)) {
+    try {
+      const salvaged = JSON.parse(raw.slice(start, end + 1));
+      if (Array.isArray(salvaged)) return salvaged;
+    } catch {
+      // keep scanning — this '[' was noise, not the array
+    }
   }
+  return null;
 }
 
 function onlinePm2Apps(names, config, ctx) {
