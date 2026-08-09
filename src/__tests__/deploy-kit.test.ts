@@ -27,9 +27,21 @@ const { lockDir, prevShaFile } = require('../lock.js') as {
 // A fake execFileSync that records every command and returns programmed output.
 // The command to run is always the LAST arg: local is ('sh', ['-c', cmd]); ssh is
 // ('ssh', [...hardening -o flags, host, 'cd dir && <cmd>']).
-function makeRuntime({ fail = [] as string[], backupOutput = '' } = {}) {
+//
+// `pm2Online` seeds which app names `pm2 jlist` reports online BEFORE any `pm2
+// stop` is seen — defaults to baseConfig's dbBoundApps/appNames (`['app']`), the
+// realistic case (the whole reason a deploy pauses an app is that it was
+// running). A `pm2 stop ...` flips every seeded name to stopped; a subsequent
+// `pm2 start|restart ...` flips them back online. This is deliberately coarse
+// (it doesn't track exactly which names appeared in which command) — the tests
+// in this file only ever pause/resume this one seeded set, they never assert
+// per-name pm2 state precision.
+function makeRuntime({
+  fail = [] as string[], backupOutput = '', pm2Online = ['app'] as string[],
+} = {}) {
   const calls: string[] = [];
   const inputs: Array<{ command: string; input: string | undefined }> = [];
+  const online = new Set(pm2Online);
   const execFileSync = (file: string, args: string[], options: { input?: string } = {}) => {
     const remoteCmd = args[args.length - 1];
     calls.push(remoteCmd);
@@ -48,6 +60,11 @@ function makeRuntime({ fail = [] as string[], backupOutput = '' } = {}) {
     }
     if (remoteCmd.includes('curl')) return '200';
     if (remoteCmd.includes('db:backup')) return backupOutput;
+    if (/pm2 stop /.test(remoteCmd)) { online.clear(); return ''; }
+    if (/pm2 (start|restart)/.test(remoteCmd)) { pm2Online.forEach((n) => online.add(n)); return ''; }
+    if (remoteCmd.includes('pm2 jlist')) {
+      return JSON.stringify(pm2Online.map((name) => ({ name, pid: 1, pm2_env: { status: online.has(name) ? 'online' : 'stopped' } })));
+    }
     return '';
   };
   return { runtime: { execFileSync }, calls, inputs };
@@ -202,7 +219,12 @@ describe('deploy pipeline', () => {
 
   it('throws if health never comes up, and tells the operator the new code is live and how to recover', () => {
     const runtime = {
-      execFileSync: (_file: string, args: string[]) => (args[args.length - 1].includes('curl') ? '503' : ''),
+      execFileSync: (_file: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        if (cmd.includes('curl')) return '503';
+        if (cmd.includes('pm2 jlist')) return '[]';
+        return '';
+      },
     };
     const cfg = mergeConfig(baseConfig, { health: { attempts: 2, delaySeconds: 0 } });
     // PKG-82 Bug 4: legacy has no previous release to auto-flip back to, so the
@@ -621,6 +643,13 @@ describeOnPosix('PKG-82 Bug 2: SIGINT/SIGTERM mid-deploy', () => {
         },
       });
 
+      // dbState models pm2's view of the DB-bound 'app': online until a real
+      // pause attempt is seen, stopped after — the fail-closed pause
+      // verification (PTRY-510 Part 2) needs a genuinely readable \`pm2 jlist\`
+      // to proceed at all, and the online-before-pause reading has to be
+      // truthful for the SIGINT-triggered resume to target the right app
+      // (Part 3: resume only what was observed running).
+      let dbState = 'online';
       const execFileSync = (file, args) => {
         const cmd = args[args.length - 1];
         record(cmd);
@@ -631,6 +660,11 @@ describeOnPosix('PKG-82 Bug 2: SIGINT/SIGTERM mid-deploy', () => {
           return realExecFileSync('sleep', ['3']);
         }
         if (cmd.includes('curl')) return '200';
+        if (cmd.includes('pm2 stop')) { dbState = 'stopped'; return ''; }
+        if (cmd.includes('pm2 start') || cmd.includes('pm2 restart')) { dbState = 'online'; return ''; }
+        if (cmd.includes('pm2 jlist')) {
+          return JSON.stringify([{ name: 'app', pid: 1, pm2_env: { status: dbState } }]);
+        }
         return '';
       };
 
@@ -886,7 +920,13 @@ describe('stepTimeoutSeconds', () => {
   it('passes a timeout (ms) to execFileSync when set', () => {
     let seenTimeout: number | undefined;
     const runtime = {
-      execFileSync: (_f: string, a: string[], opts: any) => { seenTimeout = opts?.timeout; return a[a.length - 1].includes('curl') ? '200' : ''; },
+      execFileSync: (_f: string, a: string[], opts: any) => {
+        seenTimeout = opts?.timeout;
+        const cmd = a[a.length - 1];
+        if (cmd.includes('curl')) return '200';
+        if (cmd.includes('pm2 jlist')) return '[]';
+        return '';
+      },
     };
     deploy(mergeConfig(baseConfig, { stepTimeoutSeconds: 30 }), { stash: false }, { runtime, sleep: () => {} });
     expect(seenTimeout).toBe(30000);
@@ -900,7 +940,10 @@ describe('stepTimeoutSeconds', () => {
       execFileSync: (_f: string, a: string[], opts: any) => {
         seenTimeout = opts?.timeout;
         seenKill = opts?.killSignal;
-        return a[a.length - 1].includes('curl') ? '200' : '';
+        const cmd = a[a.length - 1];
+        if (cmd.includes('curl')) return '200';
+        if (cmd.includes('pm2 jlist')) return '[]';
+        return '';
       },
     };
     deploy(baseConfig, { stash: false }, { runtime, sleep: () => {} });
@@ -911,7 +954,13 @@ describe('stepTimeoutSeconds', () => {
   it('an explicit stepTimeoutSeconds: null opts out of the bound', () => {
     let seenTimeout: any = 'unset';
     const runtime = {
-      execFileSync: (_f: string, a: string[], opts: any) => { seenTimeout = opts?.timeout; return a[a.length - 1].includes('curl') ? '200' : ''; },
+      execFileSync: (_f: string, a: string[], opts: any) => {
+        seenTimeout = opts?.timeout;
+        const cmd = a[a.length - 1];
+        if (cmd.includes('curl')) return '200';
+        if (cmd.includes('pm2 jlist')) return '[]';
+        return '';
+      },
     };
     deploy({ ...baseConfig, stepTimeoutSeconds: null }, { stash: false }, { runtime, sleep: () => {} });
     expect(seenTimeout).toBeUndefined();
@@ -920,7 +969,13 @@ describe('stepTimeoutSeconds', () => {
   it('a consumer can tighten the bound', () => {
     let seenTimeout: any = 'unset';
     const runtime = {
-      execFileSync: (_f: string, a: string[], opts: any) => { seenTimeout = opts?.timeout; return a[a.length - 1].includes('curl') ? '200' : ''; },
+      execFileSync: (_f: string, a: string[], opts: any) => {
+        seenTimeout = opts?.timeout;
+        const cmd = a[a.length - 1];
+        if (cmd.includes('curl')) return '200';
+        if (cmd.includes('pm2 jlist')) return '[]';
+        return '';
+      },
     };
     deploy({ ...baseConfig, stepTimeoutSeconds: 60 }, { stash: false }, { runtime, sleep: () => {} });
     expect(seenTimeout).toBe(60_000);
@@ -1087,6 +1142,7 @@ describe('multi-endpoint health', () => {
         const cmd = a[a.length - 1];
         if (cmd.includes('/bad')) return '503';
         if (cmd.includes('curl')) return '200';
+        if (cmd.includes('pm2 jlist')) return '[]';
         return '';
       },
     };
@@ -1100,6 +1156,7 @@ describe('waitForHealth retries', () => {
     const runtime = {
       execFileSync: (_f: string, a: string[]) => {
         const cmd = a[a.length - 1];
+        if (cmd.includes('pm2 jlist')) return '[]';
         if (!cmd.includes('curl')) return '';
         n += 1;
         return n >= 3 ? '200' : '503';
@@ -1138,7 +1195,13 @@ describe('local mode deploy end-to-end', () => {
   it('skips the stash and wraps commands in sh -c', () => {
     const localCalls: Array<[string, string[]]> = [];
     const runtime = {
-      execFileSync: (file: string, a: string[]) => { localCalls.push([file, a]); return a[a.length - 1].includes('curl') ? '200' : ''; },
+      execFileSync: (file: string, a: string[]) => {
+        localCalls.push([file, a]);
+        const cmd = a[a.length - 1];
+        if (cmd.includes('curl')) return '200';
+        if (cmd.includes('pm2 jlist')) return '[]';
+        return '';
+      },
     };
     const result = deploy(localCfg, {}, { runtime, sleep: () => {} });
     expect(result.steps).not.toContain('stash');

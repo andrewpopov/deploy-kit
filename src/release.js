@@ -6,6 +6,7 @@ const { log: defaultLog } = require('./log');
 const { backupIdFromOutput, isSafeBackupId, backupReferenceFromId } = require('./backup-reference');
 const { resolveBranch } = require('./branch');
 const { buildPinCheckProgram, PIN_CHECK_COMMAND } = require('./pin-gate');
+const { parsePm2List } = require('./pm2-state');
 
 // Bump when the on-host layout changes shape. The host migration writes this
 // version into .deploy-kit-layout; a release deploy refuses a host whose marker
@@ -88,14 +89,21 @@ function pm2Activate(config, paths) {
 }
 
 // Parse `pm2 jlist` JSON into { name -> { pid, restarts, online } } for our apps.
+// Parsing is shared with deploy.js/checks.js via pm2-state.js's tolerant
+// `parsePm2List` (PTRY-510 Part 1) — it also fixes a latent gap this local
+// version had: `capture()` returns '' both when the command's output was
+// genuinely empty AND when the command failed outright (a thrown error's
+// `stdout` is captured, and a fake/real failure with no stdout is also '').
+// The old `JSON.parse(out || '[]')` treated BOTH cases as "zero processes
+// running" — a failed/unreadable `pm2 jlist` right after `stopWritersConfirmed`'s
+// stop attempt would silently read back as "confirmed stopped" instead of
+// "unknown", exactly the fail-open gap Part 2 closes in deploy.js. No known
+// caller here exercised that (no test configures a failing `pm2 jlist`), so
+// this is a same-shape drift fix, not a behavior change under existing tests.
 function readPm2(config, paths, ctx) {
   const out = capture(paths.root, 'pm2 jlist', config, ctx);
-  let list;
-  try {
-    list = JSON.parse(out || '[]');
-  } catch {
-    return null; // unparseable — caller treats as a failed check
-  }
+  const list = parsePm2List(out);
+  if (list === null) return null; // unreadable — caller treats as a failed check
   const byName = {};
   for (const proc of list) {
     const env = proc.pm2_env || {};

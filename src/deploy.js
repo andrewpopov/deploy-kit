@@ -1,6 +1,8 @@
 'use strict';
 
-const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
+const {
+  runOnTarget, buildHealthCommand, shQuote, normalizeRuntime,
+} = require('./exec');
 const { buildPinCheckProgram, PIN_CHECK_COMMAND } = require('./pin-gate');
 const {
   lockDir, prevShaFile, ensureStateDir, acquireLock,
@@ -8,6 +10,7 @@ const {
 const { log: defaultLog } = require('./log');
 const { backupIdFromOutput, backupReferenceFromId } = require('./backup-reference');
 const { resolveBranch } = require('./branch');
+const { onlineAppNames } = require('./pm2-state');
 
 function defaultSleep(seconds) {
   const ms = seconds * 1000;
@@ -83,72 +86,36 @@ function pm2StartOrRestart(names, config) {
   return `pm2 start ${config.ecosystemFile} --only ${list.join(',')} --update-env 2>/dev/null || ${restart}`;
 }
 
-// Read `pm2 jlist` and return the subset of `names` currently reported
-// 'online', or null if pm2 state could not be determined (the read failed, or
-// its output wasn't parseable JSON/an array). null is a distinct "unknown"
-// result — callers must never treat it as "none online", or a one-off pm2/jq
-// hiccup on some host would read as a clean pause and mask a live writer (or,
-// the other direction, a caller that turned it into a hard failure would brick
-// every consumer's deploy on that same hiccup). A name absent from the list
-// (not registered in pm2 at all) is simply not in the returned set, same as
-// one that's registered but stopped.
-// pm2 states in which a process may be running, or about to be, and could
-// therefore still write to the database. `stopped` and `errored` are the only
-// states we treat as definitely-not-writing: checking for `online` alone would
-// let a process that is mid-launch or scheduled to restart slip past the pause
-// verification and into the backup window.
-const ACTIVE_PM2_STATUSES = new Set([
-  'online', 'launching', 'one-launch-status', 'waiting restart', 'stopping',
-]);
+// Bounded retry around a `pm2 jlist` read that guards the migration window. A
+// single unreadable read (a pm2/ssh hiccup) must not immediately fail closed —
+// that would make the deploy flaky against a perfectly healthy host — but
+// genuinely unknown state must never be treated as safe either (PTRY-510 Part
+// 2). 3 attempts, short delay between via the existing `ctx.sleep` (same
+// retry/backoff idiom `waitForHealth` already uses).
+const DB_STATE_READ_ATTEMPTS = 3;
+const DB_STATE_READ_RETRY_DELAY_SECONDS = 2;
+// `pm2 jlist` is a fast local probe, so it gets its OWN short bound instead of
+// inheriting `stepTimeoutSeconds` (default 1800s, and `null` means no timeout
+// at all). Inheriting it would let three retries hold the deploy lock for ~90
+// minutes, or hang forever on a `stepTimeoutSeconds: null` consumer — turning a
+// safety check into an availability risk. A jlist that cannot answer in 30s is
+// unreadable for our purposes, which is exactly what the retry/fail-closed
+// path is for.
+const DB_STATE_READ_TIMEOUT_SECONDS = 30;
 
-// `pm2 jlist` is supposed to emit only JSON, but pm2 has a habit of printing
-// update notices and deprecation warnings ahead of it. Parse the array out of
-// the noise rather than failing open on a preamble, since failing open here
-// means the pause silently goes unverified.
-function parsePm2List(output) {
-  const raw = String(output || '').trim();
-  if (!raw) return null;
-  try {
-    const direct = JSON.parse(raw);
-    return Array.isArray(direct) ? direct : null;
-  } catch {
-    // fall through to preamble stripping
-  }
-  // Do NOT assume the first '[' opens the array: pm2 prefixes its own notices
-  // with a literal "[PM2]", so anchoring on the first bracket picks up the
-  // warning and fails to parse — precisely the case this salvage exists for.
-  // Try every '[' in order and take the first that yields an array.
-  const end = raw.lastIndexOf(']');
-  if (end === -1) return null;
-  for (let start = raw.indexOf('['); start !== -1 && start < end; start = raw.indexOf('[', start + 1)) {
-    try {
-      const salvaged = JSON.parse(raw.slice(start, end + 1));
-      // Only a NON-EMPTY array is trustworthy here. A genuinely empty process
-      // list serializes as exactly `[]` and is handled by the direct parse
-      // above; reaching this path with an empty array instead means we matched
-      // a bracket pair inside pm2's own noise (`[PM2] warning []`), and
-      // reporting that as "nothing is running" would silently pass the pause
-      // verification. Fall through to null so it is reported as unreadable.
-      if (Array.isArray(salvaged) && salvaged.length) return salvaged;
-    } catch {
-      // keep scanning — this '[' was noise, not the array
+function readOnlineDbBoundApps(names, config, ctx) {
+  for (let attempt = 1; attempt <= DB_STATE_READ_ATTEMPTS; attempt += 1) {
+    const online = onlineAppNames(names, config, ctx, { timeoutSeconds: DB_STATE_READ_TIMEOUT_SECONDS });
+    if (online !== null) return online;
+    if (attempt < DB_STATE_READ_ATTEMPTS) {
+      ctx.log.warning(
+        `\`pm2 jlist\` was unreadable (attempt ${attempt}/${DB_STATE_READ_ATTEMPTS}); `
+        + `retrying in ${DB_STATE_READ_RETRY_DELAY_SECONDS}s...`,
+      );
+      ctx.sleep(DB_STATE_READ_RETRY_DELAY_SECONDS);
     }
   }
   return null;
-}
-
-function onlinePm2Apps(names, config, ctx) {
-  const res = runOnTarget('pm2 jlist', config, { capture: true, runtime: ctx.runtime });
-  if (!res.ok) return null;
-  const list = parsePm2List(res.output);
-  if (list === null) return null;
-  const online = new Set();
-  for (const proc of list) {
-    if (!proc || !names.includes(proc.name)) continue;
-    const status = (proc.pm2_env && proc.pm2_env.status) || proc.status;
-    if (ACTIVE_PM2_STATUSES.has(status)) online.add(proc.name);
-  }
-  return online;
 }
 
 // A step that must succeed or the whole deploy aborts. onFail runs first
@@ -214,11 +181,45 @@ function deploy(config, options = {}, ctx = {}) {
   // paused apps on every post-stop failure before aborting. Declared before the
   // lock/signal handlers below so a SIGINT/SIGTERM mid-deploy can resume them too.
   let dbAppsPaused = false;
+  // The exact set of apps OBSERVED RUNNING before the pause (PTRY-510 Part 3) —
+  // recovery resumes only these, never every configured dbBoundApp, so an app
+  // that was already stopped before this deploy (e.g. under manual maintenance)
+  // stays stopped through a failed-and-recovered deploy. This is deliberately
+  // set to the FULL observed-online set (never left to "empty means fall back
+  // to everything") — an empty set here legitimately means nothing was running,
+  // so resumeDbApps below must resume nothing, not the whole configured list.
+  // Only the dry-run path (which never reads real pm2 state, so there is no
+  // "observed" set to speak of) sets this to every configured dbBoundApp.
+  let pausedApps = [];
   const resumeDbApps = () => {
-    if (dbAppsPaused && config.dbBoundApps.length) {
-      runOnTarget(`pm2 start ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, config, { runtime });
-      dbAppsPaused = false;
+    if (!dbAppsPaused) return;
+    if (!pausedApps.length) { dbAppsPaused = false; return; }
+    const toResume = pausedApps;
+    runOnTarget(`pm2 start ${toResume.join(' ')} 2>/dev/null || true`, config, { runtime });
+    // A zero-exit `pm2 start` is not proof anything actually came back online
+    // (release.js's `resumePrevious` models the same distrust) — verify before
+    // clearing the paused-state bookkeeping. Skipped under --dry-run: pm2 state
+    // is never real there (the dry-run fake always reads back empty), so a
+    // verification read would always spuriously report "could not confirm".
+    if (normalizeRuntime(runtime).dryRun) { dbAppsPaused = false; return; }
+    const after = onlineAppNames(toResume, config, c, { timeoutSeconds: DB_STATE_READ_TIMEOUT_SECONDS });
+    const notConfirmed = after === null ? toResume : toResume.filter((name) => !after.has(name));
+    if (notConfirmed.length) {
+      // Loud and SEPARATE from the original failure: the caller (gate()/
+      // safeStep()) throws its own "Deploy aborted: ..." error right after this
+      // returns, and that original cause must not be masked by a recovery
+      // problem — so this only logs, never throws. Bookkeeping is deliberately
+      // left uncleared (dbAppsPaused stays true) — this resume was NOT confirmed,
+      // so it must not be recorded as though it were.
+      log.error(
+        `RECOVERY INCOMPLETE: DB-bound app(s) (${notConfirmed.join(', ')}) did not come back online after `
+        + `resume${after === null ? ' (`pm2 jlist` unreadable, could not verify)' : ''}. The failure above is `
+        + 'the ORIGINAL cause of this deploy aborting — this is a SEPARATE, additional problem. Check `pm2 '
+        + 'status` on the target by hand.',
+      );
+      return;
     }
+    dbAppsPaused = false;
   };
   // A gated step that, on failure, first resumes any paused apps, then aborts.
   const safeStep = (message, command) => {
@@ -358,23 +359,55 @@ function deploy(config, options = {}, ctx = {}) {
         // none of THOSE are still online after. Scoped to apps we observed
         // online — one that was already stopped, or was never registered, is
         // not this deploy's problem and must not turn into a spurious abort.
-        const onlineBeforePause = onlinePm2Apps(config.dbBoundApps, config, c);
+        //
+        // --dry-run never actually pauses anything (the fake runtime always
+        // reads back empty), so verifying the pause is meaningless there — a
+        // dry run must never abort on it. Skip the whole verification and fall
+        // back to resuming every configured dbBoundApp if something downstream
+        // still manages to fail during the dry run.
+        const dryRun = normalizeRuntime(runtime).dryRun;
+        if (dryRun) {
+          log.warning('--dry-run: skipping DB-bound pause verification (pm2 state is never real under a dry run).');
+          run(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`,
+            `pm2 stop ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, { tolerate: true });
+          dbAppsPaused = true;
+          pausedApps = config.dbBoundApps;
+        } else {
+          // Unknown state must never be treated as safe (PTRY-510 Part 2): a
+          // bounded retry absorbs a one-off pm2/ssh hiccup, but if `pm2 jlist`
+          // is STILL unreadable after retrying, abort — nothing has been
+          // stopped yet, so this is a clean abort with nothing to recover.
+          const onlineBeforePause = readOnlineDbBoundApps(config.dbBoundApps, config, c);
+          if (onlineBeforePause === null) {
+            throw new Error(
+              `Deploy aborted: could not determine which DB-bound app(s) (${config.dbBoundApps.join(', ')}) were `
+              + `running — \`pm2 jlist\` was unreadable after ${DB_STATE_READ_ATTEMPTS} attempts. Nothing has been `
+              + 'paused; refusing to proceed into the migration window with unknown state.',
+            );
+          }
 
-        run(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`,
-          `pm2 stop ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, { tolerate: true });
-        dbAppsPaused = true;
+          run(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`,
+            `pm2 stop ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, { tolerate: true });
+          dbAppsPaused = true;
+          // Resume only the apps we actually observed running before the pause
+          // (PTRY-510 Part 3) — an app that was already stopped stays stopped.
+          pausedApps = [...onlineBeforePause];
 
-        if (onlineBeforePause === null) {
-          // Can't tell what was running before the attempt — assert nothing,
-          // same "unknown, don't invent a failure" contract as below.
-          log.warning('Skipping DB-bound pause verification: `pm2 jlist` was unreadable before the pause attempt.');
-        } else if (onlineBeforePause.size) {
-          const onlineAfterPause = onlinePm2Apps(config.dbBoundApps, config, c);
-          if (onlineAfterPause === null) {
-            // A pm2/jq quirk on this host must not brick the deploy — log and
-            // proceed rather than invent a failure from unreadable output.
-            log.warning('Skipping DB-bound pause verification: `pm2 jlist` was unreadable after the pause attempt.');
-          } else {
+          if (onlineBeforePause.size) {
+            const onlineAfterPause = readOnlineDbBoundApps(config.dbBoundApps, config, c);
+            if (onlineAfterPause === null) {
+              // Still unreadable after retrying, and apps we observed running
+              // are now paused with no way to confirm it took — fail closed:
+              // resume, then abort. Unlike the pre-pause case, something HAS
+              // been stopped by now, so this is not a no-op abort.
+              resumeDbApps();
+              throw new Error(
+                `Deploy aborted: could not confirm DB-bound app(s) (${[...onlineBeforePause].join(', ')}) stopped `
+                + `— \`pm2 jlist\` was unreadable after ${DB_STATE_READ_ATTEMPTS} attempts following the pause `
+                + 'attempt. Resumed the apps observed running before the pause; unknown state must not be '
+                + 'treated as safe.',
+              );
+            }
             const stillOnline = [...onlineBeforePause].filter((name) => onlineAfterPause.has(name));
             if (stillOnline.length) {
               // Same recovery contract as every other gate in this window: resume
@@ -384,7 +417,7 @@ function deploy(config, options = {}, ctx = {}) {
               throw new Error(
                 `Deploy aborted: DB-bound app(s) still running after the pause step (${stillOnline.join(', ')}) — `
                 + 'a writer left online during the pre-migration backup can produce an inconsistent backup. '
-                + 'A resume was attempted; `pm2 start` failures are not surfaced, so confirm with `pm2 status`.',
+                + 'A resume was attempted for the apps observed running before the pause.',
               );
             }
           }
@@ -432,7 +465,10 @@ function deploy(config, options = {}, ctx = {}) {
 
     if (config.appNames.length) {
       const restartCmd = config.hooks.restart || pm2StartOrRestart(config.appNames, config);
-      run(`Restarting apps (${config.appNames.join(', ')})`, restartCmd);
+      // safeStep, not run: this is still inside the paused window. A failed
+      // restart used to abort straight through `run()`, leaving apps we paused
+      // for the migration stopped with nothing attempting to bring them back.
+      safeStep(`Restarting apps (${config.appNames.join(', ')})`, restartCmd);
       steps.push('restart');
 
       // Ensure auxiliary PM2 processes are up after the main restart — a cloudflared

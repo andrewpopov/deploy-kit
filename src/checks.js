@@ -1,6 +1,7 @@
 'use strict';
 
 const { runOnTarget } = require('./exec');
+const { parsePm2List } = require('./pm2-state');
 
 // Each check returns one or more results: { id, status, message, detail?, meta? }.
 // status is ok | warn | crit | UNKNOWN — 'unknown' means "could not determine health"
@@ -21,16 +22,16 @@ function cap(config, ctx, command, timeoutSeconds) {
 }
 
 // Read `pm2 jlist` once; shared by the pm2/restart/tunnel checks. Returns
-// { list } or { error } — a failed/invalid jlist is an UNKNOWN input, never "all down".
+// { list } or { error } — a failed/invalid jlist is an UNKNOWN input, never "all
+// down". Parsing itself is shared with deploy.js/release.js via pm2-state.js's
+// tolerant `parsePm2List` (PTRY-510 Part 1) — this monitor-facing {list}/{error}
+// shape and its callers (checkPm2, checkRestartStorm, checkTunnel) are otherwise
+// unchanged, so this is a parsing-only migration, not a behavior change.
 function readPm2(config, ctx, timeoutSeconds) {
   const res = cap(config, ctx, 'pm2 jlist', timeoutSeconds);
   if (!res.ok) return { error: 'pm2 jlist failed' };
-  try {
-    const list = JSON.parse(res.output || '[]');
-    return Array.isArray(list) ? { list } : { error: 'pm2 jlist not an array' };
-  } catch {
-    return { error: 'pm2 jlist not valid JSON' };
-  }
+  const list = parsePm2List(res.output);
+  return list === null ? { error: 'pm2 jlist not valid JSON' } : { list };
 }
 
 function procStatus(pm2, name) {
