@@ -123,7 +123,13 @@ function parsePm2List(output) {
   for (let start = raw.indexOf('['); start !== -1 && start < end; start = raw.indexOf('[', start + 1)) {
     try {
       const salvaged = JSON.parse(raw.slice(start, end + 1));
-      if (Array.isArray(salvaged)) return salvaged;
+      // Only a NON-EMPTY array is trustworthy here. A genuinely empty process
+      // list serializes as exactly `[]` and is handled by the direct parse
+      // above; reaching this path with an empty array instead means we matched
+      // a bracket pair inside pm2's own noise (`[PM2] warning []`), and
+      // reporting that as "nothing is running" would silently pass the pause
+      // verification. Fall through to null so it is reported as unreadable.
+      if (Array.isArray(salvaged) && salvaged.length) return salvaged;
     } catch {
       // keep scanning — this '[' was noise, not the array
     }

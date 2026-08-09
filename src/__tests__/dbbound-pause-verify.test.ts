@@ -157,6 +157,20 @@ describe('deploy(): DB-bound app pause verification', () => {
       .toThrow(/DB-bound app\(s\) still running after the pause step \(app\)/);
   });
 
+  // `[PM2] warning []` must not salvage as "nothing is running" — that would
+  // pass the verification silently instead of reporting unreadable output.
+  it('(h) a bracket pair inside pm2 noise is not mistaken for an empty process list', () => {
+    const { runtime, calls } = makeRuntime({ jlistResponses: ['[PM2] warning []'] });
+    const warnings: string[] = [];
+    const log = { ...makeLogger(() => {}, () => {}), warning: (m: string) => warnings.push(m) };
+
+    const result = deploy(baseConfig, {}, ctxWith(runtime, { log }));
+
+    expect(result.healthy).toBe(true);
+    expect(positionsOf(calls, 'pm2 jlist')).toHaveLength(1);
+    expect(warnings.some((w) => w.includes('Skipping DB-bound pause verification'))).toBe(true);
+  });
+
   it('(d) unreadable pm2 jlist -> proceeds, verification skipped and logged', () => {
     const { runtime, calls } = makeRuntime({ jlistResponses: ['not-json'] });
     const warnings: string[] = [];
