@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.19.1
+
+- Verify DB-bound apps are actually paused before the pre-migration backup/migrate window
+  The legacy (non-release-layout) `deploy` pipeline pauses `dbBoundApps` before the pre-migration backup, but the `pm2 stop` was tolerant of failure with no verification — a stop that silently failed still let the backup and migration run against a live writer, risking an inconsistent backup. The pause is now verified: `deploy` snapshots which `dbBoundApps` are running immediately before the stop attempt and asserts none of those are still running immediately after, aborting (and resuming any paused apps first, same as every other gate in this window) if one is. "Running" spans every pm2 state in which a process may still hold database connections — `online`, `launching`, `one-launch-status`, `waiting restart` and `stopping` — so a process that is mid-launch or scheduled to restart cannot slip into the backup window; `stopped` and `errored` are the only states treated as definitely inactive, so an errored app never causes a spurious abort. Apps that were already stopped, or never registered in pm2, are untouched by the check. `pm2 jlist` output is parsed tolerantly of pm2's own `[PM2] …` notices, and genuinely unreadable output is treated as unknown (logged, deploy proceeds) rather than a failure, so a pm2 quirk on one host can't brick a deploy. Release-layout deploys already verify their pause this way and are unaffected.
+
 ## 0.19.0
 
 - Add deploy-kit monitor --local to run the monitor and its alert sink on the local machine without ssh
