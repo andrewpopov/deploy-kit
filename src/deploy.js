@@ -92,21 +92,47 @@ function pm2StartOrRestart(names, config) {
 // every consumer's deploy on that same hiccup). A name absent from the list
 // (not registered in pm2 at all) is simply not in the returned set, same as
 // one that's registered but stopped.
-function onlinePm2Apps(names, config, ctx) {
-  const res = runOnTarget('pm2 jlist', config, { capture: true, runtime: ctx.runtime });
-  if (!res.ok) return null;
-  let list;
+// pm2 states in which a process may be running, or about to be, and could
+// therefore still write to the database. `stopped` and `errored` are the only
+// states we treat as definitely-not-writing: checking for `online` alone would
+// let a process that is mid-launch or scheduled to restart slip past the pause
+// verification and into the backup window.
+const ACTIVE_PM2_STATUSES = new Set(['online', 'launching', 'one-launch-status', 'waiting restart']);
+
+// `pm2 jlist` is supposed to emit only JSON, but pm2 has a habit of printing
+// update notices and deprecation warnings ahead of it. Parse the array out of
+// the noise rather than failing open on a preamble, since failing open here
+// means the pause silently goes unverified.
+function parsePm2List(output) {
+  const raw = String(output || '').trim();
+  if (!raw) return null;
   try {
-    list = JSON.parse(res.output || '[]');
+    const direct = JSON.parse(raw);
+    return Array.isArray(direct) ? direct : null;
+  } catch {
+    // fall through to preamble stripping
+  }
+  const start = raw.indexOf('[');
+  const end = raw.lastIndexOf(']');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    const salvaged = JSON.parse(raw.slice(start, end + 1));
+    return Array.isArray(salvaged) ? salvaged : null;
   } catch {
     return null;
   }
-  if (!Array.isArray(list)) return null;
+}
+
+function onlinePm2Apps(names, config, ctx) {
+  const res = runOnTarget('pm2 jlist', config, { capture: true, runtime: ctx.runtime });
+  if (!res.ok) return null;
+  const list = parsePm2List(res.output);
+  if (list === null) return null;
   const online = new Set();
   for (const proc of list) {
     if (!proc || !names.includes(proc.name)) continue;
     const status = (proc.pm2_env && proc.pm2_env.status) || proc.status;
-    if (status === 'online') online.add(proc.name);
+    if (ACTIVE_PM2_STATUSES.has(status)) online.add(proc.name);
   }
   return online;
 }
@@ -342,9 +368,9 @@ function deploy(config, options = {}, ctx = {}) {
               // leaves production stopped.
               resumeDbApps();
               throw new Error(
-                `Deploy aborted: DB-bound app(s) still online after the pause step (${stillOnline.join(', ')}) — `
+                `Deploy aborted: DB-bound app(s) still running after the pause step (${stillOnline.join(', ')}) — `
                 + 'a writer left online during the pre-migration backup can produce an inconsistent backup. '
-                + 'Paused apps have been resumed.',
+                + 'A resume was attempted; `pm2 start` failures are not surfaced, so confirm with `pm2 status`.',
               );
             }
           }

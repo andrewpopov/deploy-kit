@@ -59,6 +59,8 @@ function makeRuntime({ jlistResponses = [] as string[], fail = [] as string[] } 
 
 const onlineJlist = (name: string) => JSON.stringify([{ name, pid: 1, pm2_env: { status: 'online' } }]);
 const stoppedJlist = (name: string) => JSON.stringify([{ name, pid: 1, pm2_env: { status: 'stopped' } }]);
+const statusJlist = (name: string, status: string) =>
+  JSON.stringify([{ name, pid: 1, pm2_env: { status } }]);
 
 function ctxWith(runtime: unknown, extra: Record<string, unknown> = {}) {
   return { runtime, sleep: () => {}, ...extra };
@@ -77,7 +79,7 @@ describe('deploy(): DB-bound app pause verification', () => {
     const { runtime, calls } = makeRuntime({ jlistResponses: [onlineJlist('app'), onlineJlist('app')] });
 
     expect(() => deploy(baseConfig, {}, ctxWith(runtime)))
-      .toThrow(/DB-bound app\(s\) still online after the pause step \(app\)/);
+      .toThrow(/DB-bound app\(s\) still running after the pause step \(app\)/);
 
     const jlistPositions = positionsOf(calls, 'pm2 jlist');
     const stopPosition = calls.findIndex((c) => c.includes('pm2 stop app'));
@@ -115,6 +117,42 @@ describe('deploy(): DB-bound app pause verification', () => {
     // Nothing was online before the attempt, so there is nothing to verify
     // after it — only the "before" read happens.
     expect(positionsOf(calls, 'pm2 jlist')).toHaveLength(1);
+  });
+
+  // A process that is mid-launch or scheduled to restart can still write to the
+  // database, so checking for `online` alone would let it slip past the pause
+  // and into the backup window.
+  it.each(['launching', 'one-launch-status', 'waiting restart'])(
+    '(e) a %s app still in that state after the pause -> deploy aborts',
+    (status) => {
+      const { runtime, calls } = makeRuntime({
+        jlistResponses: [statusJlist('app', status), statusJlist('app', status)],
+      });
+
+      expect(() => deploy(baseConfig, {}, ctxWith(runtime)))
+        .toThrow(/DB-bound app\(s\) still running after the pause step \(app\)/);
+      expect(calls.some((c) => c.includes('db:backup'))).toBe(false);
+    },
+  );
+
+  // `errored` and `stopped` are the only states treated as definitely-not-writing.
+  it('(f) an errored app is not treated as a writer -> deploy proceeds', () => {
+    const { runtime, calls } = makeRuntime({ jlistResponses: [statusJlist('app', 'errored')] });
+
+    const result = deploy(baseConfig, {}, ctxWith(runtime));
+
+    expect(result.healthy).toBe(true);
+    expect(positionsOf(calls, 'pm2 jlist')).toHaveLength(1);
+  });
+
+  // pm2 prints update notices and deprecation warnings ahead of `jlist` JSON.
+  // Failing open on a preamble would leave the pause silently unverified.
+  it('(g) pm2 jlist with a non-JSON preamble is still parsed, and still aborts', () => {
+    const noisy = `npm notice New minor version of npm available!\n${onlineJlist('app')}`;
+    const { runtime } = makeRuntime({ jlistResponses: [noisy, noisy] });
+
+    expect(() => deploy(baseConfig, {}, ctxWith(runtime)))
+      .toThrow(/DB-bound app\(s\) still running after the pause step \(app\)/);
   });
 
   it('(d) unreadable pm2 jlist -> proceeds, verification skipped and logged', () => {
