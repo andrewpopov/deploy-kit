@@ -245,6 +245,33 @@ function applyIntentionalDeltas(oldSeq: string[], config: unknown): string[] {
     }
   }
 
+  // Delta 6 (data integrity, LEGACY layout only): the pre-migration pause
+  // (`pm2 stop <dbBoundApps>`) is tolerant twice over (`|| true` AND
+  // `tolerate: true`) because a legitimate "not running"/"not registered"
+  // error must never fail a deploy — but that also means a REAL failure to
+  // stop a writer silently fell through, straight into the backup/migrate
+  // window. deploy.js's `onlinePm2Apps` now brackets the pause with two
+  // `pm2 jlist` reads (before/after) and aborts — resuming paused apps first —
+  // if any app observed online before is still online after. Scoped to the
+  // legacy layout only: the release layout has verified its own pause via
+  // `stopWritersConfirmed` since v0.9.4 already (unchanged code, no delta
+  // needed there). Every legacy dbBoundApps fixture below (bewks/sano-os/
+  // savoro) reports its dbBoundApps online at the pre-check (the fake
+  // universal runtime's initial jlist state) and pm2-stopped at the
+  // post-check, so this never trips the new abort — it just inserts two
+  // `pm2 jlist` reads immediately before and after the existing pause line,
+  // carrying the same target-command prefix (`cd <dir> && `) that line
+  // already has.
+  if (!isReleaseLayout && (config as { dbBoundApps?: string[] }).dbBoundApps?.length) {
+    const pauseIdx = seq.findIndex((cmd) => /pm2 stop \S/.test(cmd));
+    if (pauseIdx !== -1) {
+      const pauseLine = seq[pauseIdx];
+      const prefix = pauseLine.slice(0, pauseLine.indexOf('pm2 stop'));
+      const jlistLine = `${prefix}pm2 jlist`;
+      seq = [...seq.slice(0, pauseIdx), jlistLine, pauseLine, jlistLine, ...seq.slice(pauseIdx + 1)];
+    }
+  }
+
   return seq;
 }
 

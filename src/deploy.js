@@ -83,6 +83,74 @@ function pm2StartOrRestart(names, config) {
   return `pm2 start ${config.ecosystemFile} --only ${list.join(',')} --update-env 2>/dev/null || ${restart}`;
 }
 
+// Read `pm2 jlist` and return the subset of `names` currently reported
+// 'online', or null if pm2 state could not be determined (the read failed, or
+// its output wasn't parseable JSON/an array). null is a distinct "unknown"
+// result — callers must never treat it as "none online", or a one-off pm2/jq
+// hiccup on some host would read as a clean pause and mask a live writer (or,
+// the other direction, a caller that turned it into a hard failure would brick
+// every consumer's deploy on that same hiccup). A name absent from the list
+// (not registered in pm2 at all) is simply not in the returned set, same as
+// one that's registered but stopped.
+// pm2 states in which a process may be running, or about to be, and could
+// therefore still write to the database. `stopped` and `errored` are the only
+// states we treat as definitely-not-writing: checking for `online` alone would
+// let a process that is mid-launch or scheduled to restart slip past the pause
+// verification and into the backup window.
+const ACTIVE_PM2_STATUSES = new Set([
+  'online', 'launching', 'one-launch-status', 'waiting restart', 'stopping',
+]);
+
+// `pm2 jlist` is supposed to emit only JSON, but pm2 has a habit of printing
+// update notices and deprecation warnings ahead of it. Parse the array out of
+// the noise rather than failing open on a preamble, since failing open here
+// means the pause silently goes unverified.
+function parsePm2List(output) {
+  const raw = String(output || '').trim();
+  if (!raw) return null;
+  try {
+    const direct = JSON.parse(raw);
+    return Array.isArray(direct) ? direct : null;
+  } catch {
+    // fall through to preamble stripping
+  }
+  // Do NOT assume the first '[' opens the array: pm2 prefixes its own notices
+  // with a literal "[PM2]", so anchoring on the first bracket picks up the
+  // warning and fails to parse — precisely the case this salvage exists for.
+  // Try every '[' in order and take the first that yields an array.
+  const end = raw.lastIndexOf(']');
+  if (end === -1) return null;
+  for (let start = raw.indexOf('['); start !== -1 && start < end; start = raw.indexOf('[', start + 1)) {
+    try {
+      const salvaged = JSON.parse(raw.slice(start, end + 1));
+      // Only a NON-EMPTY array is trustworthy here. A genuinely empty process
+      // list serializes as exactly `[]` and is handled by the direct parse
+      // above; reaching this path with an empty array instead means we matched
+      // a bracket pair inside pm2's own noise (`[PM2] warning []`), and
+      // reporting that as "nothing is running" would silently pass the pause
+      // verification. Fall through to null so it is reported as unreadable.
+      if (Array.isArray(salvaged) && salvaged.length) return salvaged;
+    } catch {
+      // keep scanning — this '[' was noise, not the array
+    }
+  }
+  return null;
+}
+
+function onlinePm2Apps(names, config, ctx) {
+  const res = runOnTarget('pm2 jlist', config, { capture: true, runtime: ctx.runtime });
+  if (!res.ok) return null;
+  const list = parsePm2List(res.output);
+  if (list === null) return null;
+  const online = new Set();
+  for (const proc of list) {
+    if (!proc || !names.includes(proc.name)) continue;
+    const status = (proc.pm2_env && proc.pm2_env.status) || proc.status;
+    if (ACTIVE_PM2_STATUSES.has(status)) online.add(proc.name);
+  }
+  return online;
+}
+
 // A step that must succeed or the whole deploy aborts. onFail runs first
 // (e.g. restart the apps we paused) so we never leave services stopped.
 function gate(step, config, ctx, { onFail, capture = false } = {}) {
@@ -281,9 +349,46 @@ function deploy(config, options = {}, ctx = {}) {
         // Stop DB-bound processes BEFORE the backup — matches release.js
         // (:488-494): a writer left online during the snapshot can produce an
         // inconsistent backup, defeating the entire reason the backup gate exists.
+        //
+        // The stop itself is tolerant twice over (`|| true` AND `tolerate: true`
+        // below) because `pm2 stop` legitimately errors when an app isn't
+        // running or isn't registered yet — that must never fail a deploy. But
+        // a tolerant stop is not proof anything actually stopped, so verify it:
+        // snapshot which dbBoundApps are online BEFORE the attempt, then assert
+        // none of THOSE are still online after. Scoped to apps we observed
+        // online — one that was already stopped, or was never registered, is
+        // not this deploy's problem and must not turn into a spurious abort.
+        const onlineBeforePause = onlinePm2Apps(config.dbBoundApps, config, c);
+
         run(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`,
           `pm2 stop ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, { tolerate: true });
         dbAppsPaused = true;
+
+        if (onlineBeforePause === null) {
+          // Can't tell what was running before the attempt — assert nothing,
+          // same "unknown, don't invent a failure" contract as below.
+          log.warning('Skipping DB-bound pause verification: `pm2 jlist` was unreadable before the pause attempt.');
+        } else if (onlineBeforePause.size) {
+          const onlineAfterPause = onlinePm2Apps(config.dbBoundApps, config, c);
+          if (onlineAfterPause === null) {
+            // A pm2/jq quirk on this host must not brick the deploy — log and
+            // proceed rather than invent a failure from unreadable output.
+            log.warning('Skipping DB-bound pause verification: `pm2 jlist` was unreadable after the pause attempt.');
+          } else {
+            const stillOnline = [...onlineBeforePause].filter((name) => onlineAfterPause.has(name));
+            if (stillOnline.length) {
+              // Same recovery contract as every other gate in this window: resume
+              // whatever we paused before aborting, so a failure here never
+              // leaves production stopped.
+              resumeDbApps();
+              throw new Error(
+                `Deploy aborted: DB-bound app(s) still running after the pause step (${stillOnline.join(', ')}) — `
+                + 'a writer left online during the pre-migration backup can produce an inconsistent backup. '
+                + 'A resume was attempted; `pm2 start` failures are not surfaced, so confirm with `pm2 status`.',
+              );
+            }
+          }
+        }
       }
       if (config.hooks.backup) {
         // Backup BEFORE migrating, AFTER writers are stopped. A failed backup must
