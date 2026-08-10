@@ -57,6 +57,14 @@ The `.deploy-kit.config.json` holding your real host/paths lives in each
 **consumer** repo, never in this package. The config is validated on load —
 unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 `ensureTunnelOnDeploy`) fail with a clear error instead of a silent no-op.
+This includes NESTED keys, not just top-level ones (unreleased) — a typo like
+`hooks.migarte` is rejected by name at load, the same as a top-level typo,
+instead of silently validating fine and leaving `hooks.migrate` at its
+default. Covers `hooks`, `health`, `ssh`, `layout`, `deliveryEvent`, and every
+`monitor` sub-block (`disk`/`backup`/`restartStorm`/`alert`, on top of
+`monitor` itself). The one deliberate exception: `healthHeaders` and a public
+probe's `headers` are raw HTTP-header maps — the "key" there is a header name
+the operator chooses, not a fixed config field, so those stay open to any key.
 
 ### Config reference
 
@@ -73,7 +81,7 @@ unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 | `ensureApps` | `string[]` | `[]` | both | 0.4 | Auxiliary PM2 procs ensured up (tolerant) AFTER the app restart. A failure never fails the deploy. |
 | `preDeployChecks` | `{name,command}[]` | `[]` | both | 0.4 | Gates run BEFORE anything is touched; non-zero aborts with nothing changed. |
 | `postDeployChecks` | `{name,command}[]` | `[]` | both | 0.8 | Gates run after restart and every health probe succeeds; use public smoke journeys and asset checks. A failure reports the deploy as failed but does not silently roll back the live revision. |
-| `preRestartChecks` | `{name,command}[]` | `[]` | both | 0.10 | Gates run IMMEDIATELY BEFORE the app restart (after build, with `dbBoundApps` still paused; after the release-layout flip). A failure resumes any paused apps (legacy) or runs phase recovery (release layout) before aborting. Also gates `rollback`'s restart. Use for a check against the freshly-built/flipped candidate right before it takes traffic — e.g. `port-guard` (see below). |
+| `preRestartChecks` | `{name,command}[]` | `[]` | both | 0.10 | Gates run IMMEDIATELY BEFORE the app restart (after build, with `dbBoundApps` still paused; after the release-layout flip). A failure resumes any paused apps (legacy deploy) or runs phase recovery (release-layout deploy) before aborting. Also gates `rollback`'s restart, for both layouts — under the release layout, `current` is flipped to the rollback target BEFORE this check runs, so a failure here flips `current` back and re-verifies the original release before aborting; it never leaves the symlink pointing somewhere the running process disagrees with (unreleased — this used to throw straight out, mid-flip). If the flip-BACK itself also fails, PM2 is deliberately left untouched and the error escalates to `MANUAL RECOVERY REQUIRED` — restarting against an unconfirmed `current` could activate the very release the recovery was trying to move away from, which is worse than doing nothing (unreleased). Use for a check against the freshly-built/flipped candidate right before it takes traffic — e.g. `port-guard` (see below). |
 | `ecosystemFile` | `string \| null` | `null` | both | 0.3 | PM2 ecosystem file (rel. to `projectDir`). Enables first-deploy-safe `pm2 start … --only … --update-env \|\| pm2 restart … --update-env`; each deploy refreshes process env from the ecosystem file. |
 | `port` | `number` | `3000` | both | 0.1 | Health-probe port (`http://localhost:<port>`). |
 | `healthPath` | `string` | `'/api/health'` | both | 0.1 | Health-probe path. |
@@ -116,7 +124,7 @@ unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
 | `monitor.stateFile` | `string` | `<dir>/.deploy-kit-monitor-state.json` | both | 0.8 | Abs path to monitor state — a STABLE dir, never under `releases/`. |
 | `monitor.checkTimeoutSeconds` | `number` | `20` | both | 0.8 | Per-check wall-clock bound. |
 | `deliveryEvent` | `{command} \| null` | `null` | both | 0.9 | Opt-in post-health delivery event (see `announce-discord` below). `null` = skip. `command` is the only valid key — a typo (e.g. `comand`) is now rejected at config load (unreleased) instead of silently no-op'ing the feature. |
-| `deliveryEvent.command` | `string` | — | both | 0.9 | Shell command run on the target; receives structured deployment JSON (`event`, `status`, `branch`, `revision`, `deployedAt`, `backupReference?`) on **stdin**. A failure is reported but never turns a healthy deploy into a rollback. |
+| `deliveryEvent.command` | `string` | — | both | 0.9 | Shell command run on the target; receives structured deployment JSON (`event`, `status`, `branch`, `revision`, `deployedAt`, `backupReference?`) on **stdin**. A failure never turns a healthy deploy into a rollback, but it is reported: a warning is logged and `DeployResult.deliveryEvent = { delivered: false }` (both legacy `deploy()` and the release layout; unreleased). |
 
 ### mode: local
 
@@ -161,7 +169,13 @@ SHA (`layout.runningShaCommand`), PM2 online state, and a restart-count settling
 window before the deploy is called healthy. `rollback` is an instant flip back to
 `previous` (already built). A failed deploy recovers per phase and, if a migration
 had already run, restores the backup (`hooks.restore`) or stops with `MANUAL
-RECOVERY REQUIRED` — it never resumes stale code against a migrated schema.
+RECOVERY REQUIRED` — it never resumes stale code against a migrated schema. If the
+symlink flip-BACK during that recovery itself fails, PM2 is deliberately left
+untouched (never restarted onto whatever `current` still resolves to — possibly the
+failed candidate) and the failure escalates to `MANUAL RECOVERY REQUIRED` naming
+the still-active target; a migration's DB restore still runs regardless (writers
+were already confirmed stopped, so it's a safe, traffic-independent data operation)
+but nothing is resumed (unreleased).
 
 **Flag semantics differ by layout** — the same flag can mean something
 different, or nothing, depending on which pipeline is running:
@@ -326,8 +340,24 @@ isn't four correlated pages), delivered to `alert.command` as JSON on **stdin**;
 event is persisted to `stateFile` *before* sending and retained for retry if delivery
 fails (at-least-once; the `eventId` lets your sink dedupe). `alert.run: 'controller'`
 runs the sink on the machine running deploy-kit (robust when the monitored app is what's
-down); `'target'` runs it on the host. Exit codes: `0` ok/warn · `1` a critical
-condition · `2` a monitor/config/delivery failure. Provider/scheduler-specific signals
+down); `'target'` runs it on the host. Exit codes, in precedence order (unreleased —
+this used to be CRITICAL-or-OK only, `2` was unreachable, and a crit whose alert
+delivery failed silently ranked above a crit whose delivery succeeded, with no single
+place in the code deciding it): **(1)** alert delivery to `alert.command` FAILED this
+run → `2` — this outranks even a crit. Counterintuitive, so: once delivery fails, the
+exit code is the ONLY channel left that still tells anyone anything — a crit whose
+alert WAS delivered already reached the operator through the sink, so `1` is just
+confirmation; a crit whose delivery FAILED reached nobody, and `1` alone would
+understate that. Rank by how much the operator can actually learn from this run, not
+by which signal sounds scariest in isolation. **(2)** else any check `crit` → `1` — a
+real critical condition that DID get through (delivered, or nothing needed delivering
+yet — e.g. still inside the debounce window). **(3)** else any check `unknown` (ssh
+down, a probe timed out, …), or **zero checks configured at all** (a `monitor` block
+only requires `alert` — one with no disk/backup/tunnel/probes/checks/appNames
+inspects nothing, every run) → `2`, a monitor/config/delivery failure — this is *any*,
+not *all*: a run where four of five checks are unknown and one is `ok` still exits
+`2`, because blindness about even one configured check must not be silently folded
+into "all fine". **(4)** else → `0`. Provider/scheduler-specific signals
 belong in `checks[]` (statically-severitied) so they alert without flapping liveness —
 keep the app's own `/live` vs `/ready` split app-side.
 
@@ -429,7 +459,7 @@ npx deploy-kit logs [--lines N] [--follow] [--errors]
 | `rollback` | `--skip-build` `--skip-deps` `--dry-run` `--steal-lock` `--no-lock` | Reset to the recorded pre-deploy SHA, rebuild, restart, health-gate. Does **not** accept `--skip-migrate` or `--no-stash` — rollback never reads them. Under the release layout, `--skip-build`/`--skip-deps` are rejected (rollback is an instant flip to an already-built release — see Release layout below). |
 | — `--dry-run` | | Prints the exact command stream and mutates nothing. A handful of genuinely read-only preflight probes (release-layout host migration marker, interrupted-deploy state, `current`/`previous` pointers, GNU `mv`, free disk) run for real against the target so `--dry-run` reflects the host's actual state instead of asserting every read comes back empty — see Release layout below. |
 | `monitor` | `--steal-lock` `--no-lock` `--local` | Run the `monitor` checks, alert on transitions, exit `0`/`1`/`2`. For a cron. `--local` (Since 0.19) forces `mode:'local'` for this run. |
-| `status` / `health` / `resources` / `git` / `dashboard` | — | Read-only target inspection. |
+| `status` / `health` / `resources` / `git` / `dashboard` | — | Read-only target inspection. Exits `1` if the underlying command(s) didn't actually run (e.g. the SSH connection failed) — `dashboard` exits `1` if any of `status`/`health`/`git` does (unreleased; these used to exit `0` regardless). |
 | `start` / `stop` / `restart` | — | PM2 lifecycle over `appNames`. Take **no** flags — including no `--dry-run`; these always run for real, and passing any flag (e.g. a typo'd `--dry-run`) is rejected rather than silently ignored. |
 | `logs` | `--lines N` `--follow` `--errors` | Tail PM2 logs for `appNames`. |
 
@@ -449,6 +479,20 @@ deploy(loadConfig());
 
 ## Safety behavior
 
+- **Rollback pointer gate** — before fetch/pull touch anything, the legacy
+  (non-release-layout) deploy reads HEAD independently and compares it to the
+  pre-pull SHA it just recorded, aborting if they disagree — not merely
+  checking that the recorded value LOOKS like a SHA (unreleased fix: a write
+  that fails to overwrite an EXISTING, readable pointer — read-only fs,
+  permissions, a full disk stopping the redirect from truncating — used to
+  leave the OLD, still-plausible-looking SHA in place, and the deploy
+  proceeded with that silently STALE pointer). An unborn branch / a brand-new
+  repo with no commits yet (HEAD undeterminable) is treated as a legitimate
+  first deploy, not a recording failure — there is genuinely nothing to roll
+  back to yet, so nothing is gated; `deploy-kit rollback` reports that
+  honestly if it's ever run before a first successful deploy. Accepts both
+  git object-hash formats (40-char SHA-1, 64-char SHA-256). The release layout
+  is unaffected (its rollback is a symlink flip, not this pointer).
 - **Backup before migrate** — a failed `hooks.backup` aborts before any schema change.
 - **SQLite-lock release** — `dbBoundApps` are `pm2 stop`ped before migrate and
   restarted on any post-stop failure, so a crashed migration/build never leaves

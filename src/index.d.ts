@@ -188,6 +188,10 @@ export interface DeployResult {
   sha?: string;
   /** Activated release id, `<sha12>-<ts>` (release layout only). */
   release?: string;
+  /** Present only when `deliveryEvent.command` is configured. `delivered: false`
+   * means the command failed -- logged as a warning, but this never fails the
+   * deploy (see `deliveryEvent.command` below). */
+  deliveryEvent?: { delivered: boolean };
 }
 
 export interface Runtime {
@@ -290,8 +294,13 @@ export interface RemoteOps {
   start(config: DeployConfig, ctx?: DeployContext): boolean;
   stop(config: DeployConfig, ctx?: DeployContext): boolean;
   restart(config: DeployConfig, ctx?: DeployContext): boolean;
+  /** true only if every underlying inspection command actually ran and exited 0
+   * (an unreachable target returns false, not a printed-nothing true). */
   resources(config: DeployConfig, ctx?: DeployContext): boolean;
+  /** true only if every underlying inspection command actually ran and exited 0
+   * (an unreachable target returns false, not a printed-nothing true). */
   gitInfo(config: DeployConfig, ctx?: DeployContext): boolean;
+  /** Composes status + health + gitInfo; true only if all three succeed. */
   dashboard(config: DeployConfig, ctx?: DeployContext): boolean;
   allApps(config: DeployConfig): string[];
 }

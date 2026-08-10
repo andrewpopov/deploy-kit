@@ -42,6 +42,11 @@ const baseConfig = mergeConfig(DEFAULT_CONFIG, {
 // more than one queue entry). A response past the end of the queue comes back
 // as '' (unreadable), matching a real target that has simply stopped
 // answering.
+// Plausible 40-hex SHA every fake here answers a `prev-sha` read with, so
+// deploy()'s rollback-pointer gate (PKG-135 Finding 1) doesn't trip on
+// fixtures that never modeled that file at all.
+const PLAUSIBLE_SHA = 'a'.repeat(40);
+
 function makeRuntime({ jlistResponses = [] as string[], fail = [] as string[] } = {}) {
   const calls: string[] = [];
   let jlistIndex = 0;
@@ -60,6 +65,7 @@ function makeRuntime({ jlistResponses = [] as string[], fail = [] as string[] } 
       return response !== undefined ? response : '';
     }
     if (cmd.includes('curl')) return '200';
+    if (cmd.includes('prev-sha')) return PLAUSIBLE_SHA;
     return '';
   };
   return { runtime: { execFileSync }, calls };
@@ -100,6 +106,7 @@ describe('deploy(): DB-bound app pause verification', () => {
         return jlistIndex++ === 0 ? onlineJlist('app') : stoppedJlist('app');
       }
       if (cmd.includes('curl')) return '200';
+      if (cmd.includes('prev-sha')) return PLAUSIBLE_SHA;
       return '';
     };
     deploy(baseConfig, {}, ctxWith({ execFileSync }));

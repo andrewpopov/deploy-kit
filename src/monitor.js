@@ -162,7 +162,12 @@ function monitor(config, options = {}, ctx = {}) {
     // ---- OUTBOX: accumulate any undelivered prior alerts + this run's, deliver once ----
     const pending = state.pendingEvent;
     const allAlerts = [...(pending ? pending.alerts : []), ...newAlerts];
-    let exitCode = results.some((r) => r.status === 'crit') ? EXIT.CRITICAL : EXIT.OK;
+    // Tracked here, used only in the SINGLE exit-code precedence block below
+    // (PKG-135 Finding A) -- this is deliberately just a plain flag, not an
+    // early `exitCode` assignment, so there is exactly one place in this
+    // function that decides the exit code, not one rule here and a second,
+    // silently overriding one 30 lines away (which is what this replaced).
+    let deliveryFailed = false;
 
     if (allAlerts.length) {
       const event = {
@@ -182,10 +187,45 @@ function monitor(config, options = {}, ctx = {}) {
         log.success(`monitor: delivered ${event.alerts.length} alert(s) (event ${event.eventId})`);
       } else {
         log.error(`monitor: alert delivery FAILED (event ${event.eventId} retained for retry)`);
-        exitCode = EXIT.MONITOR_ERROR;
+        deliveryFailed = true;
       }
     } else {
       writeState(config, c, { version: STATE_VERSION, checks: nextChecks, pendingEvent: null });
+    }
+
+    // Exit-code precedence (PKG-135 Finding 3, corrected by Finding A). ONE
+    // ordering, in ONE place, covering every signal this run produced:
+    //   1. alert delivery FAILED -> MONITOR_ERROR. This outranks even a crit.
+    //      It looks backwards at first glance -- a real critical condition
+    //      seems like it should always win -- but think about what the exit
+    //      code is FOR: once delivery fails, it is the ONLY channel left that
+    //      still works. A crit whose alert WAS delivered already reached the
+    //      operator through the alert sink; exit 1 is just confirmation. A
+    //      crit whose alert delivery FAILED reached NOBODY -- the exit code
+    //      has to carry that alarm itself, and "1" (a plain crit, alert
+    //      presumed delivered) would UNDERSTATE it. Rank by "how much can the
+    //      operator learn from what this run produced", not by which signal
+    //      sounds scariest in isolation.
+    //   2. else any check `crit` -> CRITICAL. A real critical condition that
+    //      DID get through (delivered, or nothing needed delivering yet --
+    //      e.g. still inside the debounce window) is reported for what it is.
+    //   3. else any check `unknown`, or EMPTY results (`monitor.alert` is the
+    //      only required monitor key -- a block with nothing else configured
+    //      inspects NOTHING, every run, forever) -> MONITOR_ERROR. Partial or
+    //      total blindness about the target, but the alert channel itself is
+    //      fine.
+    //   4. else -> OK.
+    // This does not touch stepCheck's debounce/hold logic above (a lone
+    // unknown still just holds, per-check) -- it only decides the exit code.
+    let exitCode;
+    if (deliveryFailed) {
+      exitCode = EXIT.MONITOR_ERROR;
+    } else if (results.some((r) => r.status === 'crit')) {
+      exitCode = EXIT.CRITICAL;
+    } else if (results.some((r) => r.status === 'unknown') || results.length === 0) {
+      exitCode = EXIT.MONITOR_ERROR;
+    } else {
+      exitCode = EXIT.OK;
     }
 
     for (const r of results) {

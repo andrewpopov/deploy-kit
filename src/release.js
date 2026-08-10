@@ -403,15 +403,45 @@ function deployRelease(config, options = {}, ctx = {}) {
             fail('a migration ran but DB writers could not be confirmed stopped; do NOT restore over live writers — resolve by hand');
           }
         }
+        // PKG-135 Finding B's twin: `activateSymlink(..., { tolerate: true })`
+        // neither throws nor reports success on its own -- the ORIGINAL code
+        // threw the return value away here and unconditionally resumed the
+        // previous release next, so a flip-back that silently failed left
+        // `current` pointing at the failed CANDIDATE while PM2 got restarted
+        // regardless -- restarting onto the very release this recovery
+        // exists to move away from. `flippedBack` stays `true` when no flip
+        // was even attempted (st.flipped was never set), matching the ORIGINAL
+        // no-op behavior for that case.
+        let flippedBack = true;
         if (st.flipped && st.prevTarget) {
           log.warning(`Flipping current back to ${st.prevTarget}`);
-          activateSymlink(config, paths, st.prevTarget, c, { tolerate: true });
+          flippedBack = activateSymlink(config, paths, st.prevTarget, c, { tolerate: true });
         }
+        // DB restore ordering is UNCHANGED (writers-stopped -> flip -> restore,
+        // per the Codex #1 comment above) and runs REGARDLESS of whether the
+        // flip-back took: writers were already confirmed stopped above, so
+        // nothing is racing the restore either way, and this DELIBERATELY
+        // still restores even when the flip-back failed -- leaving a migrated
+        // (post-schema-change) DB paired with `current` reverting to
+        // pre-migration code (whenever an operator eventually fixes the
+        // symlink by hand) is its own hazard, and this is a plain data
+        // operation, not a traffic-affecting one. What must NOT happen is
+        // resuming traffic onto an unconfirmed `current` -- that's gated
+        // below, separately.
         if (st.migrated) {
           if (!restoreDb()) {
             fail(`a migration ran but the DB could not be auto-restored (backup ${st.backupId || 'unknown'}); restore it by hand before serving traffic`);
           }
           log.warning(`Restored pre-migration DB backup ${st.backupId || ''}`);
+        }
+        if (!flippedBack) {
+          fail(
+            `the symlink flip-back to ${st.prevTarget} itself failed; \`current\` may still point at the failed `
+            + `candidate release (${st.releaseId || st.releaseDir || 'unknown'}). PM2 was deliberately NOT `
+            + 'restarted, since doing so could activate that candidate instead of the previous release'
+            + (st.migrated ? ' (the pre-migration DB backup WAS restored above -- writers were already confirmed stopped, so that was safe regardless of the symlink state)' : '')
+            + '. Manually confirm what `current` points at, and what (if anything) is actually running, before touching PM2 yourself',
+          );
         }
         if (!resumePrevious().ok) fail('the previous release did not come back healthy after DB/symlink recovery');
         markRecovered();
@@ -660,6 +690,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       if (!result.ok) throw new Error(`Post-deploy check failed: ${check.name}`);
       steps.push(`post-check:${check.name}`);
     }
+    let deliveryEvent;
     if (config.deliveryEvent?.command) {
       // Backup hooks often return a host-local path. The delivery event is a
       // cross-system audit record, so expose only its opaque leaf reference.
@@ -672,11 +703,23 @@ function deployRelease(config, options = {}, ctx = {}) {
         deployedAt: new Date().toISOString(),
         ...(backupReference ? { backupReference } : {}),
       });
-      runInDir(paths.root, config.deliveryEvent.command, config, c, {
+      // Non-gating by design (tolerate: true) -- a broken announcement must
+      // never turn an already-verified, already-activated release into a
+      // failure. But "reported" has to mean something observable (PKG-135
+      // Finding 7, same treatment as deploy.js's legacy pipeline): a warning
+      // plus the delivery status on the result, not a silent sink.
+      const delivery = runInDir(paths.root, config.deliveryEvent.command, config, c, {
         tolerate: true,
         input: payload,
       });
       steps.push('delivery-event');
+      if (!delivery.ok) {
+        log.warning(
+          'Delivery event command failed (deliveryEvent.command); the event was NOT delivered. This does not '
+          + 'fail the deploy, but the receiving system never heard about this deployment.',
+        );
+      }
+      deliveryEvent = { delivered: delivery.ok };
     }
 
     // ---- Phase: metadata + prune (success; still holding the lock) ----
@@ -686,7 +729,10 @@ function deployRelease(config, options = {}, ctx = {}) {
     steps.push('prune');
 
     log.success(`Deployment completed successfully (release ${releaseId})`);
-    return { branch, mode: config.mode, host: config.host, sha: st.sha, release: releaseId, steps, healthy: true };
+    return {
+      branch, mode: config.mode, host: config.host, sha: st.sha, release: releaseId, steps, healthy: true,
+      ...(deliveryEvent ? { deliveryEvent } : {}),
+    };
   } catch (err) {
     recover(err);
     throw err;
@@ -701,6 +747,11 @@ function deployRelease(config, options = {}, ctx = {}) {
 // then GNU `mv -T` renames it over the target (a single namespace op on ext4 —
 // readers see the old or new link, never a missing one). Relative target so the
 // tree can be relocated. `link` overrides which symlink is written (current by default).
+// Returns whether the swap actually took (PKG-135 Finding B) -- a `tolerate:
+// true` caller that ignores this return value gets the OLD behavior (log
+// nothing, throw nothing, keep going); a caller that needs to know whether
+// `current` actually moved before deciding what to do next (recovery, below)
+// can now ask.
 function activateSymlink(config, paths, relTarget, ctx, { link, tolerate = false } = {}) {
   const dest = link || paths.currentLink;
   const tmp = `${paths.root}/.dk-swap.$$.${dest.split('/').pop()}`;
@@ -710,6 +761,7 @@ function activateSymlink(config, paths, relTarget, ctx, { link, tolerate = false
     runOnTarget(`rm -f ${tmp} 2>/dev/null || true`, { ...config, projectDir: paths.root }, { runtime: ctx.runtime });
     if (!tolerate) throw new Error(`Deploy aborted: atomic symlink swap failed (${dest})`);
   }
+  return res.ok;
 }
 
 // Persist explicit release metadata (never inferred) ATOMICALLY: write a same-dir
@@ -747,6 +799,51 @@ function prune(config, paths, keepId, ctx) {
     runOnTarget(`git --git-dir=${paths.repoGit} worktree remove --force ${dir} 2>/dev/null || rm -rf ${dir}`, { ...config, projectDir: paths.root }, { runtime: ctx.runtime });
   }
   runOnTarget(`git --git-dir=${paths.repoGit} worktree prune 2>/dev/null || true`, { ...config, projectDir: paths.root }, { runtime: ctx.runtime });
+}
+
+// Post-flip rollback recovery (PKG-135 Finding 5), shared by every failure path
+// that can occur AFTER `current` has already been flipped to the rollback
+// target: a failing preRestartCheck, or an activation that never verifies
+// healthy. Nothing after the flip may throw without first attempting this --
+// the alternative is `current` pointing at the rolled-back release while the
+// ORIGINAL process (never restarted) is still the one actually serving
+// traffic, which is the worst state to be in mid-incident: the symlink and
+// the running process disagree about what's live. `reason` is a plain
+// description of what triggered the recovery (a failed check, an unhealthy
+// verification, ...) -- this ALWAYS throws: either a "restored, here's what
+// triggered it" error, or MANUAL RECOVERY when the restore itself can't be
+// confirmed (no safe originalCurrent to restore to, or the restored release
+// doesn't come back healthy either).
+function recoverFailedRollback(config, paths, originalCurrent, c, reason) {
+  c.log.error(`${reason}; flipping back to ${originalCurrent}`);
+  if (!(originalCurrent && RELEASE_TARGET_RE.test(originalCurrent))) {
+    throw new Error(`MANUAL RECOVERY REQUIRED — ${reason} and no safe original release to restore.`);
+  }
+  // PKG-135 Finding B: the flip-back itself can fail (permissions, disk,
+  // whatever broke the forward flip could just as easily break this one) --
+  // `activateSymlink(..., { tolerate: true })` neither throws nor reports
+  // that on its own, so a blind `pm2Activate` right after it would restart
+  // PM2 against WHATEVER `current` still points at, which may still be the
+  // release that just failed its own check/verification. That is WORSE than
+  // doing nothing: it can activate the very target this recovery exists to
+  // move away from. So: check the flip-back's own result FIRST. If it did
+  // not take, do not touch PM2 at all -- change nothing further and shout.
+  const flipped = activateSymlink(config, paths, originalCurrent, c, { tolerate: true });
+  if (!flipped) {
+    throw new Error(
+      `MANUAL RECOVERY REQUIRED — ${reason} AND the recovery symlink swap back to ${originalCurrent} itself `
+      + `failed. \`current\` (${paths.currentLink}) may still point at the release this recovery was trying to `
+      + 'move away from -- PM2 was deliberately NOT restarted, since doing so could activate that release '
+      + 'instead of restoring the original one. Manually confirm what `current` points at and what is actually '
+      + 'running before touching PM2 yourself.',
+    );
+  }
+  runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
+  const back = verifyActivation(config, paths, null, `${paths.root}/${originalCurrent}`, c);
+  if (!back.ok) {
+    throw new Error(`MANUAL RECOVERY REQUIRED — ${reason} AND the original release did not come back (${back.reason}).`);
+  }
+  throw new Error(`Rollback aborted: ${reason}; restored the original release ${originalCurrent}.`);
 }
 
 // Release-layout rollback: flip `current` back to the recorded previous release and
@@ -792,10 +889,20 @@ function rollbackRelease(config, options = {}, ctx = {}) {
     activateSymlink(config, paths, pointers.previous, c);
     // Pre-restart checks: gated, run IMMEDIATELY BEFORE the pm2 restart, same as
     // the forward deploy — a rollback restart is just as capable of colliding
-    // with a squatting process as a forward one.
+    // with a squatting process as a forward one. `current` has ALREADY been
+    // flipped by this point, so a failing check here must not be allowed to
+    // throw straight out of this function (PKG-135 Finding 5) — that would
+    // leave `current` pointing at the rollback target while the original
+    // process (never restarted) is still what's actually running. Route the
+    // failure through the same post-flip recovery the unhealthy-verification
+    // path below uses.
     for (const check of config.preRestartChecks) {
       log.step(`Pre-restart check: ${check.name}`);
-      runInDir(paths.root, check.command, config, c);
+      try {
+        runInDir(paths.root, check.command, config, c);
+      } catch (err) {
+        recoverFailedRollback(config, paths, originalCurrent, c, `Pre-restart check "${check.name}" failed during rollback (${err.message})`);
+      }
     }
     runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
     runInDir(paths.root, 'pm2 save 2>/dev/null || true', config, c, { tolerate: true });
@@ -803,15 +910,7 @@ function rollbackRelease(config, options = {}, ctx = {}) {
     const v = verifyActivation(config, paths, null, `${paths.root}/${pointers.previous}`, c);
     if (!v.ok) {
       // The target release did not come up. Restore the release that WAS running.
-      log.error(`Rollback target unhealthy (${v.reason}); flipping back to ${originalCurrent}`);
-      if (originalCurrent && RELEASE_TARGET_RE.test(originalCurrent)) {
-        activateSymlink(config, paths, originalCurrent, c, { tolerate: true });
-        runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
-        const back = verifyActivation(config, paths, null, `${paths.root}/${originalCurrent}`, c);
-        if (!back.ok) throw new Error(`MANUAL RECOVERY REQUIRED — rollback target unhealthy AND the original release did not come back (${back.reason}).`);
-        throw new Error(`Rollback aborted: target ${pointers.previous} was unhealthy (${v.reason}); restored the original release ${originalCurrent}.`);
-      }
-      throw new Error(`MANUAL RECOVERY REQUIRED — rollback target unhealthy (${v.reason}) and no safe original release to restore.`);
+      recoverFailedRollback(config, paths, originalCurrent, c, `Rollback target ${pointers.previous} was unhealthy (${v.reason})`);
     }
 
     log.success(`Rolled back to ${pointers.previous}`);

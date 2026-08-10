@@ -86,6 +86,10 @@ function makeUniversalRuntime(appNames: string[]) {
     if (cmd.includes('mv --version')) return 'mv (GNU coreutils) 9.1';
     if (cmd.includes('df -kP') || cmd.includes('df -Pk')) return '99999999';
     if (cmd.includes('date -u')) return '20260710T090000Z';
+    // Also answers PKG-135 Finding 1's read-back of the prev-sha pointer
+    // (`cat <prevShaFile>`) deploy.js now issues right after recording it —
+    // that command doesn't contain "rev-parse", so it needs its own match.
+    if (cmd.includes('.prev-sha')) return SHA;
     if (cmd.includes('rev-parse HEAD')) return SHA;
     if (cmd.includes('rev-parse')) return SHA;
     if (cmd.includes('readlink -f')) return '/canonical';
@@ -184,10 +188,18 @@ function applyIntentionalDeltas(oldSeq: string[], config: unknown): string[] {
   // whole string, and preserve whatever prefix this consumer's mode/host
   // produced.
   const prevShaLine = `git rev-parse HEAD > ${lock.prevShaFile(config)} 2>/dev/null || true`;
+  // Captured from the PRISTINE (pre-Delta-3) line, before ensureStateDir's
+  // multi-line preamble gets folded in below -- this is the plain `cd <dir> && `
+  // target-command prefix every OTHER single-line command in the sequence also
+  // carries, and it's what Delta 7 (below) needs for the new read-back command
+  // it inserts as its own separate call, not glued onto this multi-line write.
+  const prevShaCdPrefix = (() => {
+    const line = seq.find((cmd) => cmd.endsWith(prevShaLine));
+    return line ? line.slice(0, line.length - prevShaLine.length) : '';
+  })();
   seq = seq.map((cmd) => {
     if (!cmd.endsWith(prevShaLine)) return cmd;
-    const prefix = cmd.slice(0, cmd.length - prevShaLine.length);
-    return `${prefix}${lock.ensureStateDir(config)}\n${prevShaLine}`;
+    return `${prevShaCdPrefix}${lock.ensureStateDir(config)}\n${prevShaLine}`;
   });
 
   // Delta 4 (security, release layout): the SAME defense-in-depth quoting as
@@ -269,6 +281,32 @@ function applyIntentionalDeltas(oldSeq: string[], config: unknown): string[] {
       const prefix = pauseLine.slice(0, pauseLine.indexOf('pm2 stop'));
       const jlistLine = `${prefix}pm2 jlist`;
       seq = [...seq.slice(0, pauseIdx), jlistLine, pauseLine, jlistLine, ...seq.slice(pauseIdx + 1)];
+    }
+  }
+
+  // Delta 7 (PKG-135 Finding 1 + Finding C, data integrity, LEGACY layout
+  // only): the prev-sha write immediately above is tolerated (its own
+  // `|| true` makes `res.ok` true even when `git rev-parse HEAD` or the
+  // redirect itself failed), so a green write was not proof `deploy-kit
+  // rollback` had anything usable to reset to -- and merely reading the
+  // pointer back and checking it LOOKS like a SHA isn't enough either: a
+  // write that fails to overwrite an EXISTING, readable file leaves a STALE
+  // sha in place, which still looks plausible. deploy.js now reads HEAD
+  // independently (bare `git rev-parse HEAD`, no redirect) and compares it
+  // against the recorded pointer, ABORTING before fetch/pull if they
+  // disagree. Anchored to the SAME `prevShaLine`/`lock.prevShaFile` used by
+  // Delta 3 above (not retyped), so it can't drift the next time that path
+  // changes — inserts the bare HEAD read, THEN the `cat <prevShaFile>` read
+  // (that order: deploy.js reads HEAD first, and only reads the file at all
+  // once HEAD comes back non-empty), both carrying the same prefix, right
+  // after the write. Scoped to the legacy layout only: release.js's own
+  // rollback is a symlink flip and never reads this pointer at all.
+  if (!isReleaseLayout) {
+    const writeIdx = seq.findIndex((cmd) => cmd.endsWith(prevShaLine));
+    if (writeIdx !== -1) {
+      const headLine = `${prevShaCdPrefix}git rev-parse HEAD`;
+      const readLine = `${prevShaCdPrefix}cat ${lock.prevShaFile(config)} 2>/dev/null || true`;
+      seq = [...seq.slice(0, writeIdx + 1), headLine, readLine, ...seq.slice(writeIdx + 1)];
     }
   }
 

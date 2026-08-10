@@ -202,6 +202,36 @@ describe('release deploy — happy path', () => {
     expect(JSON.stringify(event)).not.toContain('/var/lib/smarthome/backups');
   });
 
+  // PKG-135 Finding 7: same non-gating-but-honest treatment as deploy.js's
+  // legacy pipeline (Finding 4) — a broken announcement must never fail an
+  // already-verified, already-activated release, but "reported" has to mean
+  // something observable: a warning plus a delivery status on the result.
+  it('a successful delivery event is reflected in the result, with no warning', () => {
+    const { runtime } = makeReleaseRuntime();
+    const warnings: string[] = [];
+    const log = { ...kit.makeLogger(() => {}, () => {}), warning: (m: string) => warnings.push(m) };
+    const result = release.deployRelease(relConfig({ deliveryEvent: { command: 'emit-event' } }), {}, { ...ctx(runtime), log });
+    expect(result.deliveryEvent).toEqual({ delivered: true });
+    expect(warnings.some((w) => /[Dd]elivery event/.test(w))).toBe(false);
+  });
+
+  it('a failing delivery event command warns, records delivered:false, and does NOT fail the release', () => {
+    const { runtime } = makeReleaseRuntime({ fail: ['emit-event'] });
+    const warnings: string[] = [];
+    const log = { ...kit.makeLogger(() => {}, () => {}), warning: (m: string) => warnings.push(m) };
+    const result = release.deployRelease(relConfig({ deliveryEvent: { command: 'emit-event' } }), {}, { ...ctx(runtime), log });
+    expect(result.healthy).toBe(true); // non-gating: still a successful release
+    expect(result.steps).toContain('delivery-event');
+    expect(result.deliveryEvent).toEqual({ delivered: false });
+    expect(warnings.some((w) => /[Dd]elivery event.*failed/.test(w))).toBe(true);
+  });
+
+  it('deliveryEvent is absent from the result entirely when not configured', () => {
+    const { runtime } = makeReleaseRuntime();
+    const result = release.deployRelease(relConfig(), {}, ctx(runtime));
+    expect(result).not.toHaveProperty('deliveryEvent');
+  });
+
   it('dispatches through the public deploy() when layout.type is releases', () => {
     const { runtime } = makeReleaseRuntime();
     const result = kit.deploy(relConfig(), {}, ctx(runtime));
@@ -300,6 +330,96 @@ describe('release deploy — preRestartChecks', () => {
   });
 });
 
+// PKG-135 Finding 5: `current` is flipped to the rollback target BEFORE
+// preRestartChecks run. Before this fix, a failing check threw straight out
+// of rollbackRelease() -- `current` was left pointing at the (unrestarted)
+// rollback target while the ORIGINAL process, never restarted, was still
+// what was actually serving traffic. The symlink and the running process
+// disagreed, which is the worst state to be in mid-incident.
+describe('release rollback — post-flip recovery (PKG-135 Finding 5)', () => {
+  it('a failing preRestartCheck restores originalCurrent, leaving the symlink consistent with the running process', () => {
+    const { runtime, calls, cfg } = makeReleaseRuntime({ fail: ['check-port'] });
+    const rbCfg = relConfig({ preRestartChecks: [{ name: 'port-safe', command: 'check-port' }] });
+
+    expect(() => release.rollbackRelease(rbCfg, {}, ctx(runtime)))
+      .toThrow(/restored the original release/);
+
+    // Assert the actual symlink target the recovery left behind, not just
+    // that it threw: the LAST `ln -s` onto current must point at
+    // originalCurrent (cfg.currentLink — what was live before this rollback
+    // ever ran), not at the failed rollback target (cfg.previousLink).
+    const flipsToPrevious = calls.filter((cmd) => cmd.includes(`ln -s ${cfg.previousLink} `));
+    const flipsToOriginal = calls.filter((cmd) => cmd.includes(`ln -s ${cfg.currentLink} `));
+    expect(flipsToPrevious.length).toBe(1); // the forward flip, before the check ran
+    expect(flipsToOriginal.length).toBe(1); // the recovery flip-back
+    const forwardFlipIdx = calls.findIndex((cmd) => cmd.includes(`ln -s ${cfg.previousLink} `));
+    const recoveryFlipIdx = calls.findIndex((cmd) => cmd.includes(`ln -s ${cfg.currentLink} `));
+    expect(recoveryFlipIdx).toBeGreaterThan(forwardFlipIdx); // the recovery flip landed LAST
+    // The running process actually matches the restored symlink: pm2 WAS
+    // restarted (by the recovery) after the flip-back, not just the pointer
+    // moved — the check fails BEFORE the forward restart ever runs, so the
+    // only `pm2 startOrRestart` seen is the recovery's resume of the ORIGINAL
+    // release (same shape as the sibling forward-deploy recovery test above).
+    expect(calls.filter((cmd) => cmd.includes('pm2 startOrRestart')).length).toBe(1);
+    // No flip happened after the recovery one — the symlink is left settled.
+    expect(calls.filter((cmd) => cmd.includes('ln -s')).length).toBe(2);
+  });
+
+  it('recovery also holds when the restore itself is imperfect — the failure is surfaced, not swallowed', () => {
+    // The preRestartCheck fails (triggers recovery); the recovery's OWN
+    // verification of the restored originalCurrent ALSO fails (health never
+    // returns 200) — an imperfect restore. This must escalate loudly, not
+    // silently report success or swallow the original cause.
+    const { runtime } = makeReleaseRuntime({ fail: ['check-port', 'curl'] });
+    const rbCfg = relConfig({ preRestartChecks: [{ name: 'port-safe', command: 'check-port' }] });
+    expect(() => release.rollbackRelease(rbCfg, {}, ctx(runtime)))
+      .toThrow(/MANUAL RECOVERY REQUIRED/);
+  });
+
+  // PKG-135 Finding B: `activateSymlink(..., { tolerate: true })` neither
+  // throws nor reports success/failure on its own -- a blind restart right
+  // after it would restart PM2 against WHATEVER `current` still points at,
+  // which may still be the rollback target that just failed its check. That
+  // is worse than doing nothing. When the recovery's OWN symlink swap fails,
+  // PM2 must NOT be touched at all.
+  it('when the recovery symlink swap itself fails, PM2 is NOT restarted (never risks activating the failed rollback target)', () => {
+    const probe = makeReleaseRuntime();
+    const { runtime, calls } = makeReleaseRuntime({ fail: ['check-port', `ln -s ${probe.cfg.currentLink} `] });
+    const rbCfg = relConfig({ preRestartChecks: [{ name: 'port-safe', command: 'check-port' }] });
+
+    expect(() => release.rollbackRelease(rbCfg, {}, ctx(runtime)))
+      .toThrow(/MANUAL RECOVERY REQUIRED/);
+
+    // The forward flip (to previous) succeeded; only the RECOVERY flip-back
+    // (to originalCurrent / cfg.currentLink) failed. Confirm both actually
+    // ran, so this test isn't vacuously passing because neither did.
+    expect(calls.some((cmd) => cmd.includes(`ln -s ${probe.cfg.previousLink} `))).toBe(true);
+    expect(calls.some((cmd) => cmd.includes(`ln -s ${probe.cfg.currentLink} `))).toBe(true);
+    // PM2 must never have been restarted -- neither the forward restart
+    // (never reached; the check fails first) nor a recovery restart onto a
+    // `current` that may still point at the failed rollback target.
+    expect(calls.some((cmd) => cmd.includes('pm2 startOrRestart'))).toBe(false);
+  });
+
+  it('an unhealthy rollback target (no preRestartChecks involved) still recovers via the same shared path', () => {
+    // Regression guard for the refactor that extracted `recoverFailedRollback`
+    // out of this pre-existing branch — same behavior, now shared code.
+    let verifyCwdCalls = 0;
+    const rt = makeReleaseRuntime();
+    const runtime = {
+      execFileSync: (_f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        if (cmd.includes('readlink -f /proc/')) {
+          verifyCwdCalls += 1;
+          return verifyCwdCalls <= 1 ? '/srv/app/releases/99999999cccc-20260101T000000Z' : rt.cfg.canonical;
+        }
+        return (rt.runtime.execFileSync as any)(_f, args);
+      },
+    };
+    expect(() => release.rollbackRelease(relConfig(), {}, ctx(runtime))).toThrow(/restored the original release/);
+  });
+});
+
 describe('release deploy — failure recovery by phase', () => {
   it('install failure: current keeps serving, apps never stopped, candidate quarantined', () => {
     const { runtime, calls } = makeReleaseRuntime({ fail: ['npm ci'] });
@@ -346,6 +466,89 @@ describe('release deploy — failure recovery by phase', () => {
     // flip back onto current happened (there are two mv -Tf onto current: forward + back)
     expect(calls.filter((cmd) => /mv -Tf .*\/current/.test(cmd)).length).toBeGreaterThanOrEqual(2);
     expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(true);
+  });
+
+  // PKG-135 Finding B's twin (deployRelease's OWN recover(), 'migrated'/
+  // 'flipped'/'verify' phase — same bug as rollbackRelease's
+  // recoverFailedRollback, just never fixed there the first time around).
+  // This is the SUCCESSFUL-flip-back case, pinned explicitly as the no-
+  // regression guard for that fix: the writers-stopped -> flip-back ->
+  // DB-restore -> resume ORDER (the Codex #1 comment's sequencing) must be
+  // completely unchanged.
+  it('successful flip-back during recovery: writers-stopped -> flip-back -> DB-restore -> resume order is unchanged', () => {
+    const { runtime, calls, cfg } = makeReleaseRuntime({ runningSha: 'deadbeefdeadbeef' });
+    expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow(/verification failed/);
+
+    const indicesOf = (needle: string) => calls.reduce<number[]>((acc, cmd, i) => {
+      if (cmd.includes(needle)) acc.push(i);
+      return acc;
+    }, []);
+    // `pm2 stop` and `pm2 startOrRestart` each appear TWICE: once in the
+    // normal forward flow (pre-migration pause; restarting onto the
+    // candidate, before verification ever runs) and once again inside
+    // recovery (stopWritersConfirmed()'s own re-check; the resume of the
+    // PREVIOUS release). We want recovery's OWN occurrences — the LAST of
+    // each — not whichever comes first.
+    const stopIdxs = indicesOf('pm2 stop');
+    const resumeIdxs = indicesOf('pm2 startOrRestart');
+    // The recovery flip-back's exact command: source = st.prevTarget
+    // (cfg.currentLink — what WAS current before this deploy), destination =
+    // `current` (tmp file ends in ".current"). Distinct from the FORWARD
+    // path's own two symlink writes: flipping `current` to the NEW candidate
+    // (different source) and updating the `previous` pointer to the old
+    // current (same source, but destination "previous", tmp ends in
+    // ".previous") — neither of those is this line.
+    const flipBackIdx = calls.findIndex((cmd) => cmd.includes(`ln -s ${cfg.currentLink} /srv/app/.dk-swap.$$.current`));
+    const restoreIdx = calls.findIndex((cmd) => cmd.includes('run-restore'));
+
+    const recoveryStopIdx = stopIdxs[stopIdxs.length - 1];
+    const recoveryResumeIdx = resumeIdxs[resumeIdxs.length - 1];
+    expect(stopIdxs.length).toBe(2);
+    expect(resumeIdxs.length).toBe(2);
+    expect(flipBackIdx).toBeGreaterThanOrEqual(0);
+    expect(recoveryStopIdx).toBeLessThan(flipBackIdx);
+    expect(flipBackIdx).toBeLessThan(restoreIdx);
+    expect(restoreIdx).toBeLessThan(recoveryResumeIdx);
+  });
+
+  // PKG-135 Finding B's twin, the actual fix: `activateSymlink(...,
+  // { tolerate: true })` neither throws nor reports success on its own — the
+  // ORIGINAL code threw the return value away here too and unconditionally
+  // resumed the previous release next. If the flip-back itself fails,
+  // `current` may still point at the failed CANDIDATE, and restarting PM2
+  // would risk activating exactly that — worse than doing nothing. This
+  // matters MORE here than in rollbackRelease: it fires when a deploy has
+  // already failed mid-flight with a possibly-migrated database.
+  it('a FAILING symlink flip-back during recovery does NOT resume the previous release, and surfaces MANUAL RECOVERY REQUIRED naming the still-active candidate', () => {
+    const probe = makeReleaseRuntime();
+    // Fails ONLY the recovery's flip-back (source = st.prevTarget /
+    // cfg.currentLink, destination = `current`) — NOT the forward path's
+    // OWN two symlink writes, which share the same source (updating the
+    // `previous` pointer, destination "previous") or destination (flipping
+    // `current` to the NEW candidate, different source) but never both.
+    const { runtime, calls } = makeReleaseRuntime({
+      runningSha: 'deadbeefdeadbeef', // forces the forward activation verify to fail -> triggers recover()
+      fail: [`ln -s ${probe.cfg.currentLink} /srv/app/.dk-swap.$$.current`],
+    });
+
+    expect(() => release.deployRelease(relConfig(), {}, ctx(runtime)))
+      .toThrow(/MANUAL RECOVERY REQUIRED/);
+
+    // The recovery flip-back was actually attempted (and failed) — this
+    // isn't vacuously passing because it never ran.
+    expect(calls.some((cmd) => cmd.includes(`ln -s ${probe.cfg.currentLink} /srv/app/.dk-swap.$$.current`))).toBe(true);
+    // DB-restore decision, pinned: writers were already confirmed stopped
+    // before the flip-back was ever attempted, so the restore is still safe
+    // and STILL runs even though the flip-back failed — leaving a migrated
+    // DB paired with code that may revert to pre-migration is its own hazard,
+    // and this is a data operation, not a traffic-affecting one.
+    expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(true);
+    // What must NOT happen: a SECOND `pm2 startOrRestart` -- the recovery's
+    // own resume of the previous release. The FIRST one is the forward
+    // path's own restart onto the candidate (before verification ever runs,
+    // which is what triggers recovery in the first place) and legitimately
+    // still happens; only the recovery-triggered one must be suppressed.
+    expect(calls.filter((cmd) => cmd.includes('pm2 startOrRestart')).length).toBe(1);
   });
 
   it('escalates to MANUAL RECOVERY REQUIRED when a migration failed AND the restore also fails', () => {
