@@ -22,7 +22,9 @@ function makeMonitorRuntime(over: any = {}) {
     pm2Fails: false,
     dfAvail: '9999999',
     dfInodes: '999999',
+    dfFails: false, // PKG-135 Finding 3: models an unreadable `df` -> checkDisk unknown
     backupMtime: String(Math.floor(NOW / 1000)), // fresh now
+    backupStatFails: false, // PKG-135 Finding 3: models an unreadable `stat` -> checkBackup unknown
     httpCode: '200',
     alertFails: false,
     ...over,
@@ -38,9 +40,9 @@ function makeMonitorRuntime(over: any = {}) {
     if (cmd.includes('cat ') && cmd.includes('monitor-state.json')) return stateStore;
     if (cmd.includes('ALERT-SINK')) { if (cfg.alertFails) throw new Error('sink failed'); delivered.push(opts && opts.input); return ''; }
     if (cmd.includes('pm2 jlist')) { if (cfg.pm2Fails) throw new Error('pm2 down'); return JSON.stringify(cfg.pm2); }
-    if (cmd.includes('df -kP')) return cfg.dfAvail;
+    if (cmd.includes('df -kP')) { if (cfg.dfFails) throw new Error('df: cannot read'); return cfg.dfAvail; }
     if (cmd.includes('df -iP')) return cfg.dfInodes;
-    if (cmd.includes('stat -c %Y')) return cfg.backupMtime;
+    if (cmd.includes('stat -c %Y')) { if (cfg.backupStatFails) throw new Error('stat: cannot read'); return cfg.backupMtime; }
     if (cmd.includes('%{http_code}')) return cfg.httpCode;
     return '';
   };
@@ -145,6 +147,132 @@ describe('monitor() run', () => {
     expect(res.alerts).toEqual([]);
     expect(rt.delivered).toEqual([]);
     expect(rt.getState().pendingEvent).toBeNull();
+  });
+
+  // PKG-135 Finding 3: index.d.ts/README document exit `2` for "a monitor/
+  // config/delivery failure", but the code only ever set CRITICAL-or-OK — a run
+  // where the monitor is completely blind (every check `unknown`) used to exit
+  // 0, indistinguishable from a genuinely healthy run. `publicProbes` is
+  // dropped from this config because a failed public probe is always `crit`
+  // (never `unknown`, per checks.js) — this test needs every check type that
+  // CAN go unknown (pm2/restart/tunnel via `pm2 jlist`, disk, backup) to
+  // actually do so, to build the genuine "saw nothing" case, not a weaker
+  // "some checks unknown" one a sloppier fix could pass with.
+  it('a run where EVERY check is unknown exits with the documented monitor-failure code (blind, not healthy)', () => {
+    const rt = makeMonitorRuntime({ pm2Fails: true, dfFails: true, backupStatFails: true });
+    const config = monConfig({ publicProbes: [] });
+    const res = monitor(config, {}, ctx(rt));
+    expect(res.results.length).toBeGreaterThan(0);
+    expect(res.results.every((r) => r.status === 'unknown')).toBe(true);
+    expect(res.exitCode).toBe(EXIT.MONITOR_ERROR);
+    // No alert fires over "unknown" (stepCheck holds, per the state-machine
+    // suite above) — this must not be confused with a crit/alert exit.
+    expect(res.alerts).toEqual([]);
+  });
+
+  // RULING (coordinator, after review): partial blindness is still blindness
+  // about those specific checks, and the documented contract ("2 = monitor/
+  // config/delivery failure") describes the monitor's ABILITY TO DO ITS JOB,
+  // not a quorum. With five checks and four blind, a run that only trips on
+  // "ALL unknown" leaves the original bug mostly intact. This is the INVERSE
+  // of an earlier version of this test (which asserted the opposite) — kept
+  // here, inverted, as the regression guard for that reversal.
+  it('a PARTIALLY unknown run (only pm2 unreadable) ALSO exits the monitor-failure code — any unknown, not just all', () => {
+    const rt = makeMonitorRuntime({ pm2Fails: true });
+    const res = monitor(monConfig(), {}, ctx(rt));
+    expect(res.results.some((r) => r.status === 'unknown')).toBe(true);
+    expect(res.results.some((r) => r.status !== 'unknown')).toBe(true); // disk/backup/public still answered
+    expect(res.exitCode).toBe(EXIT.MONITOR_ERROR);
+  });
+
+  it('a genuine crit (not blindness) still exits 1, unchanged', () => {
+    const rt = makeMonitorRuntime({ pm2: [{ name: 'app', pid: 0, pm2_env: { status: 'stopped', restart_time: 5 } }, { name: 'tun', pid: 2, pm2_env: { status: 'online' } }] });
+    const res = monitor(monConfig(), {}, ctx(rt));
+    expect(res.exitCode).toBe(EXIT.CRITICAL);
+  });
+
+  // Precedence rule 1: a real critical condition is more actionable than "some
+  // checks were indeterminate" — crit must win even when another check is
+  // ALSO unknown in the same run, not fall through to the monitor-failure code.
+  it('crit BEATS unknown: one crit + one unknown in the same run exits CRITICAL, not the monitor-failure code', () => {
+    // pm2 unreadable (-> pm2/restart/tunnel all `unknown`) AND disk genuinely
+    // over threshold (`crit`) in the same run.
+    const rt = makeMonitorRuntime({ pm2Fails: true, dfAvail: '1' });
+    const res = monitor(monConfig(), {}, ctx(rt));
+    expect(res.results.some((r) => r.status === 'unknown')).toBe(true);
+    expect(res.results.some((r) => r.status === 'crit')).toBe(true);
+    expect(res.exitCode).toBe(EXIT.CRITICAL);
+  });
+
+  // PKG-135 Finding A: the OLD code set `exitCode = CRITICAL` for a crit,
+  // then a SEPARATE, later block silently overwrote it to MONITOR_ERROR if
+  // delivery failed -- so "crit + failed delivery" already came out as `2` by
+  // accident (an unconditional override always wins over an earlier plain
+  // assignment), while "crit + unknown" came out as `1` because the crit
+  // check ran FIRST in that block and nothing overrode it after. Same
+  // destination code, two uncoordinated mechanisms — worked today, but not
+  // encoded anywhere as a deliberate ordering, so a future edit to either
+  // block could break it invisibly. This test pins the INTENDED, now-explicit
+  // precedence (delivery failure is checked FIRST, in the same block as
+  // crit/unknown) rather than the accidental override that used to produce
+  // the same answer for THIS case only.
+  it('delivery failure BEATS crit: a crit whose alert delivery fails exits the monitor-failure code, not CRITICAL', () => {
+    const down = {
+      pm2: [{ name: 'app', pid: 0, pm2_env: { status: 'stopped', restart_time: 5 } }, { name: 'tun', pid: 2, pm2_env: { status: 'online' } }],
+      alertFails: true,
+    };
+    const rt = makeMonitorRuntime(down);
+    monitor(monConfig(), {}, ctx(rt));            // run 1: debounce, no alert yet
+    const res = monitor(monConfig(), {}, ctx(rt)); // run 2: alert fires, crit present, sink FAILS
+    expect(res.results.some((r) => r.status === 'crit')).toBe(true);
+    expect(rt.delivered).toEqual([]); // the sink never actually received anything
+    expect(res.exitCode).toBe(EXIT.MONITOR_ERROR);
+  });
+
+  it('an all-ok run still exits 0, unchanged', () => {
+    const rt = makeMonitorRuntime();
+    const res = monitor(monConfig(), {}, ctx(rt));
+    expect(res.exitCode).toBe(EXIT.OK);
+  });
+
+  // Precedence rule 3 (ruling): an EMPTY result set (nothing was configured to
+  // check at all — `monitor.alert` is the only required monitor key) is a
+  // config failure, not a healthy run: a monitor that inspects nothing must
+  // not report the same exit code as one that checked everything and found it
+  // fine.
+  it('an EMPTY result set (nothing configured to check) exits the monitor-failure code, not a healthy 0', () => {
+    const rt = makeMonitorRuntime();
+    const config = mergeConfig(DEFAULT_CONFIG, {
+      host: 'app@pi', appNames: [],
+      monitor: {
+        alert: { command: 'ALERT-SINK', run: 'target' },
+        failAfterRuns: 2, recoverAfterRuns: 2, reAlertAfterMinutes: 0,
+        stateFile: '/var/lib/app/deploy-kit-monitor-state.json',
+      },
+    });
+    const res = monitor(config, {}, ctx(rt));
+    expect(res.results).toEqual([]);
+    expect(res.exitCode).toBe(EXIT.MONITOR_ERROR);
+  });
+
+  // Debounce/notification-hold behaviour must survive the exit-code fix
+  // unchanged: an all-unknown run never alerts (stepCheck holds on `unknown`
+  // regardless of how many runs pass), and recovers into an ok exit code the
+  // instant the target becomes visible again.
+  it('debounce/hold is unchanged: an all-unknown run never alerts across repeated runs, and recovers cleanly once visible', () => {
+    const rt = makeMonitorRuntime({ pm2Fails: true, dfFails: true, backupStatFails: true });
+    const config = monConfig({ publicProbes: [] });
+    const r1 = monitor(config, {}, ctx(rt));
+    const r2 = monitor(config, {}, ctx(rt));
+    expect(r1.exitCode).toBe(EXIT.MONITOR_ERROR);
+    expect(r2.exitCode).toBe(EXIT.MONITOR_ERROR);
+    expect(rt.delivered).toEqual([]); // never alerts over blindness alone
+
+    rt.cfg.pm2Fails = false;
+    rt.cfg.dfFails = false;
+    rt.cfg.backupStatFails = false;
+    const r3 = monitor(config, {}, ctx(rt));
+    expect(r3.exitCode).toBe(EXIT.OK);
   });
 
   it('crit sets exit 1 even before an alert fires (debounce)', () => {

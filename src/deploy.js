@@ -17,6 +17,19 @@ function defaultSleep(seconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// A syntactically plausible git SHA (abbreviated or full) -- what rollback()
+// requires of a recorded pointer before it will reset to it (see rollback()
+// below). deploy()'s own write-time gate no longer uses this: it compares the
+// recorded pointer against a freshly-read HEAD directly (PKG-135 Finding C),
+// which is a strictly stronger check that makes a length-based "plausible"
+// regex unnecessary there. 7-64 covers both git object-hash formats git
+// itself can emit: SHA-1 (40 hex chars, or an abbreviation down to 7) and the
+// newer SHA-256 repository format (64 hex chars, PKG-135 Finding D) -- `git
+// rev-parse HEAD` always returns the FULL, un-abbreviated form, but this
+// regex is intentionally as permissive as "looks like a hex object id" gets,
+// not narrowed to exactly 40-or-64.
+const PLAUSIBLE_SHA_RE = /^[0-9a-f]{7,64}$/;
+
 // Path to the host layout marker. A legacy deploy/rollback must refuse to run
 // against a host that has been migrated to the release layout (SMH-112) — pulling
 // and building in a bare/releases root would be destructive. Cheap single probe.
@@ -288,6 +301,46 @@ function deploy(config, options = {}, ctx = {}) {
       { tolerate: true },
     );
 
+    // The write above is tolerated (its OWN `|| true` makes `res.ok` true even
+    // when `git rev-parse HEAD` or the redirect itself failed), so a green
+    // `res.ok` is not proof anything usable actually landed -- and merely
+    // reading the file back and checking it LOOKS like a SHA (PKG-135 Finding
+    // 1) is not enough either (Finding C): a write that fails to overwrite an
+    // EXISTING, readable file (read-only fs, permissions, a full disk
+    // stopping the `>` redirect from truncating) leaves the OLD sha in place,
+    // which still passes a bare "looks plausible" check while being silently
+    // STALE. The only check that actually proves the recorded pointer
+    // reflects THIS run is comparing it against HEAD, read independently,
+    // right now.
+    //
+    // Skipped under --dry-run: the write above never really happened there
+    // either (the dry-run fake always reads back empty), so this would
+    // otherwise abort every dry run on its own fakery rather than a real
+    // failure -- same rationale as the DB-bound pause verification skip below.
+    if (!normalizeRuntime(runtime).dryRun) {
+      const headRes = runOnTarget('git rev-parse HEAD', config, { runtime, capture: true });
+      const head = (headRes.output || '').trim();
+      // Empty HEAD (PKG-135 Finding D2) is NOT a recording failure -- it's an
+      // unborn branch / a freshly-initialized repo with no commits yet, a
+      // legitimate first deploy (the `git pull` right after this establishes
+      // the initial checkout). There is genuinely no prior revision to roll
+      // back to, so there is nothing to gate: `deploy-kit rollback` already
+      // reports that honestly ("No recorded previous revision") if it's ever
+      // run before a first successful deploy. Gate ONLY the case where a
+      // prior revision DOES exist but we could not prove it got recorded.
+      if (head) {
+        const recorded = runOnTarget(`cat ${prevShaFile(config)} 2>/dev/null || true`, config, { runtime, capture: true });
+        if ((recorded.output || '').trim() !== head) {
+          throw new Error(
+            `Deploy aborted: could not establish a rollback pointer at ${prevShaFile(config)} -- the recorded `
+            + `revision does not match HEAD (${head.slice(0, 12)}). \`deploy-kit rollback\` would reset to the `
+            + 'wrong (or no) revision. Check that the target can write to $HOME/.deploy-kit (not read-only, not '
+            + 'full), then retry.',
+          );
+        }
+      }
+    }
+
     run('Fetching latest', `git fetch ${shQuote(config.remote)} --prune`);
     run(`Pulling ${config.remote}/${branch} (--ff-only)`, `git pull --ff-only ${shQuote(config.remote)} ${shQuote(branch)}`);
     steps.push(`pull:${branch}`);
@@ -515,6 +568,7 @@ function deploy(config, options = {}, ctx = {}) {
       steps.push(`post-check:${check.name}`);
     }
 
+    let deliveryEvent;
     if (config.deliveryEvent?.command) {
       const backupReference = backupReferenceFromId(backupId);
       const payload = JSON.stringify({
@@ -523,12 +577,26 @@ function deploy(config, options = {}, ctx = {}) {
         deployedAt: new Date().toISOString(),
         ...(backupReference ? { backupReference } : {}),
       });
-      run('Emitting delivery event', config.deliveryEvent.command, { tolerate: true, input: payload });
+      // Non-gating by design (tolerate: true) -- a broken announcement must
+      // never turn a healthy deploy into a failure. But "reported" has to mean
+      // something observable: before this, a failure here was a silent sink --
+      // no warning, no trace in the result. Surface it both ways so an operator
+      // (or a caller reading DeployResult) can actually tell delivery failed.
+      const delivered = run('Emitting delivery event', config.deliveryEvent.command, { tolerate: true, input: payload });
       steps.push('delivery-event');
+      if (!delivered) {
+        log.warning(
+          'Delivery event command failed (deliveryEvent.command); the event was NOT delivered. This does not '
+          + 'fail the deploy, but the receiving system never heard about this deployment.',
+        );
+      }
+      deliveryEvent = { delivered };
     }
 
     log.success('Deployment completed successfully');
-    return { branch, mode: config.mode, host: config.host, steps, healthy };
+    return {
+      branch, mode: config.mode, host: config.host, steps, healthy, ...(deliveryEvent ? { deliveryEvent } : {}),
+    };
   } finally {
     // Remove the signal handlers on every exit path (success or thrown) so they
     // never leak across calls — matches release.js's own SIGINT/SIGTERM cleanup.
@@ -563,7 +631,7 @@ function rollback(config, options = {}, ctx = {}) {
     assertNotReleaseHost(config, c);
     const prev = runOnTarget(`cat ${prevShaFile(config)} 2>/dev/null || true`, config, { capture: true, runtime });
     const sha = (prev.output || '').trim();
-    if (!/^[0-9a-f]{7,40}$/.test(sha)) {
+    if (!PLAUSIBLE_SHA_RE.test(sha)) {
       throw new Error(`No recorded previous revision (${prevShaFile(config)}); cannot roll back automatically.`);
     }
 

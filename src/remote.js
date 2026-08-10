@@ -57,32 +57,39 @@ const start = (config, ctx) => lifecycle('start', config, ctx);
 const stop = (config, ctx) => lifecycle('stop', config, ctx);
 const restart = (config, ctx) => lifecycle('restart', config, ctx);
 
+// Each of these runs several read-only inspection commands and used to
+// discard every result and return true unconditionally -- so `resources`/
+// `git` exited 0 even when the SSH connection failed and nothing was actually
+// inspected. Honor `runOnTarget`'s `.ok` instead: true only when every
+// command in the group actually ran and exited zero.
 function resources(config, ctx = {}) {
   const log = ctx.log || defaultLog;
   log.header('💻 System Resources');
-  runOnTarget('free -h', config, { runtime: ctx.runtime });
-  runOnTarget('df -h | grep -E "^/dev|Filesystem"', config, { runtime: ctx.runtime });
-  runOnTarget('uptime', config, { runtime: ctx.runtime });
-  return true;
+  const memOk = runOnTarget('free -h', config, { runtime: ctx.runtime }).ok;
+  const diskOk = runOnTarget('df -h | grep -E "^/dev|Filesystem"', config, { runtime: ctx.runtime }).ok;
+  const uptimeOk = runOnTarget('uptime', config, { runtime: ctx.runtime }).ok;
+  return memOk && diskOk && uptimeOk;
 }
 
 function gitInfo(config, ctx = {}) {
   (ctx.log || defaultLog).header('🔍 Git');
-  runOnTarget('git rev-parse --abbrev-ref HEAD', config, { runtime: ctx.runtime });
-  runOnTarget('git log -1 --oneline', config, { runtime: ctx.runtime });
-  runOnTarget('git status --short', config, { runtime: ctx.runtime });
-  return true;
+  const branchOk = runOnTarget('git rev-parse --abbrev-ref HEAD', config, { runtime: ctx.runtime }).ok;
+  const logOk = runOnTarget('git log -1 --oneline', config, { runtime: ctx.runtime }).ok;
+  const statusOk = runOnTarget('git status --short', config, { runtime: ctx.runtime }).ok;
+  return branchOk && logOk && statusOk;
 }
 
+// Composes status + health + gitInfo -- must fail if any of them does, not
+// just print all three and claim success regardless.
 function dashboard(config, ctx = {}) {
   const log = ctx.log || defaultLog;
   log.header('📊 Management Dashboard');
-  status(config, ctx);
+  const statusOk = status(config, ctx);
   log.divider();
-  health(config, ctx);
+  const healthOk = health(config, ctx);
   log.divider();
-  gitInfo(config, ctx);
-  return true;
+  const gitOk = gitInfo(config, ctx);
+  return statusOk && healthOk && gitOk;
 }
 
 module.exports = {

@@ -226,6 +226,102 @@ const MONITOR_KEYS = ['disk', 'backup', 'restartStorm', 'tunnel', 'publicProbes'
 
 function isPosInt(v) { return typeof v === 'number' && Number.isInteger(v) && v > 0; }
 
+// ---- Nested-object validation (PKG-135 Finding 6) ------------------------
+// `validateConfig` only ever allowlisted TOP-LEVEL keys (`Object.keys(DEFAULT_
+// CONFIG)`) and type-checked each nested block as a whole ('object') -- never
+// its CONTENTS. So "hooks.migarte" (a typo) validated fine, was never read,
+// and silently left "hooks.migrate" disabled; the same gap applied to
+// `health`, `ssh`, and monitor's own sub-blocks (disk/backup/restartStorm/
+// alert never got an unknown-key check at all). `layout`/`monitor`/
+// `deliveryEvent` HAD one each -- but as three separate hand-rolled copies of
+// the same "for key of Object.keys(block) reject if not allowed" loop, added
+// ad hoc whenever someone happened to be touching that one block. That's
+// exactly how the gap happened: nobody added the same loop for `hooks`/
+// `health`/`ssh` because no single mechanism made it obvious they needed one.
+//
+// `rejectUnknownKeys` is that one mechanism now -- every block-level key
+// allowlist in this file (existing and new) calls it, so a block simply
+// cannot end up unvalidated by omission again. `validateBlock` composes it
+// with a lightweight per-key type check (reusing the same `typeMatches`/
+// spec-string convention the top-level KEY_TYPES table already uses) for the
+// blocks that only need "known key, right JS type" and nothing more elaborate
+// -- `hooks`, `health`, `ssh`, and monitor's disk/backup/restartStorm/alert.
+// Blocks with genuinely bespoke per-field rules (safe URL/path syntax,
+// id uniqueness, positive-integer thresholds with a specific message, ...) —
+// `layout`, `monitor` itself, `deliveryEvent`, and monitor's publicProbes/
+// checks arrays — keep their existing hand-written value-level checks
+// alongside this; only the "reject an unknown key" layer is now shared.
+//
+// A block whose keys are genuinely open (the KEY the caller supplies is user
+// data, not a fixed config field an operator could typo) must NEVER be run
+// through `rejectUnknownKeys`/`validateBlock` — checked for this codebase:
+// `healthHeaders` and a `monitor.publicProbes[].headers` are raw HTTP-header
+// maps keyed by whatever header name the operator wants to send, so neither
+// is (or should be) validated this way; both are left exactly as before.
+function rejectUnknownKeys(obj, allowed, source, label) {
+  const problems = [];
+  for (const key of Object.keys(obj)) {
+    if (!allowed.includes(key)) {
+      problems.push(`${source}: unknown ${label} key "${key}" (valid: ${allowed.join(', ')})`);
+    }
+  }
+  return problems;
+}
+
+// `types` is a { key: spec } map using the same spec strings as KEY_TYPES
+// ('string' | 'string?' | 'number' | 'number?' | 'boolean' | 'boolean?' |
+// 'array' | 'array?'). Only keys ACTUALLY PRESENT on `obj` are type-checked —
+// same lenient convention as the top-level check: a config may omit any key
+// and get the default, so validation never demands a key be present, only
+// that it be well-formed when it is. Caller must have already confirmed
+// `obj` is a non-null, non-array object (every call site below does, via the
+// same `!= null && typeof === 'object' && !Array.isArray` guard the existing
+// `layout`/`monitor` calls use).
+function validateBlock(obj, types, source, label) {
+  const problems = rejectUnknownKeys(obj, Object.keys(types), source, label);
+  for (const [key, spec] of Object.entries(types)) {
+    if (key in obj && !typeMatches(obj[key], spec)) {
+      problems.push(`${source}: "${label}.${key}" must be ${spec.replace('?', ' or null')}`);
+    }
+  }
+  return problems;
+}
+
+// Documented shape of `hooks` (README's "Hooks" config-reference rows) — every
+// hook the kit reads via `config.hooks.<name>`. `install` is the only
+// non-nullable one: unlike the others (which mean "skip this step" when
+// null), deploy.js always runs SOME install command.
+const HOOKS_TYPES = {
+  install: 'string',
+  generate: 'string?',
+  backup: 'string?',
+  migrate: 'string?',
+  build: 'string?',
+  restart: 'string?',
+  restore: 'string?',
+};
+
+// Documented shape of `health`.
+const HEALTH_TYPES = { attempts: 'number', delaySeconds: 'number' };
+
+// Documented shape of `ssh` (README's `ssh.*` rows).
+const SSH_TYPES = {
+  connectTimeout: 'number?',
+  serverAliveInterval: 'number?',
+  serverAliveCountMax: 'number?',
+  options: 'array',
+  strictHostKeyChecking: 'string?',
+  batchMode: 'string?',
+};
+
+// Documented shape of monitor's own sub-blocks (used from validateMonitor
+// below, alongside — not instead of — its existing bespoke value checks for
+// these same blocks).
+const MONITOR_DISK_TYPES = { minFreeKiB: 'number?', minFreeInodes: 'number?' };
+const MONITOR_BACKUP_TYPES = { id: 'string?', stampFile: 'string', maxAgeHours: 'number?' };
+const MONITOR_RESTART_STORM_TYPES = { maxDelta: 'number?' };
+const MONITOR_ALERT_TYPES = { command: 'string', run: 'string?' };
+
 function validateDeployChecks(checks, key, source) {
   const problems = [];
   if (checks == null) return problems;
@@ -252,12 +348,7 @@ const DELIVERY_EVENT_KEYS = ['command'];
 // "comand") would silently no-op the whole feature instead of erroring, so
 // reject any key other than `command` and require `command` to actually be set.
 function validateDeliveryEvent(de, source) {
-  const problems = [];
-  for (const key of Object.keys(de)) {
-    if (!DELIVERY_EVENT_KEYS.includes(key)) {
-      problems.push(`${source}: unknown deliveryEvent key "${key}" (valid: ${DELIVERY_EVENT_KEYS.join(', ')})`);
-    }
-  }
+  const problems = rejectUnknownKeys(de, DELIVERY_EVENT_KEYS, source, 'deliveryEvent');
   if (typeof de.command !== 'string' || !de.command.trim()) {
     problems.push(`${source}: "deliveryEvent.command" must be a non-empty string`);
   }
@@ -269,15 +360,18 @@ function validateDeliveryEvent(de, source) {
 // for every probe/check (so per-check state can't collide), https-only probe urls
 // free of shell metacharacters, and sane thresholds.
 function validateMonitor(m, source) {
-  const p = [];
-  for (const k of Object.keys(m)) {
-    if (!MONITOR_KEYS.includes(k)) p.push(`${source}: unknown monitor key "${k}" (valid: ${MONITOR_KEYS.join(', ')})`);
-  }
+  const p = rejectUnknownKeys(m, MONITOR_KEYS, source, 'monitor');
   // alert sink is required — a monitor with no way to alert is pointless.
   if (m.alert == null || typeof m.alert !== 'object' || typeof m.alert.command !== 'string' || !m.alert.command) {
     p.push(`${source}: "monitor.alert.command" (a shell command; gets the alert JSON on stdin) is required`);
   } else if (m.alert.run != null && m.alert.run !== 'controller' && m.alert.run !== 'target') {
     p.push(`${source}: "monitor.alert.run" must be "controller" or "target"`);
+  }
+  // PKG-135 Finding 6: an unknown key inside alert/disk/backup/restartStorm
+  // (e.g. "run" misspelled "ruun") used to validate fine and silently no-op —
+  // these blocks never had an unknown-key check at all before this.
+  if (m.alert != null && typeof m.alert === 'object' && !Array.isArray(m.alert)) {
+    p.push(...validateBlock(m.alert, MONITOR_ALERT_TYPES, source, 'monitor.alert'));
   }
   const seen = new Set();
   const uniqueId = (id, where) => {
@@ -342,13 +436,18 @@ function validateMonitor(m, source) {
   if (m.backup != null) {
     if (typeof m.backup !== 'object' || !safeAbsPath(m.backup.stampFile)) p.push(`${source}: "monitor.backup.stampFile" must be an absolute path free of shell metacharacters`);
     if (m.backup && m.backup.maxAgeHours != null && !(typeof m.backup.maxAgeHours === 'number' && m.backup.maxAgeHours > 0)) p.push(`${source}: "monitor.backup.maxAgeHours" must be a positive number`);
+    if (typeof m.backup === 'object' && !Array.isArray(m.backup)) p.push(...validateBlock(m.backup, MONITOR_BACKUP_TYPES, source, 'monitor.backup'));
   }
   if (m.disk != null) {
     if (m.disk.minFreeKiB != null && !isPosInt(m.disk.minFreeKiB)) p.push(`${source}: "monitor.disk.minFreeKiB" must be a positive integer`);
     if (m.disk.minFreeInodes != null && !isPosInt(m.disk.minFreeInodes)) p.push(`${source}: "monitor.disk.minFreeInodes" must be a positive integer`);
+    if (typeof m.disk === 'object' && !Array.isArray(m.disk)) p.push(...validateBlock(m.disk, MONITOR_DISK_TYPES, source, 'monitor.disk'));
   }
   if (m.restartStorm != null && m.restartStorm.maxDelta != null && !(typeof m.restartStorm.maxDelta === 'number' && Number.isInteger(m.restartStorm.maxDelta) && m.restartStorm.maxDelta >= 0)) {
     p.push(`${source}: "monitor.restartStorm.maxDelta" must be a non-negative integer`);
+  }
+  if (m.restartStorm != null && typeof m.restartStorm === 'object' && !Array.isArray(m.restartStorm)) {
+    p.push(...validateBlock(m.restartStorm, MONITOR_RESTART_STORM_TYPES, source, 'monitor.restartStorm'));
   }
   for (const k of ['failAfterRuns', 'recoverAfterRuns', 'checkTimeoutSeconds']) {
     if (m[k] != null && !isPosInt(m[k])) p.push(`${source}: "monitor.${k}" must be a positive integer`);
@@ -368,12 +467,7 @@ const LAYOUT_KEYS = ['type', 'keepReleases', 'sharedPaths', 'releaseChecks', 'ru
 // escape the release, and no two paths overlap (one being a prefix of another
 // would let one symlink hide the other).
 function validateLayout(layout, source) {
-  const problems = [];
-  for (const key of Object.keys(layout)) {
-    if (!LAYOUT_KEYS.includes(key)) {
-      problems.push(`${source}: unknown layout key "${key}" (valid: ${LAYOUT_KEYS.join(', ')})`);
-    }
-  }
+  const problems = rejectUnknownKeys(layout, LAYOUT_KEYS, source, 'layout');
   if (layout.type !== 'releases') {
     problems.push(`${source}: "layout.type" must be "releases" (the only supported layout)`);
   }
@@ -479,6 +573,19 @@ function validateConfig(raw, { source = 'config' } = {}) {
   }
   if (raw.monitor != null && typeof raw.monitor === 'object' && !Array.isArray(raw.monitor)) {
     problems.push(...validateMonitor(raw.monitor, source));
+  }
+  // `hooks`/`health`/`ssh` type is checked above (object); validate their inner
+  // shape too (PKG-135 Finding 6) — a typo like "hooks.migarte" used to validate
+  // fine (only the top-level "hooks" key was ever allowlisted) and silently
+  // leave "hooks.migrate" at its default (disabled).
+  if (raw.hooks != null && typeof raw.hooks === 'object' && !Array.isArray(raw.hooks)) {
+    problems.push(...validateBlock(raw.hooks, HOOKS_TYPES, source, 'hooks'));
+  }
+  if (raw.health != null && typeof raw.health === 'object' && !Array.isArray(raw.health)) {
+    problems.push(...validateBlock(raw.health, HEALTH_TYPES, source, 'health'));
+  }
+  if (raw.ssh != null && typeof raw.ssh === 'object' && !Array.isArray(raw.ssh)) {
+    problems.push(...validateBlock(raw.ssh, SSH_TYPES, source, 'ssh'));
   }
   // projectDir is interpolated raw into `cd <dir> && …` on the target, so it must
   // be an absolute path free of shell metacharacters/spaces — reject a typo here

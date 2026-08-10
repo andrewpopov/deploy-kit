@@ -36,12 +36,41 @@ const { lockDir, prevShaFile } = require('../lock.js') as {
 // (it doesn't track exactly which names appeared in which command) — the tests
 // in this file only ever pause/resume this one seeded set, they never assert
 // per-name pm2 state precision.
+// Plausible-looking 40-hex SHA every fake runtime in this file uses as the
+// default "current HEAD" by default, so deploy()'s rollback-pointer gate
+// (PKG-135 Finding 1) sees a real-looking recorded revision instead of
+// tripping on test fixtures that never modeled that file at all.
+const PLAUSIBLE_SHA = 'a'.repeat(40);
+
+// `headSha`/`prevShaWriteFails`/`prevShaFileSeed` model the prev-sha file as
+// actual STATE, coupling the write to what the read-back and the independent
+// HEAD comparison (PKG-135 Finding C) see — NOT three independently-injected
+// canned values. That coupling is the point: Finding C's bug (a write that
+// silently fails to overwrite an EXISTING file leaves a STALE-but-still-
+// plausible-looking sha in place, and the deploy proceeds anyway) is
+// invisible to a fixture where the "read" answer doesn't depend on whether
+// the "write" actually ran.
+//   headSha           — what a bare `git rev-parse HEAD` (no redirect) reports:
+//                        the ACTUAL current revision, read independently.
+//   prevShaWriteFails — true models a write that cannot overwrite the file
+//                        (read-only fs, permissions, a full disk stopping the
+//                        `>` redirect from truncating) — masked by the
+//                        script's own `|| true`, so it still "succeeds" from
+//                        `res.ok`'s point of view. The file's PRIOR content
+//                        (prevShaFileSeed) is left untouched.
+//   prevShaFileSeed   — pre-existing file content, as if left over from a
+//                        PRIOR deploy — only meaningful combined with
+//                        prevShaWriteFails: THAT combination is the actual
+//                        "stale pointer" bug (an old, still-plausible sha
+//                        surviving a silently-failed write).
 function makeRuntime({
   fail = [] as string[], backupOutput = '', pm2Online = ['app'] as string[],
+  headSha = PLAUSIBLE_SHA as string, prevShaWriteFails = false, prevShaFileSeed = null as string | null,
 } = {}) {
   const calls: string[] = [];
   const inputs: Array<{ command: string; input: string | undefined }> = [];
   const online = new Set(pm2Online);
+  let prevShaFileContent = prevShaFileSeed;
   const execFileSync = (file: string, args: string[], options: { input?: string } = {}) => {
     const remoteCmd = args[args.length - 1];
     calls.push(remoteCmd);
@@ -60,6 +89,23 @@ function makeRuntime({
     }
     if (remoteCmd.includes('curl')) return '200';
     if (remoteCmd.includes('db:backup')) return backupOutput;
+    // The "Recording current revision" write: `git rev-parse HEAD > file` —
+    // has BOTH 'prev-sha' and a redirect, unlike the plain read below. Only
+    // actually updates the stored content when NOT simulating a write
+    // failure, matching a real target where a failed overwrite leaves the
+    // PRIOR content in place.
+    if (remoteCmd.includes('prev-sha') && remoteCmd.includes('git rev-parse HEAD >')) {
+      if (!prevShaWriteFails) prevShaFileContent = headSha;
+      return '';
+    }
+    // The read-back (`cat <prevShaFile>`) — both deploy()'s own gate and
+    // rollback()'s read hit this. Returns whatever is CURRENTLY stored.
+    if (remoteCmd.includes('prev-sha')) return prevShaFileContent || '';
+    // The bare, independent `git rev-parse HEAD` (no redirect, no file path)
+    // — PKG-135 Finding C's comparison read, and the pre-existing delivery-
+    // event revision read both hit this. Empty `headSha` models an unborn
+    // branch / brand-new repo with no commits yet (Finding D2).
+    if (remoteCmd.endsWith('git rev-parse HEAD')) return headSha;
     if (/pm2 stop /.test(remoteCmd)) { online.clear(); return ''; }
     if (/pm2 (start|restart)/.test(remoteCmd)) { pm2Online.forEach((n) => online.add(n)); return ''; }
     if (remoteCmd.includes('pm2 jlist')) {
@@ -185,6 +231,42 @@ describe('deploy pipeline', () => {
     expect(JSON.stringify(event)).not.toContain('/var/lib/bewks/backups');
   });
 
+  // PKG-135 Finding 4: `deliveryEvent.command` is non-gating by design (a
+  // broken announcement must never fail an already-healthy deploy), but a
+  // failure used to be a total silent sink — no warning, no trace anywhere in
+  // the result. "Reported" has to mean something observable.
+  it('a successful delivery event is reflected in the result, with no warning', () => {
+    const { runtime } = makeRuntime();
+    const warnings: string[] = [];
+    const log = { ...kit.makeLogger(() => {}, () => {}), warning: (m: string) => warnings.push(m) };
+    const cfg = mergeConfig(baseConfig, { deliveryEvent: { command: 'emit-event' } });
+
+    const result = deploy(cfg, {}, { ...ctxWith(runtime), log });
+
+    expect(result.deliveryEvent).toEqual({ delivered: true });
+    expect(warnings.some((w) => /[Dd]elivery event/.test(w))).toBe(false);
+  });
+
+  it('a failing delivery event command produces a visible warning, records delivered:false, and does NOT fail the deploy', () => {
+    const { runtime } = makeRuntime({ fail: ['emit-event'] });
+    const warnings: string[] = [];
+    const log = { ...kit.makeLogger(() => {}, () => {}), warning: (m: string) => warnings.push(m) };
+    const cfg = mergeConfig(baseConfig, { deliveryEvent: { command: 'emit-event' } });
+
+    const result = deploy(cfg, {}, { ...ctxWith(runtime), log });
+
+    expect(result.healthy).toBe(true); // non-gating: still a successful deploy
+    expect(result.steps).toContain('delivery-event');
+    expect(result.deliveryEvent).toEqual({ delivered: false });
+    expect(warnings.some((w) => /[Dd]elivery event.*failed/.test(w))).toBe(true);
+  });
+
+  it('deployResult.deliveryEvent is absent entirely when deliveryEvent is not configured', () => {
+    const { runtime } = makeRuntime();
+    const result = deploy(baseConfig, {}, ctxWith(runtime));
+    expect(result).not.toHaveProperty('deliveryEvent');
+  });
+
   it('omits unsafe or noisy backup output from delivery events without failing the deploy', () => {
     for (const backupOutput of [
       '../../etc/shadow',
@@ -223,6 +305,7 @@ describe('deploy pipeline', () => {
         const cmd = args[args.length - 1];
         if (cmd.includes('curl')) return '503';
         if (cmd.includes('pm2 jlist')) return '[]';
+        if (cmd.includes('prev-sha')) return PLAUSIBLE_SHA;
         return '';
       },
     };
@@ -665,6 +748,7 @@ describeOnPosix('PKG-82 Bug 2: SIGINT/SIGTERM mid-deploy', () => {
         if (cmd.includes('pm2 jlist')) {
           return JSON.stringify([{ name: 'app', pid: 1, pm2_env: { status: dbState } }]);
         }
+        if (cmd.includes('prev-sha')) return 'a'.repeat(40);
         return '';
       };
 
@@ -925,6 +1009,7 @@ describe('stepTimeoutSeconds', () => {
         const cmd = a[a.length - 1];
         if (cmd.includes('curl')) return '200';
         if (cmd.includes('pm2 jlist')) return '[]';
+        if (cmd.includes('prev-sha')) return PLAUSIBLE_SHA;
         return '';
       },
     };
@@ -943,6 +1028,7 @@ describe('stepTimeoutSeconds', () => {
         const cmd = a[a.length - 1];
         if (cmd.includes('curl')) return '200';
         if (cmd.includes('pm2 jlist')) return '[]';
+        if (cmd.includes('prev-sha')) return PLAUSIBLE_SHA;
         return '';
       },
     };
@@ -959,6 +1045,7 @@ describe('stepTimeoutSeconds', () => {
         const cmd = a[a.length - 1];
         if (cmd.includes('curl')) return '200';
         if (cmd.includes('pm2 jlist')) return '[]';
+        if (cmd.includes('prev-sha')) return PLAUSIBLE_SHA;
         return '';
       },
     };
@@ -974,6 +1061,7 @@ describe('stepTimeoutSeconds', () => {
         const cmd = a[a.length - 1];
         if (cmd.includes('curl')) return '200';
         if (cmd.includes('pm2 jlist')) return '[]';
+        if (cmd.includes('prev-sha')) return PLAUSIBLE_SHA;
         return '';
       },
     };
@@ -1049,6 +1137,99 @@ describe('deploy: lock, sha, stash-drop', () => {
     expect(joined).toContain(`git rev-parse HEAD > ${shaFile}`);
     expect(joined.indexOf(`git rev-parse HEAD > ${shaFile}`)).toBeLessThan(joined.indexOf('git fetch'));
   });
+
+  // PKG-135 Finding 1: the write above is tolerated (its own shell `|| true`
+  // makes `res.ok` true even when nothing usable landed), so a green write was
+  // never proof `deploy-kit rollback` had anything to reset to. deploy() must
+  // read the pointer back and abort — before fetch/pull touch anything — if it
+  // doesn't match HEAD.
+  it('aborts BEFORE fetch/pull when the write fails and nothing was ever recorded', () => {
+    const { runtime, calls } = makeRuntime({ prevShaWriteFails: true });
+    expect(() => deploy(baseConfig, {}, ctxWith(runtime)))
+      .toThrow(/could not establish a rollback pointer/);
+    // Ordering, not just the throw: fetch/pull must never have been reached.
+    expect(calls.some((c) => c.includes('git fetch'))).toBe(false);
+    expect(calls.some((c) => c.includes('git pull'))).toBe(false);
+    // And nothing past fetch/pull either (install, migrate, restart, …).
+    expect(calls.some((c) => c.includes('npm ci'))).toBe(false);
+    expect(calls.some((c) => c.includes('db:migrate'))).toBe(false);
+  });
+
+  // PKG-135 Finding C (Codex): checking that the recorded value merely LOOKS
+  // like a SHA is not enough — a write that fails to overwrite an EXISTING,
+  // readable file (read-only fs, permissions, a full disk stopping the `>`
+  // redirect from truncating) leaves the OLD sha in place, which still looks
+  // perfectly plausible while being silently STALE. The write/read coupling
+  // in makeRuntime models exactly this: `prevShaFileSeed` is what a PRIOR
+  // deploy left behind, `prevShaWriteFails: true` means THIS deploy's write
+  // never touched it, so the file still holds the old value when the gate
+  // reads it back — and that old value does not match the (different) HEAD
+  // makeRuntime reports for this run.
+  it('a STALE recorded value (an old, still-plausible sha left over from a prior deploy, THIS write failed) also aborts', () => {
+    const staleSha = 'b'.repeat(40); // plausible-looking, but NOT this run's HEAD
+    const { runtime, calls } = makeRuntime({ prevShaFileSeed: staleSha, prevShaWriteFails: true });
+    expect(() => deploy(baseConfig, {}, ctxWith(runtime)))
+      .toThrow(/could not establish a rollback pointer/);
+    expect(calls.some((c) => c.includes('git fetch'))).toBe(false);
+  });
+
+  it('a plausible recorded SHA that matches HEAD (the healthy path) proceeds normally', () => {
+    const { runtime } = makeRuntime(); // default: write succeeds, recorded === headSha
+    const result = deploy(baseConfig, {}, ctxWith(runtime));
+    expect(result.healthy).toBe(true);
+  });
+
+  // PKG-135 Finding D1 (Codex): a SHA-256 repository's `git rev-parse HEAD`
+  // returns a 64-hex-char object id, not the 40-char SHA-1 shape — the gate
+  // must not reject a legitimate SHA-256 repo's own HEAD.
+  it('a 64-char SHA-256 HEAD is accepted (not just 40-char SHA-1)', () => {
+    const sha256 = 'f'.repeat(64);
+    const { runtime } = makeRuntime({ headSha: sha256 });
+    const result = deploy(baseConfig, {}, ctxWith(runtime));
+    expect(result.healthy).toBe(true);
+  });
+
+  // PKG-135 Finding D2 (Codex): a fresh host where `projectDir` is an
+  // initialized repo with an unborn branch (no commits yet) — `git rev-parse
+  // HEAD` fails/returns empty. This is a LEGITIMATE first deploy (the
+  // upcoming `git pull` establishes the initial checkout) and must NOT abort
+  // — there is genuinely no prior revision to protect yet.
+  it('an unborn branch / brand-new repo (HEAD cannot be determined) does NOT abort — a legitimate first deploy', () => {
+    const { runtime, calls } = makeRuntime({ headSha: '' });
+    const result = deploy(baseConfig, {}, ctxWith(runtime));
+    expect(result.healthy).toBe(true);
+    expect(calls.some((c) => c.includes('git fetch'))).toBe(true);
+  });
+
+  // Same as above, but with a LEFTOVER file already present (e.g. copied in
+  // from another host, or a stale artifact) — proves the gate is SKIPPED
+  // ENTIRELY when HEAD can't be determined, not merely "skipped because the
+  // file happens to be empty too". A version of the fix that compared
+  // instead of skipping (`recorded !== head`, without first checking `head`
+  // is non-empty) would still spuriously abort here, since the leftover file
+  // content would never equal an empty HEAD.
+  it('an unborn branch with a LEFTOVER stale file present still does not abort (the gate is skipped, not coincidentally satisfied)', () => {
+    const { runtime, calls } = makeRuntime({ headSha: '', prevShaFileSeed: 'd'.repeat(40), prevShaWriteFails: true });
+    const result = deploy(baseConfig, {}, ctxWith(runtime));
+    expect(result.healthy).toBe(true);
+    expect(calls.some((c) => c.includes('git fetch'))).toBe(true);
+  });
+
+  it('--dry-run never aborts over the rollback pointer (the dry-run fake never really writes one)', () => {
+    const calls: string[] = [];
+    const runtime = {
+      dryRun: true,
+      execFileSync: (_f: string, a: string[]) => {
+        const cmd = a[a.length - 1];
+        calls.push(cmd);
+        return cmd.includes('curl') ? '200' : '';
+      },
+    };
+    const result = deploy(baseConfig, {}, { runtime, sleep: () => {} });
+    expect(result.healthy).toBe(true);
+    expect(calls.some((c) => c.includes('git fetch'))).toBe(true);
+  });
+
   it('drops the deploy-kit stash after a successful pull', () => {
     const { runtime, calls } = makeRuntime();
     deploy(baseConfig, {}, ctxWith(runtime));
@@ -1143,6 +1324,7 @@ describe('multi-endpoint health', () => {
         if (cmd.includes('/bad')) return '503';
         if (cmd.includes('curl')) return '200';
         if (cmd.includes('pm2 jlist')) return '[]';
+        if (cmd.includes('prev-sha')) return PLAUSIBLE_SHA;
         return '';
       },
     };
@@ -1157,6 +1339,7 @@ describe('waitForHealth retries', () => {
       execFileSync: (_f: string, a: string[]) => {
         const cmd = a[a.length - 1];
         if (cmd.includes('pm2 jlist')) return '[]';
+        if (cmd.includes('prev-sha')) return PLAUSIBLE_SHA;
         if (!cmd.includes('curl')) return '';
         n += 1;
         return n >= 3 ? '200' : '503';
@@ -1200,6 +1383,7 @@ describe('local mode deploy end-to-end', () => {
         const cmd = a[a.length - 1];
         if (cmd.includes('curl')) return '200';
         if (cmd.includes('pm2 jlist')) return '[]';
+        if (cmd.includes('prev-sha')) return PLAUSIBLE_SHA;
         return '';
       },
     };
@@ -1228,6 +1412,22 @@ describe('rollback', () => {
   it('throws when there is no recorded SHA', () => {
     const runtime = { execFileSync: (_f: string, a: string[]) => (a[a.length - 1].includes('curl') ? '200' : '') };
     expect(() => rollback(rbCfg, {}, { runtime, sleep: () => {} })).toThrow(/No recorded previous revision/);
+  });
+  // PKG-135 Finding D1 (Codex): a SHA-256 repository records a 64-hex-char
+  // pointer, not the 40-char SHA-1 shape — rollback()'s own plausibility
+  // check must accept it too, not just deploy()'s write-time gate.
+  it('accepts a 64-char SHA-256 recorded pointer, not just 40-char SHA-1', () => {
+    const sha256 = 'c'.repeat(64);
+    const runtime = {
+      execFileSync: (_f: string, a: string[]) => {
+        const cmd = a[a.length - 1];
+        if (cmd.includes('prev-sha')) return sha256;
+        return cmd.includes('curl') ? '200' : '';
+      },
+    };
+    const result = rollback(rbCfg, {}, { runtime, sleep: () => {} });
+    expect(result.sha).toBe(sha256);
+    expect(result.healthy).toBe(true);
   });
   it('actually issues git reset --hard <sha>', () => {
     const sha = 'b'.repeat(40);

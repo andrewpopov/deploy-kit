@@ -360,6 +360,9 @@ describeOnPosix('lock: false still records a prev-sha (PKG-82 Blocker 2 regressi
         const cmd = args[args.length - 1];
         calls.push(cmd);
         if (cmd.includes('curl')) return '200'; // health check
+        // PKG-135 Finding 1: deploy() reads the prev-sha pointer back and
+        // aborts unless it looks like a real SHA -- give it one.
+        if (cmd.includes('prev-sha')) return 'a'.repeat(40);
         return '';
       },
     };
