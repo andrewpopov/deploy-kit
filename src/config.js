@@ -25,6 +25,10 @@ const DEFAULT_CONFIG = {
   // a non-zero exit aborts the deploy with nothing changed (free disk, DB reachable,
   // required secret present, …). The kit runs them; the consumer supplies them.
   preDeployChecks: [],
+  // Named gates run after the candidate is installed/built/validated but BEFORE
+  // dbBoundApps are stopped. Use for migration rehearsals against a disposable
+  // current-data copy: failure aborts while the live app is still serving.
+  preMigrationChecks: [],
   // Post-health gates run after the new app is healthy. Use them for public smoke
   // journeys and asset-contract checks that a localhost health probe cannot see.
   // Release-layout consumers must choose an explicit onFailure policy per check:
@@ -183,6 +187,7 @@ const KEY_TYPES = {
   tunnelName: 'string?',
   ensureApps: 'array',
   preDeployChecks: 'array',
+  preMigrationChecks: 'array',
   postDeployChecks: 'array',
   preRestartChecks: 'array',
   ecosystemFile: 'string?',
@@ -572,6 +577,7 @@ function validateConfig(raw, { source = 'config' } = {}) {
     problems.push(`${source}: "mode" must be "ssh" or "local"`);
   }
   problems.push(...validateDeployChecks(raw.preDeployChecks, 'preDeployChecks', source));
+  problems.push(...validateDeployChecks(raw.preMigrationChecks, 'preMigrationChecks', source));
   problems.push(...validateDeployChecks(raw.postDeployChecks, 'postDeployChecks', source));
   if (raw.layout?.type === 'releases' && Array.isArray(raw.postDeployChecks)) {
     raw.postDeployChecks.forEach((check, index) => {

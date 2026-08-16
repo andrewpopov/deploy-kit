@@ -399,6 +399,10 @@ function deploy(config, options = {}, ctx = {}) {
     }
 
     if (!skipMigrate) {
+      for (const check of config.preMigrationChecks) {
+        run(`Pre-migration check: ${check.name}`, check.command);
+        steps.push(`pre-migration-check:${check.name}`);
+      }
       if (config.dbBoundApps.length) {
         // Stop DB-bound processes BEFORE the backup — matches release.js
         // (:488-494): a writer left online during the snapshot can produce an

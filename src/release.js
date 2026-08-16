@@ -665,6 +665,18 @@ function deployRelease(config, options = {}, ctx = {}) {
     }
     steps.push('validate');
 
+    // Candidate code and migration files are now final, but production writers
+    // are still online. This is the last non-disruptive gate: consumers can take
+    // a WAL-safe disposable copy, run the candidate migrations against it, and
+    // abort without stopping the live service when data-dependent SQL fails.
+    if (!skipMigrate) {
+      for (const check of config.preMigrationChecks) {
+        log.step(`Pre-migration check: ${check.name}`);
+        runInDir(st.releaseDir, check.command, config, c);
+        steps.push(`pre-migration-check:${check.name}`);
+      }
+    }
+
     // ================= disruptive window opens =================
     // From here a failure can leave production stopped or the schema changed, so we
     // MUST have a validated known-good release to fall back to. Refuse to proceed if

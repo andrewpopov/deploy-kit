@@ -190,7 +190,7 @@ describe('no regression: every currently-valid invocation still dispatches', () 
         releaseChecks: [{ name: 'entrypoint', command: 'test -f dist/server.js' }],
         runningShaCommand: 'read-running-sha',
       },
-      postDeployChecks: [{ name: 'public-smoke', command: 'run-public-smoke' }],
+      postDeployChecks: [{ name: 'public-smoke', command: 'run-public-smoke', onFailure: 'rollback' }],
       deliveryEvent: { command: 'emit-delivery-event' },
       hooks: {
         install: 'install-deps', backup: 'backup-db', migrate: 'migrate-db',
