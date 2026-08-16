@@ -223,15 +223,17 @@ stable `ecosystemFile` whose `cwd` is the literal `…/current`. deploy-kit neve
 performs the one-time host restructure — that is a separate, per-app, reversible
 migration. A legacy deploy against a migrated host (or vice-versa) fails closed.
 
-`--dry-run` against a release-layout host runs preflight's reads for real (the
-layout marker, GNU `mv`, free disk, the interrupted-deploy state file, and the
-`current`/`previous` pointers) — all pre-existing host state, none of it changed
-by anything a dry run does — so a genuinely migrated host preflights cleanly
-instead of every read coming back empty and preflight refusing with "requires a
-migrated host" (unreleased fix, PKG-127). Everything past that point (worktree
-materialize, install, build, the symlink flip, restarts, …) stays simulated:
-none of it is real state the dry run could safely read, since a dry run never
-actually performs the earlier mutating steps it depends on.
+`--dry-run` against a release layout is a deterministic, config-only plan. It
+prints the complete command stream from preflight through materialize, install,
+pin verification, build, validation, backup/migration, activation verification,
+post-deploy checks, delivery event, metadata, and pruning without opening SSH or
+executing a local target command. Captured values that later phases require —
+layout marker, current/previous pointers, commit SHA, release timestamp, backup
+reference, PM2 state, health, and running SHA — are internally consistent symbolic
+values. Config validation still runs before planning and fails by the exact invalid
+field. Use a real deploy or an explicit live diagnostic when host truth is required;
+the dry-run is an executable-plan review, not a host health check (unreleased,
+CAIRN-369).
 
 ### `port-guard` (shared-host port-conflict guard)
 
@@ -466,7 +468,7 @@ npx deploy-kit announce-discord [--webhook-env NAME] [--service NAME]  # conveni
 npx deploy-kit run-host-operations --action DEPLOY_PRODUCTION  # claim one allowlisted operations-API request and run this configured deploy
 npx deploy-kit run-cairn-operations  # deprecated alias: same as above with the Cairn defaults
 npx deploy-kit deploy            # full pipeline
-npx deploy-kit deploy --dry-run  # print the command stream; mutates nothing (a few read-only preflight checks run for real — see "--dry-run" below)
+npx deploy-kit deploy --dry-run  # print a complete deterministic command plan; contacts no target
 npx deploy-kit rollback          # git reset to the pre-last-deploy SHA + rebuild + restart
 npx deploy-kit dashboard         # status + health + git
 npx deploy-kit status|health|resources|git
@@ -487,7 +489,7 @@ npx deploy-kit logs [--lines N] [--follow] [--errors]
 | `run-cairn-operations` | — | **Deprecated** alias for `run-host-operations` with the old fixed defaults (action `DEPLOY_CAIRN_PRODUCTION`, env vars `CAIRN_OPERATIONS_API_URL` / `CAIRN_OPERATIONS_API_KEY`). Kept for existing Cairn consumers; new integrations should use `run-host-operations` directly. |
 | `deploy` | `--skip-build` `--skip-deps` `--skip-migrate` `--no-stash` `--dry-run` `--steal-lock` `--no-lock` | Run the full pipeline. Under the release layout, `--no-stash` is rejected (nothing to stash — see Release layout below). |
 | `rollback` | `--skip-build` `--skip-deps` `--dry-run` `--steal-lock` `--no-lock` | Reset to the recorded pre-deploy SHA, rebuild, restart, health-gate. Does **not** accept `--skip-migrate` or `--no-stash` — rollback never reads them. Under the release layout, `--skip-build`/`--skip-deps` are rejected (rollback is an instant flip to an already-built release — see Release layout below). |
-| — `--dry-run` | | Prints the exact command stream and mutates nothing. A handful of genuinely read-only preflight probes (release-layout host migration marker, interrupted-deploy state, `current`/`previous` pointers, GNU `mv`, free disk) run for real against the target so `--dry-run` reflects the host's actual state instead of asserting every read comes back empty — see Release layout below. |
+| — `--dry-run` | | Prints the complete deterministic command stream and executes nothing locally or remotely. Release-layout captured values are symbolic and internally consistent so every phase can be reviewed; config validation remains real. See Release layout below. |
 | `monitor` | `--steal-lock` `--no-lock` `--local` | Run the `monitor` checks, alert on transitions, exit `0`/`1`/`2`. For a cron. `--local` (Since 0.19) forces `mode:'local'` for this run. |
 | `status` / `health` / `resources` / `git` / `dashboard` | — | Read-only target inspection. Exits `1` if the underlying command(s) didn't actually run (e.g. the SSH connection failed) — `dashboard` exits `1` if any of `status`/`health`/`git` does (unreleased; these used to exit `0` regardless). |
 | `start` / `stop` / `restart` | — | PM2 lifecycle over `appNames`. Take **no** flags — including no `--dry-run`; these always run for real, and passing any flag (e.g. a typo'd `--dry-run`) is rejected rather than silently ignored. |
