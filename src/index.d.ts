@@ -117,6 +117,10 @@ export interface DeployConfig {
   tunnelName: string | null;
   ensureApps?: string[];
   preDeployChecks?: PreDeployCheck[];
+  /** Named gates run after candidate preparation but before dbBoundApps are
+   * stopped. Intended for disposable current-data migration rehearsals: a
+   * failure aborts while the live service remains online. */
+  preMigrationChecks?: PreDeployCheck[];
   /** Named gates run after health succeeds; failures fail the deployment result. */
   postDeployChecks?: PreDeployCheck[];
   /** Named gates run IMMEDIATELY BEFORE the app restart (legacy: after build, with

@@ -412,6 +412,40 @@ describe('deploy pipeline', () => {
     expect(joined).not.toContain('npm ci');
   });
 
+  it('preMigrationChecks run before writers stop and gate the disruptive window', () => {
+    const cfg = mergeConfig(baseConfig, {
+      preMigrationChecks: [{ name: 'schema-rehearsal', command: 'npm run db:rehearse' }],
+    });
+    const { runtime, calls } = makeRuntime();
+    const result = deploy(cfg, {}, ctxWith(runtime));
+    expect(result.steps).toContain('pre-migration-check:schema-rehearsal');
+    const rehearsal = calls.findIndex((command) => command.includes('npm run db:rehearse'));
+    const stop = calls.findIndex((command) => command.includes('pm2 stop app'));
+    const backup = calls.findIndex((command) => command.includes('npm run db:backup'));
+    expect(rehearsal).toBeGreaterThanOrEqual(0);
+    expect(rehearsal).toBeLessThan(stop);
+    expect(stop).toBeLessThan(backup);
+
+    const failed = makeRuntime({ fail: ['npm run db:rehearse'] });
+    expect(() => deploy(cfg, {}, ctxWith(failed.runtime))).toThrow(/Pre-migration check: schema-rehearsal failed/);
+    expect(failed.calls.some((command) => command.includes('pm2 stop app'))).toBe(false);
+    expect(failed.calls.some((command) => command.includes('npm run db:backup'))).toBe(false);
+  });
+
+  it('preMigrationChecks are skipped with --skip-migrate', () => {
+    const cfg = mergeConfig(baseConfig, {
+      preMigrationChecks: [{ name: 'schema-rehearsal', command: 'npm run db:rehearse' }],
+    });
+    const { runtime, calls } = makeRuntime();
+    deploy(cfg, { skipMigrate: true }, ctxWith(runtime));
+    expect(calls.some((command) => command.includes('npm run db:rehearse'))).toBe(false);
+  });
+
+  it('rejects malformed preMigrationChecks instead of silently ignoring them', () => {
+    expect(validateConfig({ preMigrationChecks: [{ name: '', command: '' }] }).join('\n'))
+      .toMatch(/preMigrationChecks\[0\]\.(name|command)/);
+  });
+
   it('runs postDeployChecks after health and fails the deploy when one fails', () => {
     const cfg = mergeConfig(baseConfig, {
       postDeployChecks: [{ name: 'public-smoke', command: 'npm run test:smoke:prod' }],

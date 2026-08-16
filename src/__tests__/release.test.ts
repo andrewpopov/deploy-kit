@@ -331,6 +331,41 @@ describe('release deploy — preRestartChecks', () => {
   });
 });
 
+describe('release deploy — preMigrationChecks', () => {
+  it('runs after candidate validation and before writers stop', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    const cfg = relConfig({
+      preMigrationChecks: [{ name: 'schema-rehearsal', command: 'run-rehearsal' }],
+    });
+    const result = release.deployRelease(cfg, {}, ctx(runtime));
+    expect(result.steps).toContain('pre-migration-check:schema-rehearsal');
+    const validate = calls.findIndex((command) => command.includes('check-prisma'));
+    const rehearsal = calls.findIndex((command) => command.includes('run-rehearsal'));
+    const stop = calls.findIndex((command) => command.includes('pm2 stop app'));
+    expect(validate).toBeLessThan(rehearsal);
+    expect(rehearsal).toBeLessThan(stop);
+  });
+
+  it('a failed rehearsal aborts with writers still online and no live backup', () => {
+    const { runtime, calls } = makeReleaseRuntime({ fail: ['run-rehearsal'] });
+    const cfg = relConfig({
+      preMigrationChecks: [{ name: 'schema-rehearsal', command: 'run-rehearsal' }],
+    });
+    expect(() => release.deployRelease(cfg, {}, ctx(runtime))).toThrow(/run-rehearsal/);
+    expect(calls.some((command) => command.includes('pm2 stop app'))).toBe(false);
+    expect(calls.some((command) => command.includes('run-backup'))).toBe(false);
+  });
+
+  it('skips rehearsal with --skip-migrate', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    const cfg = relConfig({
+      preMigrationChecks: [{ name: 'schema-rehearsal', command: 'run-rehearsal' }],
+    });
+    release.deployRelease(cfg, { skipMigrate: true }, ctx(runtime));
+    expect(calls.some((command) => command.includes('run-rehearsal'))).toBe(false);
+  });
+});
+
 // PKG-135 Finding 5: `current` is flipped to the rollback target BEFORE
 // preRestartChecks run. Before this fix, a failing check threw straight out
 // of rollbackRelease() -- `current` was left pointing at the (unrestarted)
