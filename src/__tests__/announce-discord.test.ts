@@ -40,6 +40,17 @@ describe('formatDiscordMessage', () => {
     const msg = formatDiscordMessage(SAMPLE_EVENT);
     expect(msg).toMatch(/^🚀 `app` deployed/);
   });
+
+  it('renders degraded and failed recovery outcomes distinctly', () => {
+    expect(formatDiscordMessage({
+      ...SAMPLE_EVENT, status: 'degraded', failedCheck: 'public-smoke',
+      recovery: { policy: 'remain-active', outcome: 'remained-active', verified: true },
+    })).toMatch(/^⚠️ .* is degraded after `public-smoke`/);
+    expect(formatDiscordMessage({
+      ...SAMPLE_EVENT, status: 'failed', failedCheck: 'public-smoke',
+      recovery: { policy: 'rollback', outcome: 'rolled-back', verified: true },
+    })).toMatch(/^❌ .* failed \(`rolled-back`\) after `public-smoke`/);
+  });
 });
 
 describe('announceDiscord (module)', () => {

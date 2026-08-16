@@ -42,6 +42,16 @@ export interface PreDeployCheck {
   command: string;
 }
 
+export type PostDeployFailurePolicy = 'rollback' | 'remain-active' | 'manual';
+
+export interface PostDeployCheck extends PreDeployCheck {
+  /** Required for release layouts. `rollback` restores the prior code release
+   * (and the pre-migration backup when a migration ran); `remain-active` keeps
+   * the candidate serving but records a degraded deployment; `manual` leaves
+   * the verified candidate active and records that an operator decision is due. */
+  onFailure?: PostDeployFailurePolicy;
+}
+
 export interface HealthCheck {
   port?: number;
   path?: string;
@@ -117,8 +127,9 @@ export interface DeployConfig {
   tunnelName: string | null;
   ensureApps?: string[];
   preDeployChecks?: PreDeployCheck[];
-  /** Named gates run after health succeeds; failures fail the deployment result. */
-  postDeployChecks?: PreDeployCheck[];
+  /** Named gates run after health succeeds. Release layouts require an explicit
+   * `onFailure` policy for every check. */
+  postDeployChecks?: PostDeployCheck[];
   /** Named gates run IMMEDIATELY BEFORE the app restart (legacy: after build, with
    * dbBoundApps still paused; release layout: after the `current` flip). A failure
    * resumes paused apps / runs phase recovery before aborting. Also gates
@@ -512,13 +523,26 @@ export function runCairnOperations(config: DeployConfig, options?: {
 }): Promise<{ state: 'idle' } | { state: 'succeeded'; id: string }>;
 
 /** The `deliveryEvent.command` payload deploy.js/release.js pipe on stdin after
- * a successful deploy — see `DeployConfig['deliveryEvent']`. */
+ * a terminal deployment outcome — see `DeployConfig['deliveryEvent']`. */
+export interface DeliveryRecovery {
+  policy: PostDeployFailurePolicy;
+  outcome: 'rolled-back' | 'remained-active' | 'manual-decision-required' | 'rollback-failed';
+  verified: boolean;
+}
+
 export interface DeliveryEvent {
   event: 'deployment';
-  status: 'succeeded';
+  status: 'succeeded' | 'failed' | 'degraded';
   branch: string;
+  /** Attempted deployment revision. */
   revision: string;
   deployedAt: string;
+  failedCheck?: string;
+  /** Revision currently serving when it is known. A rolled-back release may be
+   * identified only by `activeRelease` when its full SHA is unavailable. */
+  activeRevision?: string;
+  activeRelease?: string;
+  recovery?: DeliveryRecovery;
   /** Opaque backup label, never the host-local backup path. Present when a backup hook emits a usable id. */
   backupReference?: string;
 }

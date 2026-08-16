@@ -1,7 +1,7 @@
 'use strict';
 
 // A bundled, OPT-IN convenience deliveryEvent.command that posts a RELEASE
-// announcement to a per-app Discord channel after a successful deploy: the
+// announcement to a per-app Discord channel after a deploy outcome: the
 // release counterpart to alert-discord.js's incident sink.
 //
 // This is NOT part of the policy-free delivery-event contract — deploy.js and
@@ -34,6 +34,13 @@ function formatDiscordMessage(event, { service = DEFAULT_SERVICE } = {}) {
   const shortSha = revision ? revision.slice(0, 7) : 'unknown';
   const deployedAt = (event && event.deployedAt) || new Date().toISOString();
   const when = formatTimestamp(deployedAt);
+  if (event?.status === 'degraded') {
+    return `⚠️ \`${service}\` deployment \`${branch}@${shortSha}\` is degraded after \`${event.failedCheck || 'post-deploy check'}\` at ${when}`;
+  }
+  if (event?.status === 'failed') {
+    const outcome = event.recovery?.outcome || 'failed';
+    return `❌ \`${service}\` deployment \`${branch}@${shortSha}\` failed (\`${outcome}\`) after \`${event.failedCheck || 'post-deploy check'}\` at ${when}`;
+  }
   return `🚀 \`${service}\` deployed \`${branch}@${shortSha}\` at ${when}`;
 }
 

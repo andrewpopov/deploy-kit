@@ -174,7 +174,7 @@ describe('release deploy — happy path', () => {
   it('runs post-deploy checks and delivery events after activation', () => {
     const { runtime, calls, inputs } = makeReleaseRuntime();
     const result = release.deployRelease(relConfig({
-      postDeployChecks: [{ name: 'public-smoke', command: 'cd current && run-smoke' }],
+      postDeployChecks: [{ name: 'public-smoke', command: 'cd current && run-smoke', onFailure: 'rollback' }],
       deliveryEvent: { command: 'cd current && emit-event' },
     }), {}, ctx(runtime));
     expect(result.steps).toContain('post-check:public-smoke');
@@ -284,6 +284,109 @@ describe('release deploy — happy path', () => {
     const v = release.verifyActivation(relConfig(), release.releasePaths(relConfig()), SHA, rt.cfg.canonical, ctx(runtime));
     expect(v.ok).toBe(false);
     expect(v.reason).toMatch(/crash loop/);
+  });
+});
+
+describe('release deploy — post-deploy failure policy', () => {
+  const failingCheck = (onFailure?: string) => ({
+    name: 'public-smoke', command: 'run-smoke', ...(onFailure ? { onFailure } : {}),
+  });
+
+  it('rejects a missing policy before acquiring the deploy lock', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    expect(() => release.deployRelease(relConfig({ postDeployChecks: [failingCheck()] }), {}, ctx(runtime)))
+      .toThrow(/onFailure/);
+    expect(calls).toEqual([]);
+  });
+
+  it('rolls code and migrated data back, verifies the previous release, journals the outcome, and emits failure', () => {
+    const { runtime, calls, inputs, cfg } = makeReleaseRuntime({ fail: ['run-smoke'] });
+    const config = relConfig({
+      postDeployChecks: [failingCheck('rollback')],
+      deliveryEvent: { command: 'emit-event' },
+    });
+
+    expect(() => release.deployRelease(config, {}, ctx(runtime)))
+      .toThrow(/public-smoke \(policy: rollback\)/);
+
+    const lastIndex = (needle: string) => calls.reduce((found, command, index) => (
+      command.includes(needle) ? index : found
+    ), -1);
+    const flipBack = calls.findIndex((command) => command.includes(`ln -s ${cfg.currentLink} /srv/app/.dk-swap.$$.current`));
+    expect(lastIndex('pm2 stop')).toBeLessThan(flipBack);
+    expect(flipBack).toBeLessThan(lastIndex('run-restore'));
+    expect(lastIndex('run-restore')).toBeLessThan(lastIndex('pm2 startOrRestart'));
+
+    const event = JSON.parse(inputs.filter(({ command }) => command.includes('emit-event')).at(-1)?.input ?? '{}');
+    expect(event).toMatchObject({
+      status: 'failed', failedCheck: 'public-smoke', activeRelease: cfg.currentLink,
+      recovery: { policy: 'rollback', outcome: 'rolled-back', verified: true },
+    });
+    expect(event.backupReference).toBe('smarthome-20260710T090000Z.db.gpg');
+    expect(JSON.stringify(event)).not.toContain('/var/lib/smarthome/backups');
+    expect(calls.join('\n')).toContain('post-deploy-rolled-back');
+  });
+
+  it('keeps a verified candidate active under remain-active and records a degraded event even when its sink fails', () => {
+    const probe = makeReleaseRuntime();
+    const { runtime, calls, inputs } = makeReleaseRuntime({ fail: ['run-smoke', 'emit-event'] });
+    const warnings: string[] = [];
+    const log = { ...kit.makeLogger(() => {}, () => {}), warning: (message: string) => warnings.push(message) };
+    const config = relConfig({
+      postDeployChecks: [failingCheck('remain-active')],
+      deliveryEvent: { command: 'emit-event' },
+    });
+
+    expect(() => release.deployRelease(config, {}, { ...ctx(runtime), log }))
+      .toThrow(/policy: remain-active/);
+    expect(calls.some((command) => command.includes(`ln -s ${probe.cfg.currentLink} /srv/app/.dk-swap.$$.current`))).toBe(false);
+    expect(calls.some((command) => command.includes('run-restore'))).toBe(false);
+    const event = JSON.parse(inputs.filter(({ command }) => command.includes('emit-event')).at(-1)?.input ?? '{}');
+    expect(event).toMatchObject({
+      status: 'degraded', failedCheck: 'public-smoke', activeRevision: SHA,
+      recovery: { policy: 'remain-active', outcome: 'remained-active', verified: true },
+    });
+    expect(calls.join('\n')).toContain('post-deploy-degraded');
+    expect(warnings.some((message) => /on-host release journal/.test(message))).toBe(true);
+  });
+
+  it('records manual-decision-required without mutating code or data', () => {
+    const probe = makeReleaseRuntime();
+    const { runtime, calls, inputs } = makeReleaseRuntime({ fail: ['run-smoke'] });
+    const config = relConfig({
+      postDeployChecks: [failingCheck('manual')],
+      deliveryEvent: { command: 'emit-event' },
+    });
+    expect(() => release.deployRelease(config, {}, ctx(runtime))).toThrow(/policy: manual/);
+    expect(calls.some((command) => command.includes(`ln -s ${probe.cfg.currentLink} /srv/app/.dk-swap.$$.current`))).toBe(false);
+    expect(calls.some((command) => command.includes('run-restore'))).toBe(false);
+    const event = JSON.parse(inputs.filter(({ command }) => command.includes('emit-event')).at(-1)?.input ?? '{}');
+    expect(event.recovery).toEqual({ policy: 'manual', outcome: 'manual-decision-required', verified: true });
+    expect(calls.join('\n')).toContain('post-deploy-manual-decision');
+  });
+
+  it('journals and emits rollback-failed when the recovery pointer cannot be restored', () => {
+    const probe = makeReleaseRuntime();
+    const { runtime, calls, inputs } = makeReleaseRuntime({
+      fail: ['run-smoke', `ln -s ${probe.cfg.currentLink} /srv/app/.dk-swap.$$.current`],
+    });
+    const config = relConfig({
+      postDeployChecks: [failingCheck('rollback')],
+      deliveryEvent: { command: 'emit-event' },
+    });
+    expect(() => release.deployRelease(config, {}, ctx(runtime))).toThrow(/MANUAL RECOVERY REQUIRED/);
+    expect(calls.join('\n')).toContain('post-deploy-rollback-failed');
+    const event = JSON.parse(inputs.filter(({ command }) => command.includes('emit-event')).at(-1)?.input ?? '{}');
+    expect(event.recovery).toEqual({ policy: 'rollback', outcome: 'rollback-failed', verified: false });
+    expect(calls.filter((command) => command.includes('pm2 startOrRestart')).length).toBe(1);
+  });
+
+  it('refuses a new deploy after interruption during post-check rollback', () => {
+    const { runtime, calls } = makeReleaseRuntime({
+      stateContent: '{"phase":"post-deploy-rollback","releaseId":"a1b2c3d4e5f6-20260710T010000Z"}',
+    });
+    expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow(/interrupted mid-"post-deploy-rollback"/);
+    expect(calls.some((command) => command.includes('worktree add'))).toBe(false);
   });
 });
 
