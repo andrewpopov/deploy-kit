@@ -126,8 +126,8 @@ function makeUniversalRuntime(appNames: string[]) {
 
 const ctx = (runtime: unknown) => ({ runtime, sleep: () => {} });
 
-// Deploy behavior has deliberately diverged from v0.9.4 in five ways: four from
-// PKG-82, plus the pin gate. This function encodes exactly those deltas, narrowly
+// Deploy behavior has deliberately diverged from v0.9.4 in the documented ways
+// below. This function encodes exactly those deltas, narrowly
 // and anchored, so they can be applied to the v0.9.4 sequence and diffed against
 // the CURRENT kit's output. Anything the current kit does that ISN'T one of these
 // deltas will still show up as a mismatch — that's the whole point of keeping the
@@ -310,6 +310,17 @@ function applyIntentionalDeltas(oldSeq: string[], config: unknown): string[] {
     }
   }
 
+  // Delta 8 (CAIRN-371, release layout only): disruptive-phase journal records
+  // now carry the post-check failure policy/outcome fields. They are null before
+  // a post-check fails, preserving behavior while making the same atomic journal
+  // schema capable of recording pending and terminal recovery outcomes.
+  if (isReleaseLayout) {
+    seq = seq.map((cmd) => cmd.replace(
+      /("prevTarget":"[^"]+")(?=,"layoutVersion":1)/,
+      '$1,"failedCheck":null,"failurePolicy":null,"recoveryOutcome":null',
+    ));
+  }
+
   return seq;
 }
 
@@ -339,6 +350,7 @@ const CONFIGS: Record<string, unknown> = {
     postDeployChecks: [{
       name: 'production-board-smoke',
       command: 'cd current && set -a && . ./.env && set +a && E2E_PRODUCTION_SMOKE=1 E2E_BASE_URL=https://cairn.andrewvpopov.com npx playwright test --config packages/web-app/playwright.config.ts packages/web-app/e2e/production-board-smoke.spec.ts',
+      onFailure: 'rollback',
     }],
     deliveryEvent: { command: 'cd current && set -a && . ./.env && set +a && node scripts/emit-cairn-deployment-event.js' },
     hooks: {

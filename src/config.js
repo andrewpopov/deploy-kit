@@ -27,8 +27,9 @@ const DEFAULT_CONFIG = {
   preDeployChecks: [],
   // Post-health gates run after the new app is healthy. Use them for public smoke
   // journeys and asset-contract checks that a localhost health probe cannot see.
-  // A failure makes the deploy fail loudly; the active revision is left intact for
-  // an explicit, evidence-based rollback decision.
+  // Release-layout consumers must choose an explicit onFailure policy per check:
+  // rollback, remain-active, or manual. Legacy consumers retain their historical
+  // remain-active behavior until they move to the release layout.
   postDeployChecks: [],
   // Pre-restart check gates run IMMEDIATELY BEFORE the app (re)start step — after
   // build, with any dbBoundApps still paused. Each { name, command }; a non-zero
@@ -337,6 +338,12 @@ function validateDeployChecks(checks, key, source) {
     else if (names.has(check.name)) problems.push(`${source}: duplicate ${key} name "${check.name}"`);
     else names.add(check.name);
     if (typeof check.command !== 'string' || !check.command.trim()) problems.push(`${source}: ${where}.command must be a non-empty string`);
+    const allowedKeys = key === 'postDeployChecks' ? ['name', 'command', 'onFailure'] : ['name', 'command'];
+    problems.push(...rejectUnknownKeys(check, allowedKeys, source, where));
+    if (key === 'postDeployChecks' && check.onFailure != null
+      && !['rollback', 'remain-active', 'manual'].includes(check.onFailure)) {
+      problems.push(`${source}: ${where}.onFailure must be "rollback", "remain-active", or "manual"`);
+    }
   });
   return problems;
 }
@@ -566,6 +573,13 @@ function validateConfig(raw, { source = 'config' } = {}) {
   }
   problems.push(...validateDeployChecks(raw.preDeployChecks, 'preDeployChecks', source));
   problems.push(...validateDeployChecks(raw.postDeployChecks, 'postDeployChecks', source));
+  if (raw.layout?.type === 'releases' && Array.isArray(raw.postDeployChecks)) {
+    raw.postDeployChecks.forEach((check, index) => {
+      if (check && !['rollback', 'remain-active', 'manual'].includes(check.onFailure)) {
+        problems.push(`${source}: postDeployChecks[${index}].onFailure is required for release layouts`);
+      }
+    });
+  }
   problems.push(...validateDeployChecks(raw.preRestartChecks, 'preRestartChecks', source));
   // `layout` type is checked above (object?); if present, validate its inner shape.
   if (raw.layout != null && typeof raw.layout === 'object' && !Array.isArray(raw.layout)) {

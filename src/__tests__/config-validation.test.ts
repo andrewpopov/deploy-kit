@@ -132,6 +132,33 @@ describe('config validation: deliveryEvent inner shape', () => {
   });
 });
 
+describe('config validation: release-layout post-deploy failure policy', () => {
+  const layout = { type: 'releases' };
+  const check = { name: 'public-smoke', command: 'run-smoke' };
+
+  it('requires every release-layout post-deploy check to choose a policy', () => {
+    expect(validateConfig({ layout, postDeployChecks: [check] }).join('\n'))
+      .toMatch(/postDeployChecks\[0\]\.onFailure is required/);
+  });
+
+  it.each(['rollback', 'remain-active', 'manual'])('accepts %s', (onFailure) => {
+    expect(validateConfig({ layout, postDeployChecks: [{ ...check, onFailure }] })).toEqual([]);
+  });
+
+  it('rejects unknown policies and typoed check keys', () => {
+    const problems = validateConfig({
+      layout,
+      postDeployChecks: [{ ...check, onFailure: 'ignore', onFailuer: 'rollback' }],
+    }).join('\n');
+    expect(problems).toMatch(/onFailure must be/);
+    expect(problems).toMatch(/unknown postDeployChecks\[0\] key "onFailuer"/);
+  });
+
+  it('preserves the legacy layout behavior when no policy is supplied', () => {
+    expect(validateConfig({ postDeployChecks: [check] })).toEqual([]);
+  });
+});
+
 // PKG-135 Finding 6: `validateConfig` only ever allowlisted TOP-LEVEL keys and
 // type-checked each nested block as a whole ('object') — never its CONTENTS.
 // "hooks.migarte" validated fine, was never read by deploy.js, and silently

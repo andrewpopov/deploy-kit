@@ -278,7 +278,7 @@ function assertNoInterruptedDeploy(config, paths, ctx) {
   if (!raw) return;
   let state;
   try { state = JSON.parse(raw); } catch { return; } // unreadable → best-effort, don't block
-  if (state && ['stopped', 'migrated', 'flipped'].includes(state.phase)) {
+  if (state && ['stopped', 'migrated', 'flipped', 'post-deploy-failed', 'post-deploy-rollback'].includes(state.phase)) {
     throw new Error(
       `A previous deploy was interrupted mid-"${state.phase}" (release ${state.releaseId || '?'}, backup `
       + `${state.backupId || 'none'}). Resolve it by hand — verify the DB/schema and the running release — then `
@@ -318,11 +318,24 @@ function deployRelease(config, options = {}, ctx = {}) {
     );
   }
 
+  for (const [index, check] of (config.postDeployChecks || []).entries()) {
+    if (!['rollback', 'remain-active', 'manual'].includes(check.onFailure)) {
+      throw new Error(
+        `Release layout requires postDeployChecks[${index}].onFailure to be "rollback", `
+        + '"remain-active", or "manual".',
+      );
+    }
+  }
+
   log.header(`🚀 Deploying [release layout] (${config.mode}${config.host ? ` → ${config.host}` : ''})`);
 
   const steps = [];
   // Mutable state the recovery machine reads. phase names match the failure table.
-  const st = { phase: 'preflight', dbAppsPaused: false, flipped: false, prevTarget: null, releaseDir: null, releaseId: null, sha: null, backupId: null, migrated: false };
+  const st = {
+    phase: 'preflight', dbAppsPaused: false, flipped: false, prevTarget: null,
+    releaseDir: null, releaseId: null, sha: null, branch: null, backupId: null,
+    migrated: false, failedCheck: null, failurePolicy: null, recoveryOutcome: null,
+  };
 
   // Durably journal the disruptive-phase state BEFORE each irreversible op, so a
   // process/SSH/power loss leaves an on-host record of whether the DB was migrated
@@ -331,6 +344,8 @@ function deployRelease(config, options = {}, ctx = {}) {
   const journal = () => persistState(config, paths, {
     phase: st.phase, releaseId: st.releaseId, sha: st.sha, backupId: st.backupId,
     migrated: st.migrated, flipped: st.flipped, prevTarget: st.prevTarget,
+    failedCheck: st.failedCheck, failurePolicy: st.failurePolicy,
+    recoveryOutcome: st.recoveryOutcome,
   }, c);
 
   // After a SUCCESSFUL recovery, overwrite the journaled disruptive phase so the
@@ -368,6 +383,60 @@ function deployRelease(config, options = {}, ctx = {}) {
     return res.ok;
   };
 
+  // Delivery events are best-effort transport, while the on-host journal is the
+  // durable source of truth. Every terminal post-check outcome is journaled first
+  // and then offered to the configured sink with only an opaque backup leaf.
+  const emitDeliveryEvent = (status, extra = {}) => {
+    if (!config.deliveryEvent?.command) return undefined;
+    const backupReference = backupReferenceFromId(st.backupId);
+    const payload = JSON.stringify({
+      event: 'deployment', status, branch: st.branch, revision: st.sha,
+      deployedAt: new Date().toISOString(),
+      ...(backupReference ? { backupReference } : {}),
+      ...extra,
+    });
+    const delivery = runInDir(paths.root, config.deliveryEvent.command, config, c, {
+      tolerate: true,
+      input: payload,
+    });
+    steps.push('delivery-event');
+    if (!delivery.ok) {
+      log.warning(
+        'Delivery event command failed (deliveryEvent.command); the on-host release journal contains the '
+        + 'outcome, but the receiving system did not receive it.',
+      );
+    }
+    return { delivered: delivery.ok };
+  };
+
+  const rollbackToPrevious = (fail) => {
+    if (!st.prevTarget) {
+      fail('no previous release exists to satisfy the configured rollback policy');
+    }
+    if (st.migrated && !stopWritersConfirmed()) {
+      fail('a migration ran but DB writers could not be confirmed stopped; do NOT restore over live writers — resolve by hand');
+    }
+    let flippedBack = true;
+    if (st.flipped) {
+      log.warning(`Flipping current back to ${st.prevTarget}`);
+      flippedBack = activateSymlink(config, paths, st.prevTarget, c, { tolerate: true });
+    }
+    if (st.migrated) {
+      if (!restoreDb()) {
+        fail(`a migration ran but the DB could not be auto-restored (backup ${st.backupId || 'unknown'}); restore it by hand before serving traffic`);
+      }
+      log.warning(`Restored pre-migration DB backup ${st.backupId || ''}`);
+    }
+    if (!flippedBack) {
+      fail(
+        `the symlink flip-back to ${st.prevTarget} itself failed; \`current\` may still point at the failed `
+        + `candidate release (${st.releaseId || st.releaseDir || 'unknown'}). PM2 was deliberately NOT `
+        + 'restarted; manually confirm the pointer and running process',
+      );
+    }
+    if (!resumePrevious().ok) fail('the previous release did not come back healthy after DB/symlink recovery');
+  };
+
   // Phase-appropriate recovery. Returns nothing; throws a distinct MANUAL RECOVERY
   // error if it cannot restore a known-good running release (never a routine abort).
   const recover = (err) => {
@@ -394,64 +463,62 @@ function deployRelease(config, options = {}, ctx = {}) {
       case 'migrated':
       case 'flipped':
       case 'verify': {
-        // Schema changed and/or symlink flipped. Order matters: the candidate may be
-        // running and writing to the DB, so STOP all writers and confirm they are down
-        // BEFORE restoring — otherwise the restore races live writes (Codex #1). Then
-        // flip current back and resume the previous release.
-        if (st.migrated) {
-          if (!stopWritersConfirmed()) {
-            fail('a migration ran but DB writers could not be confirmed stopped; do NOT restore over live writers — resolve by hand');
-          }
-        }
-        // PKG-135 Finding B's twin: `activateSymlink(..., { tolerate: true })`
-        // neither throws nor reports success on its own -- the ORIGINAL code
-        // threw the return value away here and unconditionally resumed the
-        // previous release next, so a flip-back that silently failed left
-        // `current` pointing at the failed CANDIDATE while PM2 got restarted
-        // regardless -- restarting onto the very release this recovery
-        // exists to move away from. `flippedBack` stays `true` when no flip
-        // was even attempted (st.flipped was never set), matching the ORIGINAL
-        // no-op behavior for that case.
-        let flippedBack = true;
-        if (st.flipped && st.prevTarget) {
-          log.warning(`Flipping current back to ${st.prevTarget}`);
-          flippedBack = activateSymlink(config, paths, st.prevTarget, c, { tolerate: true });
-        }
-        // DB restore ordering is UNCHANGED (writers-stopped -> flip -> restore,
-        // per the Codex #1 comment above) and runs REGARDLESS of whether the
-        // flip-back took: writers were already confirmed stopped above, so
-        // nothing is racing the restore either way, and this DELIBERATELY
-        // still restores even when the flip-back failed -- leaving a migrated
-        // (post-schema-change) DB paired with `current` reverting to
-        // pre-migration code (whenever an operator eventually fixes the
-        // symlink by hand) is its own hazard, and this is a plain data
-        // operation, not a traffic-affecting one. What must NOT happen is
-        // resuming traffic onto an unconfirmed `current` -- that's gated
-        // below, separately.
-        if (st.migrated) {
-          if (!restoreDb()) {
-            fail(`a migration ran but the DB could not be auto-restored (backup ${st.backupId || 'unknown'}); restore it by hand before serving traffic`);
-          }
-          log.warning(`Restored pre-migration DB backup ${st.backupId || ''}`);
-        }
-        if (!flippedBack) {
-          fail(
-            `the symlink flip-back to ${st.prevTarget} itself failed; \`current\` may still point at the failed `
-            + `candidate release (${st.releaseId || st.releaseDir || 'unknown'}). PM2 was deliberately NOT `
-            + 'restarted, since doing so could activate that candidate instead of the previous release'
-            + (st.migrated ? ' (the pre-migration DB backup WAS restored above -- writers were already confirmed stopped, so that was safe regardless of the symlink state)' : '')
-            + '. Manually confirm what `current` points at, and what (if anything) is actually running, before touching PM2 yourself',
-          );
-        }
-        if (!resumePrevious().ok) fail('the previous release did not come back healthy after DB/symlink recovery');
+        rollbackToPrevious(fail);
         markRecovered();
         return;
       }
-      case 'post-deploy':
-        // Post-deploy checks run only after activation has fully verified. They
-        // report a failed deploy but intentionally do not roll back a healthy
-        // release, matching the legacy pipeline's contract.
+      case 'post-deploy-failed': {
+        const eventBase = {
+          failedCheck: st.failedCheck,
+          activeRevision: st.sha,
+          activeRelease: `releases/${st.releaseId}`,
+        };
+        if (st.failurePolicy === 'remain-active') {
+          st.phase = 'post-deploy-degraded';
+          st.recoveryOutcome = 'remained-active';
+          journal();
+          emitDeliveryEvent('degraded', {
+            ...eventBase,
+            recovery: { policy: st.failurePolicy, outcome: st.recoveryOutcome, verified: true },
+          });
+          return;
+        }
+        if (st.failurePolicy === 'manual') {
+          st.phase = 'post-deploy-manual-decision';
+          st.recoveryOutcome = 'manual-decision-required';
+          journal();
+          emitDeliveryEvent('failed', {
+            ...eventBase,
+            recovery: { policy: st.failurePolicy, outcome: st.recoveryOutcome, verified: true },
+          });
+          return;
+        }
+
+        st.phase = 'post-deploy-rollback';
+        st.recoveryOutcome = 'pending';
+        journal();
+        try {
+          rollbackToPrevious(fail);
+          st.phase = 'post-deploy-rolled-back';
+          st.recoveryOutcome = 'rolled-back';
+          journal();
+          emitDeliveryEvent('failed', {
+            failedCheck: st.failedCheck,
+            activeRelease: st.prevTarget,
+            recovery: { policy: st.failurePolicy, outcome: st.recoveryOutcome, verified: true },
+          });
+        } catch (recoveryError) {
+          st.phase = 'post-deploy-rollback-failed';
+          st.recoveryOutcome = 'rollback-failed';
+          try { journal(); } catch { /* original recovery error remains primary */ }
+          emitDeliveryEvent('failed', {
+            ...eventBase,
+            recovery: { policy: st.failurePolicy, outcome: st.recoveryOutcome, verified: false },
+          });
+          throw recoveryError;
+        }
         return;
+      }
       default:
         fail(`unknown phase "${st.phase}"`);
     }
@@ -509,6 +576,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // as a bare mirror at repoGit rather than a checked-out working tree, so pass
     // gitDir through rather than relying on cwd having a `.git`.
     const branch = resolveBranch(config, c, { gitDir: paths.repoGit });
+    st.branch = branch;
     // Resolve the exact SHA from `refs/heads/<branch>` FIRST — that is the ref the
     // explicit `+refs/heads/*:refs/heads/*` fetch above just force-updated, so it is
     // always current. A remote-tracking `origin/<branch>` (present if repo.git has a
@@ -680,47 +748,24 @@ function deployRelease(config, options = {}, ctx = {}) {
     // These hooks are part of the public deploy contract, not a legacy-only
     // feature. Run from the stable root so callers can explicitly `cd current`
     // when their command needs release files, while preserving hooks that only
-    // operate on shared host state. A failure is reported without silently
-    // rolling back an already verified release.
+    // operate on shared host state. Every failure policy is explicit and its
+    // outcome is journaled before a durable delivery event is attempted.
     st.phase = 'post-deploy';
     journal();
     for (const check of config.postDeployChecks) {
       log.step(`Post-deploy check: ${check.name}`);
       const result = runInDir(paths.root, check.command, config, c, { tolerate: true });
-      if (!result.ok) throw new Error(`Post-deploy check failed: ${check.name}`);
+      if (!result.ok) {
+        st.failedCheck = check.name;
+        st.failurePolicy = check.onFailure;
+        st.recoveryOutcome = 'pending';
+        st.phase = 'post-deploy-failed';
+        journal();
+        throw new Error(`Post-deploy check failed: ${check.name} (policy: ${check.onFailure})`);
+      }
       steps.push(`post-check:${check.name}`);
     }
-    let deliveryEvent;
-    if (config.deliveryEvent?.command) {
-      // Backup hooks often return a host-local path. The delivery event is a
-      // cross-system audit record, so expose only its opaque leaf reference.
-      // This preserves a deploy-to-backup correlation without publishing host
-      // topology to the receiving control plane.
-      const backupReference = backupReferenceFromId(st.backupId);
-      const payload = JSON.stringify({
-        event: 'deployment', status: 'succeeded', branch,
-        revision: st.sha,
-        deployedAt: new Date().toISOString(),
-        ...(backupReference ? { backupReference } : {}),
-      });
-      // Non-gating by design (tolerate: true) -- a broken announcement must
-      // never turn an already-verified, already-activated release into a
-      // failure. But "reported" has to mean something observable (PKG-135
-      // Finding 7, same treatment as deploy.js's legacy pipeline): a warning
-      // plus the delivery status on the result, not a silent sink.
-      const delivery = runInDir(paths.root, config.deliveryEvent.command, config, c, {
-        tolerate: true,
-        input: payload,
-      });
-      steps.push('delivery-event');
-      if (!delivery.ok) {
-        log.warning(
-          'Delivery event command failed (deliveryEvent.command); the event was NOT delivered. This does not '
-          + 'fail the deploy, but the receiving system never heard about this deployment.',
-        );
-      }
-      deliveryEvent = { delivered: delivery.ok };
-    }
+    const deliveryEvent = emitDeliveryEvent('succeeded');
 
     // ---- Phase: metadata + prune (success; still holding the lock) ----
     st.phase = 'done';
