@@ -81,7 +81,7 @@ the operator chooses, not a fixed config field, so those stay open to any key.
 | `ensureApps` | `string[]` | `[]` | both | 0.4 | Auxiliary PM2 procs ensured up (tolerant) AFTER the app restart. A failure never fails the deploy. |
 | `preDeployChecks` | `{name,command}[]` | `[]` | both | 0.4 | Gates run BEFORE anything is touched; non-zero aborts with nothing changed. |
 | `preMigrationChecks` | `{name,command}[]` | `[]` | both | unreleased | Gates run after candidate preparation but before `dbBoundApps` are stopped. Use for a migration rehearsal against a disposable current-data copy; non-zero aborts before the disruptive window. Skipped with `--skip-migrate`. |
-| `postDeployChecks` | `{name,command}[]` | `[]` | both | 0.8 | Gates run after restart and every health probe succeeds; use public smoke journeys and asset checks. A failure reports the deploy as failed but does not silently roll back the live revision. |
+| `postDeployChecks` | `{name,command,onFailure?}[]` | `[]` | both | 0.8 | Gates run after restart and health succeeds. Release layouts require `onFailure: 'rollback' \| 'remain-active' \| 'manual'` for every check; see the policy section below. Legacy layouts retain their historical remain-active behavior. |
 | `preRestartChecks` | `{name,command}[]` | `[]` | both | 0.10 | Gates run IMMEDIATELY BEFORE the app restart (after build, with `dbBoundApps` still paused; after the release-layout flip). A failure resumes any paused apps (legacy deploy) or runs phase recovery (release-layout deploy) before aborting. Also gates `rollback`'s restart, for both layouts — under the release layout, `current` is flipped to the rollback target BEFORE this check runs, so a failure here flips `current` back and re-verifies the original release before aborting; it never leaves the symlink pointing somewhere the running process disagrees with (unreleased — this used to throw straight out, mid-flip). If the flip-BACK itself also fails, PM2 is deliberately left untouched and the error escalates to `MANUAL RECOVERY REQUIRED` — restarting against an unconfirmed `current` could activate the very release the recovery was trying to move away from, which is worse than doing nothing (unreleased). Use for a check against the freshly-built/flipped candidate right before it takes traffic — e.g. `port-guard` (see below). |
 | `ecosystemFile` | `string \| null` | `null` | both | 0.3 | PM2 ecosystem file (rel. to `projectDir`). Enables first-deploy-safe `pm2 start … --only … --update-env \|\| pm2 restart … --update-env`; each deploy refreshes process env from the ecosystem file. |
 | `port` | `number` | `3000` | both | 0.1 | Health-probe port (`http://localhost:<port>`). |
@@ -125,7 +125,7 @@ the operator chooses, not a fixed config field, so those stay open to any key.
 | `monitor.stateFile` | `string` | `<dir>/.deploy-kit-monitor-state.json` | both | 0.8 | Abs path to monitor state — a STABLE dir, never under `releases/`. |
 | `monitor.checkTimeoutSeconds` | `number` | `20` | both | 0.8 | Per-check wall-clock bound. |
 | `deliveryEvent` | `{command} \| null` | `null` | both | 0.9 | Opt-in post-health delivery event (see `announce-discord` below). `null` = skip. `command` is the only valid key — a typo (e.g. `comand`) is now rejected at config load (unreleased) instead of silently no-op'ing the feature. |
-| `deliveryEvent.command` | `string` | — | both | 0.9 | Shell command run on the target; receives structured deployment JSON (`event`, `status`, `branch`, `revision`, `deployedAt`, `backupReference?`) on **stdin**. A failure never turns a healthy deploy into a rollback, but it is reported: a warning is logged and `DeployResult.deliveryEvent = { delivered: false }` (both legacy `deploy()` and the release layout; unreleased). |
+| `deliveryEvent.command` | `string` | — | both | 0.9 | Shell command run on the target; receives structured deployment JSON (`event`, `status`, `branch`, `revision`, `deployedAt`, `failedCheck?`, `activeRevision?`, `activeRelease?`, `recovery?`, `backupReference?`) on **stdin**. Events cover success and release-layout post-check recovery. A sink failure is warned and recorded but never changes recovery policy. |
 
 ### mode: local
 
@@ -177,6 +177,34 @@ failed candidate) and the failure escalates to `MANUAL RECOVERY REQUIRED` naming
 the still-active target; a migration's DB restore still runs regardless (writers
 were already confirmed stopped, so it's a safe, traffic-independent data operation)
 but nothing is resumed (unreleased).
+
+#### Post-deploy failure policy
+
+Every release-layout `postDeployChecks` entry must choose what happens when its
+command fails:
+
+```json
+"postDeployChecks": [
+  { "name": "public-smoke", "command": "npm run smoke:prod", "onFailure": "rollback" }
+]
+```
+
+- `rollback` stops and confirms DB writers when a migration ran, flips `current`
+  to the prior release, restores the pre-migration backup, restarts, and verifies
+  the prior release. If any recovery gate fails, traffic is not blindly resumed
+  and the command escalates to `MANUAL RECOVERY REQUIRED`.
+- `remain-active` keeps the already activation-verified candidate serving but
+  records the deployment as degraded.
+- `manual` also leaves the verified candidate serving, records a failed deployment,
+  and names the unresolved operator decision explicitly.
+
+The on-host journal is written at failure, before rollback, and at the terminal
+outcome. A configured `deliveryEvent.command` then receives a `failed` or
+`degraded` event with the failed check, attempted revision, active release or
+revision, recovery policy/outcome, and only the redacted backup leaf reference.
+A failed event sink is warned but cannot change the chosen recovery action; the
+journal remains the durable local record. A hard interruption during rollback is
+recognized on the next invocation and blocks a new deploy until reconciled.
 
 **Flag semantics differ by layout** — the same flag can mean something
 different, or nothing, depending on which pipeline is running:
@@ -407,8 +435,10 @@ just a bundled *consumer* of that stdin-JSON contract:
 "deliveryEvent": { "command": "npx deploy-kit announce-discord" }
 ```
 
-It reads the delivery event on stdin (`{event:'deployment', status:'succeeded',
-branch, revision, deployedAt, backupReference?}` — see `deploy.js`/`release.js`).
+It reads the delivery event on stdin (`{event:'deployment', status, branch,
+revision, deployedAt, failedCheck?, activeRevision?, activeRelease?, recovery?,
+backupReference?}` — see `deploy.js`/`release.js`) and renders success, degraded,
+and failed recovery outcomes distinctly.
 When either deploy layout captured a safe backup id, `backupReference` contains
 only its opaque leaf label; host paths and unsafe/noisy output are omitted. It
 resolves the webhook URL from `process.env.DISCORD_RELEASE_WEBHOOK` (override with
