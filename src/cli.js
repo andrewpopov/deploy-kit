@@ -182,34 +182,61 @@ Commands:
   logs [--lines N] [--follow] [--errors]
   help`;
 
-// A runtime that prints the exact command stream instead of executing it. Health
-// probes return 200 so a dry-run walks the full happy path.
-//
-// `dryRun: true` opts into exec.js's `readOnly` escape hatch: a handful of
-// call sites (release.js's preflight, interrupted-deploy check, and current/
-// previous symlink reads — see their `readOnly: true` call sites) are
-// genuinely non-mutating probes of state that already exists on the host, and
-// are marked as such precisely so they can run for REAL here instead of
-// through the fake `execFileSync` below. Before this (PKG-127) every one of
-// those reads came back '' under `--dry-run`, so `--dry-run` could never
-// complete against a real release-layout host — the marker read alone made a
-// genuinely migrated host look unmigrated and abort the dry run with "Release
-// deploy requires a migrated host". `realExecFileSync` is left unset here, so
-// exec.js's normalizeRuntime() falls back to the real Node execFileSync — a
-// live, read-only ssh/local call. Every other command (anything not marked
-// readOnly — every mutation: install, build, migrate, the symlink flip, pm2
-// restarts, …) still only ever hits the fake execFileSync below, which never
-// touches the target.
-function dryRunContext() {
+// A deterministic, config-aware planner runtime. It prints every target command
+// but executes none of them — including calls marked readOnly. Captured values
+// are symbolic yet internally consistent, so release-layout planning reaches
+// every phase without needing SSH, a migrated host, PM2, or a real repository.
+function dryRunContext(config) {
+  const sha = 'd'.repeat(40);
+  const timestamp = '20990101T000000Z';
+  const releaseId = `${sha.slice(0, 12)}-${timestamp}`;
+  const candidateDir = `${config.projectDir}/releases/${releaseId}`;
+  const currentTarget = 'releases/111111111111-20981231T000000Z';
+  const previousTarget = 'releases/222222222222-20981230T000000Z';
+  let appsStopped = false;
+  const plannedOutput = (rendered) => {
+    if (rendered.includes('.deploy-kit-layout')) return '{"layout":"releases","version":1}';
+    if (rendered.includes('.deploy-kit-state.json') && rendered.includes('cat ')) return '';
+    if (rendered.includes('mv --version')) return 'mv (GNU coreutils) 9.0';
+    if (rendered.includes('df -kP')) return '99999999';
+    if (rendered.includes('rev-parse --abbrev-ref')) return config.branch || 'master';
+    if (rendered.includes('rev-parse refs/heads/') || rendered.includes(`rev-parse '${config.remote}'/`)) return sha;
+    if (rendered.includes('date -u +%Y%m%dT%H%M%SZ')) return timestamp;
+    if (rendered.includes('git rev-parse HEAD')) return sha;
+    if (rendered.includes(`readlink ${config.projectDir}/current`)) return currentTarget;
+    if (rendered.includes(`readlink ${config.projectDir}/previous`)) return previousTarget;
+    if (rendered.includes('readlink -f /proc/')) return candidateDir;
+    if (rendered.includes('readlink -f ')) return candidateDir;
+    if (config.layout?.runningShaCommand && rendered.includes(config.layout.runningShaCommand)) return sha;
+    if (rendered.includes('pm2 jlist')) {
+      return JSON.stringify((config.appNames || []).map((name, index) => ({
+        name,
+        pid: 1000 + index,
+        pm2_env: { status: appsStopped ? 'stopped' : 'online', restart_time: 0 },
+      })));
+    }
+    if (config.hooks?.backup && rendered.includes(config.hooks.backup)) return 'dry-run-backup-20990101';
+    if (rendered.includes(`ls -1 ${config.projectDir}/releases`)) {
+      return `${releaseId}\n${currentTarget.slice('releases/'.length)}\n${previousTarget.slice('releases/'.length)}`;
+    }
+    if (rendered.includes('curl')) return '200';
+    return '';
+  };
+  const executePlan = (file, args) => {
+    const rendered = [file, ...args].join(' ');
+    log.step(`[dry-run] ${rendered}`);
+    if (rendered.includes('pm2 stop ')) appsStopped = true;
+    if (/pm2 (startOrRestart|start|restart) /.test(rendered)) appsStopped = false;
+    return plannedOutput(rendered);
+  };
   return {
     sleep: () => {},
     runtime: {
       dryRun: true,
-      execFileSync: (file, args) => {
-        const rendered = [file, ...args].join(' ');
-        log.step(`[dry-run] ${rendered}`);
-        return /curl/.test(rendered) ? '200' : '';
-      },
+      execFileSync: executePlan,
+      // runOnTarget normally sends readOnly dry-run probes through this seam.
+      // Point it at the same planner so even preflight cannot contact the host.
+      realExecFileSync: executePlan,
     },
   };
 }
@@ -393,7 +420,7 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   switch (command) {
     case 'deploy':
       try {
-        deploy(config, options, options.dryRun ? dryRunContext() : {});
+        deploy(config, options, options.dryRun ? dryRunContext(config) : {});
         return 0;
       } catch (error) {
         log.error(error instanceof Error ? error.message : String(error));
@@ -401,7 +428,7 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
       }
     case 'rollback':
       try {
-        rollback(config, options, options.dryRun ? dryRunContext() : {});
+        rollback(config, options, options.dryRun ? dryRunContext(config) : {});
         return 0;
       } catch (error) {
         log.error(error instanceof Error ? error.message : String(error));
@@ -475,4 +502,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { run, parseOptions };
+module.exports = { run, parseOptions, dryRunContext };

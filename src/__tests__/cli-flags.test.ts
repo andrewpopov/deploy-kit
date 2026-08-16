@@ -181,6 +181,58 @@ describe('no regression: every currently-valid invocation still dispatches', () 
     });
   });
 
+  it('release-layout --dry-run prints the complete ordered plan without contacting its unreachable host', () => {
+    withConfig({
+      host: 'nobody@unreachable.invalid', projectDir: '/srv/plan-only', mode: 'ssh', branch: 'main',
+      appNames: ['plan-app'], dbBoundApps: ['plan-app'], ecosystemFile: 'shared/ecosystem.config.cjs',
+      layout: {
+        type: 'releases', sharedPaths: ['.env'],
+        releaseChecks: [{ name: 'entrypoint', command: 'test -f dist/server.js' }],
+        runningShaCommand: 'read-running-sha',
+      },
+      postDeployChecks: [{ name: 'public-smoke', command: 'run-public-smoke' }],
+      deliveryEvent: { command: 'emit-delivery-event' },
+      hooks: {
+        install: 'install-deps', backup: 'backup-db', migrate: 'migrate-db',
+        build: 'build-app', restore: 'restore-db',
+      },
+    }, (dir) => {
+      const cap = captureLog();
+      const code = cli.run(['deploy', '--dry-run'], { cwd: dir, env: {} });
+      const out = cap.out();
+      cap.restore();
+      expect(code).toBe(0);
+      const ordered = [
+        'fetch --prune', 'rev-parse refs/heads', 'worktree add --detach', 'install-deps',
+        'node -', 'build-app', 'test -f dist/server.js', 'pm2 stop plan-app',
+        'backup-db', 'migrate-db', '.dk-swap.$$.current', 'pm2 startOrRestart',
+        'read-running-sha', 'run-public-smoke', 'emit-delivery-event', 'worktree prune',
+      ];
+      let previous = -1;
+      for (const command of ordered) {
+        const index = out.indexOf(command, previous + 1);
+        expect(index, `missing or out of order: ${command}`).toBeGreaterThan(previous);
+        previous = index;
+      }
+    });
+  });
+
+  it('release-layout --dry-run still rejects invalid config by name before planning', () => {
+    withConfig({
+      mode: 'local', projectDir: '/srv/plan-only', appNames: ['app'],
+      ecosystemFile: 'ecosystem.config.cjs',
+      layout: { type: 'releases', sharedPaths: ['/escapes-release'] },
+    }, (dir) => {
+      const cap = captureLog();
+      const code = cli.run(['deploy', '--dry-run'], { cwd: dir, env: {} });
+      const out = cap.out();
+      cap.restore();
+      expect(code).toBe(1);
+      expect(out).toMatch(/layout\.sharedPaths\[0\].*must be relative/);
+      expect(out).not.toContain('[dry-run]');
+    });
+  });
+
   it('rollback with its real flags + --dry-run reaches real rollback logic (not flag-rejected)', () => {
     withConfig({ host: 'app@pi', projectDir: '/srv/app', appNames: ['app'], mode: 'ssh' }, (dir) => {
       const cap = captureLog();

@@ -4,6 +4,7 @@ import { createRequire } from 'module';
 const require = createRequire(__filename);
 const kit = require('../index.js') as typeof import('../index');
 const release = require('../release.js');
+const cli = require('../cli.js');
 const { mergeConfig, DEFAULT_CONFIG } = kit;
 
 const SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678'; // 40 hex
@@ -785,62 +786,23 @@ describe('PKG-82 Bug 6: release layout quotes branch/remote at the git call site
   });
 });
 
-// PKG-127 defect 3: `--dry-run` used to read '' for every non-curl command, so
-// even a genuinely migrated release-layout host's `.deploy-kit-layout` marker
-// came back empty and preflight refused with "requires a migrated host" — the
-// exact host the check exists to let through. preflight()'s reads are now
-// marked `readOnly`, which (only under a runtime carrying `dryRun: true`, as
-// cli.js's dry-run context now does) run for real instead of through the fake.
-// This mirrors cli.js's dryRunContext() shape directly rather than going
-// through the CLI, to keep the test at the same level as the rest of this file.
-describe('release deploy — preflight is real under --dry-run (PKG-127)', () => {
-  function dryRunCtx(realRuntime: any) {
-    const dryCalls: string[] = [];
-    const realCalls: string[] = [];
-    const wrappedReal = (file: string, args: string[], opts: any) => {
-      realCalls.push(args[args.length - 1]);
-      return realRuntime.execFileSync(file, args, opts);
-    };
-    const runtime = {
-      dryRun: true,
-      execFileSync: (_f: string, args: string[]) => {
-        const cmd = args[args.length - 1];
-        dryCalls.push(cmd);
-        return /curl/.test(cmd) ? '200' : '';
-      },
-      realExecFileSync: wrappedReal,
-    };
-    return { ctx: { runtime, sleep: () => {} }, dryCalls, realCalls };
-  }
+describe('release deploy — complete deterministic --dry-run plan (CAIRN-369)', () => {
+  it('walks every phase with symbolic captured values and no real-exec seam', () => {
+    const config = relConfig({
+      postDeployChecks: [{ name: 'public-smoke', command: 'run-public-smoke' }],
+      deliveryEvent: { command: 'emit-delivery-event' },
+    });
+    const plan = cli.dryRunContext(config);
+    expect(plan.runtime.realExecFileSync).toBe(plan.runtime.execFileSync);
 
-  it('does not reject a genuinely migrated host — the marker read runs for real, not through the dry-run fake', () => {
-    const { runtime } = makeReleaseRuntime(); // marker present on the "target"
-    const { ctx, dryCalls, realCalls } = dryRunCtx(runtime);
-
-    // The false-negative this defect caused: before the fix, this always threw
-    // "requires a migrated host" even though the host really is migrated.
-    expect(() => release.deployRelease(relConfig(), {}, ctx)).not.toThrow(/requires a migrated host/);
-    expect(() => release.deployRelease(relConfig(), {}, ctx)).not.toThrow(/marker mismatch/);
-
-    expect(realCalls.some((c) => c.includes('.deploy-kit-layout'))).toBe(true);
-    expect(dryCalls.some((c) => c.includes('.deploy-kit-layout'))).toBe(false);
-  });
-
-  it('still refuses a host that is genuinely NOT migrated — readOnly reflects reality, it does not fake success', () => {
-    const { runtime } = makeReleaseRuntime({ marker: '' }); // no marker on the "target"
-    const { ctx } = dryRunCtx(runtime);
-    expect(() => release.deployRelease(relConfig(), {}, ctx)).toThrow(/requires a migrated host/);
-  });
-
-  it('reaches real preflight-adjacent logic past the marker check (proves dispatch continued, not just "didn\'t throw")', () => {
-    const { runtime } = makeReleaseRuntime();
-    const { ctx } = dryRunCtx(runtime);
-    // Past preflight, SHA resolution is NOT a readOnly probe (still simulated,
-    // like the rest of a dry run) and legitimately fails against the all-empty
-    // dry-run fake — proof execution actually got past preflight into the real
-    // pipeline, the same "reached real logic, stopped at a later expected
-    // boundary" shape cli-flags.test.ts already uses for legacy --dry-run.
-    expect(() => release.deployRelease(relConfig(), {}, ctx)).toThrow(/Could not resolve/);
+    const result = release.deployRelease(config, {}, plan);
+    expect(result.steps).toEqual([
+      'materialize', 'shared', 'install', 'verify-pins', 'build', 'validate',
+      'backup', 'migrate', 'flip', 'health', 'post-check:public-smoke',
+      'delivery-event', 'prune',
+    ]);
+    expect(result.sha).toBe('d'.repeat(40));
+    expect(result.release).toBe('dddddddddddd-20990101T000000Z');
   });
 });
 
