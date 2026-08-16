@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.21.0
+
+- Deploys can gate migrations on checks that run before production writers are stopped
+  The new `preMigrationChecks` list runs after candidate preparation but before
+  the disruptive stop/backup/migrate window. Consumers can rehearse candidate
+  migrations against a disposable current-data copy and abort without causing
+  downtime when data-dependent SQL fails or times out.
+- Release-layout post-deploy checks now have explicit, journaled recovery policies and failure events
+  Every release-layout post-deploy check must choose `rollback`, `remain-active`,
+  or `manual`. Failed checks persist their pending and terminal recovery state,
+  emit a structured failed or degraded delivery event, and make migration-aware
+  rollback restore and verify the previous code and database state. Hard
+  interruptions and failed rollback gates remain fail-closed for operator recovery.
+- Release-layout dry-run now prints a complete deterministic plan without contacting the target
+  The planner supplies consistent symbolic capture values for preflight, repository,
+  backup, PM2, activation, and pruning state, allowing every release phase to render
+  in order and exit successfully. No local target command or SSH probe executes;
+  configuration validation still fails by the exact invalid field before planning.
+- deploy/rollback/monitor/remote/config no longer report success when a failure was tolerated, blind, discarded, or left unvalidated
+  Seven places where a failure was tolerated, swallowed, hard-coded away, or
+  left unvalidated now behave honestly.
+
+  Legacy `deploy()` aborts before fetch/pull if it cannot establish a rollback
+  pointer that actually matches HEAD (read independently, not merely checked
+  for looking SHA-shaped — a write that fails to overwrite an existing pointer
+  used to leave a silently STALE-but-plausible one in place), instead of
+  completing a deploy that `rollback` would later reset to the wrong revision.
+  An unborn branch / brand-new repo (no commits yet) is treated as a legitimate
+  first deploy, not a recording failure. Accepts both 40-char SHA-1 and 64-char
+  SHA-256 pointers. `resources`/`gitInfo`/`dashboard` (CLI: `resources`/`git`/
+  `dashboard`) now return `false` — the CLI now exits `1` — when an underlying
+  inspection command didn't actually run, instead of always exiting `0`.
+  `monitor`'s exit code now follows one explicit precedence: alert delivery
+  FAILED → `2` (this outranks even a crit — once delivery fails, the exit code
+  is the only channel left that tells anyone anything); else any `crit` → `1`;
+  else any `unknown` check (ssh down, a probe timed out, …) OR zero checks
+  configured at all → `2`; else `0` — this is *any* unknown, not just *every*
+  check, so a run where most checks are fine but one is blind still exits `2`
+  instead of quietly folding into "all fine". A failing `deliveryEvent.command`
+  — in both the legacy pipeline and the release layout — still never fails the
+  deploy, but now logs a warning and sets `DeployResult.deliveryEvent =
+  { delivered: false }` instead of vanishing silently.
+
+  Release-layout `rollback` no longer leaves `current` pointing at the rollback
+  target while the original (never-restarted) process is still what's actually
+  running: a failing `preRestartChecks` check after the flip now triggers the
+  same post-flip recovery (flip back, restart, re-verify) the unhealthy-target
+  path already had, instead of throwing straight out mid-flip. And if that
+  flip-back itself fails, PM2 is deliberately left untouched rather than
+  restarted against an unconfirmed `current` — which could activate the very
+  release the recovery was trying to move away from — surfacing `MANUAL
+  RECOVERY REQUIRED` instead. The identical bug in release-layout `deploy`'s own
+  mid-flight recovery (the `'flipped'`/`'verify'` phase, reached on ANY
+  disruptive-window failure — an unhealthy activation, an interrupted process,
+  not just a failing `preRestartChecks`) is fixed the same way: if the recovery
+  flip-back fails, PM2 is never restarted onto the failed candidate, and a
+  migration's DB restore still runs regardless (writers were already confirmed
+  stopped, so it's a safe, traffic-independent data operation) but nothing is
+  resumed.
+
+  Config validation now checks nested keys, not just top-level ones — a typo
+  like `hooks.migarte` is rejected by name at load, the same as a top-level
+  typo, instead of silently validating fine and leaving `hooks.migrate` at its
+  default. Covers `hooks`, `health`, `ssh`, and every `monitor` sub-block
+  (`disk`/`backup`/`restartStorm`/`alert`); `healthHeaders` and a public probe's
+  `headers` remain intentionally open, since those keys are operator-chosen
+  HTTP header names, not fixed config fields.
+- Multiline target scripts have an stdin-safe execution path and JSON-encoded scripts fail closed
+  `runScriptOnTarget` sends a POSIX shell program over stdin instead of embedding
+  it in a controller-shell command. The lower-level target-command builder rejects
+  `JSON.stringify(script)` input before literal escaped newline tokens can become
+  commands, redirection targets, or deployment-root artifacts.
+
 ## 0.20.0
 
 - Fail closed on unreadable pm2 state during the DB-bound app pause, and resume only what was actually paused
