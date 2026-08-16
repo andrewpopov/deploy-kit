@@ -66,6 +66,16 @@ default. Covers `hooks`, `health`, `ssh`, `layout`, `deliveryEvent`, and every
 probe's `headers` are raw HTTP-header maps — the "key" there is a header name
 the operator chooses, not a fixed config field, so those stay open to any key.
 
+### Multiline target programs
+
+Programmatic consumers must use `runScriptOnTarget(script, config)` for a
+multiline POSIX shell program. It sends the program over stdin to a fixed
+`sh -se` command, including through SSH, so no controller shell reparses its
+newlines, variables, or command substitutions. Do not use
+`JSON.stringify(script)` as shell quoting: deploy-kit rejects that encoded form
+before execution because its literal `\n` tokens can be interpreted as command
+text or redirection filenames.
+
 ### Config reference
 
 | Key | Type | Default | Mode | Since | Notes |

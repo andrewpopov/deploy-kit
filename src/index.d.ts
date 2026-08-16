@@ -262,6 +262,18 @@ export function runOnTarget(
   stderr: string;
   error?: unknown;
 };
+/** Run a multiline POSIX shell program via stdin, avoiding a controller-shell
+ * quoting layer. Use this instead of JSON.stringify(script). */
+export function runScriptOnTarget(
+  script: string,
+  config: DeployConfig,
+  options?: {
+    capture?: boolean;
+    runtime?: Runtime;
+    timeoutSeconds?: number | null;
+    readOnly?: boolean;
+  },
+): { ok: boolean; output: string; stderr: string; error?: unknown };
 export function buildHealthCommand(config: DeployConfig, check?: HealthCheck): string;
 
 export interface MonitorCheckResult {

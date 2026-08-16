@@ -73,11 +73,31 @@ function sshHardeningArgs(ssh = {}) {
   return args;
 }
 
+// JSON.stringify is for data, not shell quoting. Passing JSON.stringify(script)
+// through a controller shell turns intended newlines into literal `\n` tokens
+// and expands `$vars` / `$(commands)` before ssh runs. Reject that exact
+// representation and direct multiline callers to the stdin-safe API below.
+function assertNotJsonEncodedShellScript(command) {
+  const trimmed = typeof command === 'string' ? command.trim() : '';
+  if (!trimmed.startsWith('"') || !trimmed.endsWith('"')) return;
+  try {
+    const decoded = JSON.parse(trimmed);
+    if (typeof decoded === 'string' && /[\r\n]/.test(decoded)) {
+      throw new Error(
+        'deploy-kit: refusing a JSON-encoded multiline shell script; pass the original script to runScriptOnTarget()'
+      );
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('deploy-kit:')) throw error;
+  }
+}
+
 // Wrap a command so it runs on the target. In 'ssh' mode we `cd` into the
 // project dir first (matching the hand-rolled `ssh host "cd dir && cmd"` idiom)
 // and add connect/keepalive timeouts; in 'local' mode (script runs on the box,
 // e.g. sano) we run it directly.
 function buildTargetCommand(command, { mode, host, projectDir, ssh }) {
+  assertNotJsonEncodedShellScript(command);
   if (mode === 'local') {
     const prefix = projectDir ? `cd ${projectDir} && ` : '';
     return { file: 'sh', args: ['-c', `${prefix}${command}`] };
@@ -162,6 +182,19 @@ function runOnTarget(command, config, {
   }
 }
 
+// Execute a multiline POSIX shell program without serializing it into a local
+// shell command or ssh argument. ssh forwards this stdin payload unchanged.
+function runScriptOnTarget(script, config, {
+  capture = false, runtime, timeoutSeconds, readOnly = false,
+} = {}) {
+  if (typeof script !== 'string' || !script.trim()) {
+    throw new Error('deploy-kit: runScriptOnTarget requires a non-empty script');
+  }
+  return runOnTarget('sh -se', config, {
+    capture, runtime, input: script, timeoutSeconds, readOnly,
+  });
+}
+
 // Header key and value are single-quoted into the curl command with no escaping,
 // so a literal single quote in either would break the quoting. Reject early
 // (fail-fast on a config typo) rather than emit a subtly broken probe.
@@ -195,5 +228,6 @@ function buildHealthCommand(config, check = {}) {
 }
 
 module.exports = {
-  normalizeRuntime, buildTargetCommand, sshHardeningArgs, runOnTarget, buildHealthCommand, shQuote,
+  normalizeRuntime, buildTargetCommand, sshHardeningArgs, runOnTarget,
+  runScriptOnTarget, buildHealthCommand, shQuote,
 };

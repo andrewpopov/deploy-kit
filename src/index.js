@@ -22,7 +22,7 @@ const {
 } = config;
 const { colors, makeLogger } = log;
 const {
-  normalizeRuntime, buildTargetCommand, sshHardeningArgs, runOnTarget, buildHealthCommand,
+  normalizeRuntime, buildTargetCommand, sshHardeningArgs, runOnTarget, runScriptOnTarget, buildHealthCommand,
 } = exec;
 const { deploy, rollback, resolveBranch, waitForHealth } = deployMod;
 const { startTunnel } = tunnel;
@@ -54,6 +54,7 @@ module.exports = {
   buildTargetCommand,
   sshHardeningArgs,
   runOnTarget,
+  runScriptOnTarget,
   buildHealthCommand,
   // pipeline
   deploy,

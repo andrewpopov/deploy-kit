@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { createRequire } from 'module';
 import { spawn } from 'child_process';
 import {
-  mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync,
+  mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, mkdirSync,
 } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
@@ -12,7 +12,7 @@ const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const kit = require('../index.js') as typeof import('../index');
 const {
   buildTargetCommand, sshHardeningArgs, loadConfig, mergeConfig, validateConfig,
-  DEFAULT_CONFIG, deploy, rollback, remote, buildHealthCommand, startTunnel, init, runOnTarget,
+  DEFAULT_CONFIG, deploy, rollback, remote, buildHealthCommand, startTunnel, init, runOnTarget, runScriptOnTarget,
 } = kit;
 const cli = require('../cli.js') as { run: Function; parseOptions: Function };
 // PKG-82: lock/prev-sha state moved off a hardcoded /tmp path onto
@@ -157,6 +157,28 @@ describe('buildTargetCommand', () => {
   });
   it('throws in ssh mode without a host', () => {
     expect(() => buildTargetCommand('x', { mode: 'ssh', host: null, projectDir: '/d' })).toThrow(/requires a .host/);
+  });
+
+  it('rejects a JSON-encoded multiline shell program before it reaches ssh', () => {
+    const script = 'set -eu\nprintf "ok\\n"\nchmod 600 target\n';
+    expect(() => buildTargetCommand(JSON.stringify(script), {
+      mode: 'ssh', host: 'app@pi', projectDir: '/srv/app',
+    })).toThrow(/JSON-encoded multiline shell script.*runScriptOnTarget/);
+  });
+
+  it('runs multiline programs through stdin without escaped control-token artifacts', () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'deploy-kit-script-'));
+    try {
+      const result = runScriptOnTarget(
+        "printf 'safe\\n' > intended\nchmod 600 intended\n",
+        { mode: 'local', projectDir: root, stepTimeoutSeconds: 5 },
+      );
+      expect(result.ok).toBe(true);
+      expect(readFileSync(path.join(root, 'intended'), 'utf8')).toBe('safe\n');
+      expect(readdirSync(root).sort()).toEqual(['intended']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
