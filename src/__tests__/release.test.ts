@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createRequire } from 'module';
+import { execSync } from 'child_process';
 
 const require = createRequire(__filename);
 const kit = require('../index.js') as typeof import('../index');
@@ -181,10 +182,51 @@ describe('release deploy — happy path', () => {
     expect(result.steps).toContain('post-check:public-smoke');
     expect(result.steps).toContain('delivery-event');
     expect(calls.some((command) => command.includes('cd /srv/app && cd current && run-smoke'))).toBe(true);
-    expect(calls.some((command) => command.includes('cd /srv/app && cd current && emit-event'))).toBe(true);
+    expect(calls.some((command) => command.includes("cd /srv/app && export DEPLOY_KIT_SHARED_DIR='/srv/app/shared'; cd current && emit-event"))).toBe(true);
     const event = JSON.parse(inputs.find(({ command }) => command.includes('emit-event'))?.input ?? '{}');
     expect(event.backupReference).toBe('smarthome-20260710T090000Z.db.gpg');
     expect(JSON.stringify(event)).not.toContain('/var/lib/smarthome/backups');
+  });
+
+  it('delivery event command carries DEPLOY_KIT_SHARED_DIR set to the resolved shared/ path', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    release.deployRelease(relConfig({ deliveryEvent: { command: 'emit-event' } }), {}, ctx(runtime));
+    expect(calls.some((cmd) => cmd.includes("export DEPLOY_KIT_SHARED_DIR='/srv/app/shared';") && cmd.includes('emit-event'))).toBe(true);
+  });
+
+  // Behavioural guard: a string assertion on the emitted command proves nothing
+  // about whether the variable actually reaches the hook process. Real hooks are
+  // COMPOUND commands whose FIRST word is `cd` (`cd current && set -a; . .env;
+  // set +a; node script.js`) — `cd` is a REGULAR (non-special) shell builtin, so
+  // a bare `VAR=x cmd1 && cmd2` assignment prefix only scopes VAR to cmd1 and
+  // does not survive past it: verified live, `sh -c "FOO='bar' cd /tmp &&
+  // node -e \"console.log(process.env.FOO)\""` prints `undefined`. (`set` is a
+  // POSIX SPECIAL builtin whose prefixed assignment persists into the current
+  // shell environment regardless of the export fix, so a test built around
+  // `set -a` as the first command would pass even on the broken bare-assignment
+  // code — verified: `sh -c "FOO='bar' set -a; true; set +a; node -e …"` prints
+  // `bar` either way. Must lead with `cd`, matching real hooks, to be a real guard.)
+  // This test runs the ACTUAL emitted command through a real shell, with a
+  // child process at the tail of a `cd … && … ; node` chain reading the
+  // variable, so it fails if the injection regresses to a bare assignment.
+  it('DEPLOY_KIT_SHARED_DIR reaches a child process at the end of a real compound hook chain', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    release.deployRelease(relConfig({
+      // Leads with `cd <dir> &&`, exactly like every real app's hook (e.g.
+      // smarthome/cairn's `cd current && set -a; . .env; set +a; node …`).
+      // The test's own cwd (which exists on the test machine) stands in for
+      // the release's `current` symlink target.
+      deliveryEvent: { command: `cd ${process.cwd()} && node -e "process.stdout.write(process.env.DEPLOY_KIT_SHARED_DIR || 'MISSING')"` },
+    }), {}, ctx(runtime));
+    const emitted = calls.find((cmd) => cmd.includes('DEPLOY_KIT_SHARED_DIR'));
+    expect(emitted).toBeDefined();
+    // `emitted` is the exact string deploy-kit hands `sh -c` on the real target
+    // (already includes the `cd /srv/app && ` prefix runInDir adds); `/srv/app`
+    // doesn't exist on the test machine, so swap in a real cwd for THAT `cd` too
+    // -- same shell operators, same command shape, just a directory that exists.
+    const shellCommand = (emitted as string).replace('cd /srv/app', `cd ${process.cwd()}`);
+    const output = execSync(shellCommand, { shell: '/bin/sh', encoding: 'utf8' });
+    expect(output).toBe('/srv/app/shared');
   });
 
   it('uses the shared db-backup JSON normalizer for release delivery events', () => {
@@ -595,8 +637,35 @@ describe('release deploy — failure recovery by phase', () => {
     const { runtime, calls } = makeReleaseRuntime({ fail: ['run-migrate'] });
     expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow();
     expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(true);
-    expect(calls.some((cmd) => cmd.includes("DEPLOY_KIT_BACKUP_ID='/var/lib/smarthome/backups/smarthome-20260710T090000Z.db.gpg'"))).toBe(true);
+    expect(calls.some((cmd) => cmd.includes("export DEPLOY_KIT_BACKUP_ID='/var/lib/smarthome/backups/smarthome-20260710T090000Z.db.gpg';"))).toBe(true);
     expect(calls.some((cmd) => cmd.includes('pm2 startOrRestart'))).toBe(true);
+  });
+
+  // Same behavioural guard as DEPLOY_KIT_SHARED_DIR above: real restore hooks
+  // observed in consumer configs are all simple single commands today (e.g.
+  // `bash scripts/restore-db.sh --deploy-hook`), so the bare-assignment bug
+  // does not currently bite in practice -- but the `export …; ` form costs
+  // nothing and closes the same latent hole if a hook ever becomes compound.
+  // This proves it survives a compound restore hook end-to-end through a real
+  // shell, not just via a string match on the emitted command.
+  it('DEPLOY_KIT_BACKUP_ID reaches a child process at the end of a real compound restore hook chain', () => {
+    const { runtime, calls } = makeReleaseRuntime({ fail: ['run-migrate'] });
+    const cfg = relConfig({
+      hooks: {
+        install: 'npm ci', build: 'npm run build', migrate: 'run-migrate', backup: 'run-backup',
+        // Leads with `cd` (a regular, non-special builtin) -- see the
+        // DEPLOY_KIT_SHARED_DIR behavioural test above for why that matters:
+        // a `set -a`-first chain would pass even on the broken bare-assignment
+        // code, since `set` is a POSIX special builtin.
+        restore: `cd ${process.cwd()} && node -e "process.stdout.write(process.env.DEPLOY_KIT_BACKUP_ID || 'MISSING')"`,
+      },
+    });
+    expect(() => release.deployRelease(cfg, {}, ctx(runtime))).toThrow();
+    const emitted = calls.find((cmd) => cmd.includes('DEPLOY_KIT_BACKUP_ID') && cmd.includes('process.env'));
+    expect(emitted).toBeDefined();
+    const shellCommand = (emitted as string).replace('cd /srv/app', `cd ${process.cwd()}`);
+    const output = execSync(shellCommand, { shell: '/bin/sh', encoding: 'utf8' });
+    expect(output).toBe('/var/lib/smarthome/backups/smarthome-20260710T090000Z.db.gpg');
   });
 
   it('activation verify failure (SHA mismatch): flips back, restores DB, resumes previous', () => {

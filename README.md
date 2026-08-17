@@ -136,7 +136,7 @@ text or redirection filenames.
 | `monitor.stateFile` | `string` | `<dir>/.deploy-kit-monitor-state.json` | both | 0.8 | Abs path to monitor state — a STABLE dir, never under `releases/`. |
 | `monitor.checkTimeoutSeconds` | `number` | `20` | both | 0.8 | Per-check wall-clock bound. |
 | `deliveryEvent` | `{command} \| null` | `null` | both | 0.9 | Opt-in post-health delivery event (see `announce-discord` below). `null` = skip. `command` is the only valid key — a typo (e.g. `comand`) is now rejected at config load (unreleased) instead of silently no-op'ing the feature. |
-| `deliveryEvent.command` | `string` | — | both | 0.9 | Shell command run on the target; receives structured deployment JSON (`event`, `status`, `branch`, `revision`, `deployedAt`, `failedCheck?`, `activeRevision?`, `activeRelease?`, `recovery?`, `backupReference?`) on **stdin**. Events cover success and release-layout post-check recovery. A sink failure is warned and recorded but never changes recovery policy. |
+| `deliveryEvent.command` | `string` | — | both | 0.9 | Shell command run on the target; receives structured deployment JSON (`event`, `status`, `branch`, `revision`, `deployedAt`, `failedCheck?`, `activeRevision?`, `activeRelease?`, `recovery?`, `backupReference?`) on **stdin**. Events cover success and release-layout post-check recovery. A sink failure is warned and recorded but never changes recovery policy. In the release layout, the command also gets `DEPLOY_KIT_SHARED_DIR` (unreleased, see below). |
 
 ### mode: local
 
