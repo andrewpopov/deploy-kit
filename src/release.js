@@ -378,7 +378,12 @@ function deployRelease(config, options = {}, ctx = {}) {
   const restoreDb = () => {
     if (!config.hooks.restore) return false;
     // backupId is validated to a safe charset before migrate; single-quote anyway.
-    const env = st.backupId ? `DEPLOY_KIT_BACKUP_ID='${st.backupId}' ` : '';
+    // `export …; ` (not a bare assignment prefix) so the variable survives into
+    // every command of a compound hook (`cd … && …`), not just the first one --
+    // a bare `VAR=x cmd1 && cmd2` only scopes VAR to cmd1 (verified: `sh -c
+    // "FOO='bar' cd /tmp && node -e \"console.log(process.env.FOO)\""` prints
+    // undefined; `export FOO='bar'; cd /tmp && node …` prints bar).
+    const env = st.backupId ? `export DEPLOY_KIT_BACKUP_ID='${st.backupId}'; ` : '';
     const res = runInDir(paths.root, `${env}${config.hooks.restore}`, config, c, { tolerate: true });
     return res.ok;
   };
@@ -395,7 +400,13 @@ function deployRelease(config, options = {}, ctx = {}) {
       ...(backupReference ? { backupReference } : {}),
       ...extra,
     });
-    const delivery = runInDir(paths.root, config.deliveryEvent.command, config, c, {
+    // Survives the release-dir swap (unlike `current`), so a hook can record what
+    // it already announced under this path without re-announcing every deploy.
+    // `export …; ` so the variable reaches the LAST command in a compound hook
+    // (real hooks look like `cd current && set -a; . .env; set +a; node …`) --
+    // a bare assignment prefix only scopes to the first command in the chain.
+    const env = `export DEPLOY_KIT_SHARED_DIR='${paths.sharedDir}'; `;
+    const delivery = runInDir(paths.root, `${env}${config.deliveryEvent.command}`, config, c, {
       tolerate: true,
       input: payload,
     });

@@ -289,6 +289,19 @@ describe('deploy pipeline', () => {
     expect(result).not.toHaveProperty('deliveryEvent');
   });
 
+  // The legacy in-place layout has no shared/ directory that survives across
+  // deploys (only the release layout does), so the delivery event command must
+  // never see DEPLOY_KIT_SHARED_DIR at all here -- absent, not empty.
+  it('delivery event command does NOT carry DEPLOY_KIT_SHARED_DIR under the legacy layout', () => {
+    const { runtime, calls } = makeRuntime();
+    const cfg = mergeConfig(baseConfig, { deliveryEvent: { command: 'emit-event' } });
+
+    deploy(cfg, {}, ctxWith(runtime));
+
+    expect(calls.some((c) => c.includes('emit-event'))).toBe(true);
+    expect(calls.some((c) => c.includes('DEPLOY_KIT_SHARED_DIR'))).toBe(false);
+  });
+
   it('omits unsafe or noisy backup output from delivery events without failing the deploy', () => {
     for (const backupOutput of [
       '../../etc/shadow',

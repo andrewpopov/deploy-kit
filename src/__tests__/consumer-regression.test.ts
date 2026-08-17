@@ -321,6 +321,20 @@ function applyIntentionalDeltas(oldSeq: string[], config: unknown): string[] {
     ));
   }
 
+  // Delta 9 (correctness fix, release layout only): a bare `VAR='x' cmd1 &&
+  // cmd2` assignment prefix only scopes VAR to cmd1 — verified live via `sh -c
+  // "FOO='bar' cd /tmp && node -e \"console.log(process.env.FOO)\""` printing
+  // `undefined`. Real restore hooks are simple single commands today (e.g.
+  // `bash scripts/restore-deploy-backup.sh`), so this never actually broke
+  // DEPLOY_KIT_BACKUP_ID in practice, but the bug is latent for any hook that
+  // becomes compound (the sibling DEPLOY_KIT_SHARED_DIR fix hit this for real).
+  // `export VAR='x'; cmd` survives the whole chain, so both env injections now
+  // use it. Anchored to the exact literal prefix this kit emits.
+  seq = seq.map((cmd) => cmd.replace(
+    /\bDEPLOY_KIT_BACKUP_ID='([^']*)' /,
+    "export DEPLOY_KIT_BACKUP_ID='$1'; ",
+  ));
+
   return seq;
 }
 

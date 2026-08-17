@@ -161,7 +161,11 @@ export interface DeployConfig {
   layout?: ReleaseLayout | null;
   /** Opt-in fleet monitoring + alerting (SMH-116). Absent/null = disabled. */
   monitor?: MonitorConfig | null;
-  /** Optional target command that receives the post-health deployment JSON on stdin. */
+  /** Optional target command that receives the post-health deployment JSON on stdin.
+   * Under the release layout, also receives the resolved `shared/` directory as
+   * DEPLOY_KIT_SHARED_DIR — the one path that survives the release-dir swap, so a
+   * hook can record what it already announced there. Unset (not empty) when the
+   * layout has no shared directory. */
   deliveryEvent?: { command: string } | null;
   hooks: DeployHooks;
 }

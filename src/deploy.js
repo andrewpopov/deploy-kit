@@ -581,12 +581,22 @@ function deploy(config, options = {}, ctx = {}) {
         deployedAt: new Date().toISOString(),
         ...(backupReference ? { backupReference } : {}),
       });
+      // Legacy in-place deploys have no shared/ directory that survives across
+      // deploys (that only exists under the release layout, which delegates to
+      // release.js above before reaching this code) -- so there is nothing
+      // truthful to hand a hook here. Leaving DEPLOY_KIT_SHARED_DIR unset beats
+      // exporting an empty or wrong value; consumers fall back to their own
+      // resolution. `sharedDir` is only ever non-null on that other pipeline.
+      const sharedDir = config.layout && config.layout.type === 'releases' ? `${config.projectDir}/shared` : null;
+      // `export …; ` (not a bare assignment prefix) so a compound hook command
+      // (`cd … && … ; node …`) sees the variable in its last command too.
+      const env = sharedDir ? `export DEPLOY_KIT_SHARED_DIR='${sharedDir}'; ` : '';
       // Non-gating by design (tolerate: true) -- a broken announcement must
       // never turn a healthy deploy into a failure. But "reported" has to mean
       // something observable: before this, a failure here was a silent sink --
       // no warning, no trace in the result. Surface it both ways so an operator
       // (or a caller reading DeployResult) can actually tell delivery failed.
-      const delivered = run('Emitting delivery event', config.deliveryEvent.command, { tolerate: true, input: payload });
+      const delivered = run('Emitting delivery event', `${env}${config.deliveryEvent.command}`, { tolerate: true, input: payload });
       steps.push('delivery-event');
       if (!delivered) {
         log.warning(
