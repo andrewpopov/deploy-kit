@@ -69,6 +69,7 @@ describe('rejected flags: one per command family, message names the flag', () =>
     // deploy/rollback family — rollback never reads skipMigrate/stash (src/deploy.js:314)
     [['rollback', '--skip-migrate'], /rollback does not support: --skip-migrate/],
     [['rollback', '--no-stash'], /rollback does not support: --no-stash/],
+    [['rollback', '--branch', 'feature/test'], /rollback does not support: --branch/],
     // monitor family — monitor never reads dryRun
     [['monitor', '--dry-run'], /monitor does not support: --dry-run/],
     // remote PM2 verbs — take no flags at all
@@ -170,11 +171,51 @@ describe('PTRY-489: monitor --local', () => {
   });
 });
 
+describe('CAIRN-190: deploy --branch override', () => {
+  it('overrides config.branch for one invocation and leaves the configured default unchanged', () => {
+    withConfig({ mode: 'local', projectDir: '/srv/app', appNames: ['app'], branch: 'main' }, (dir) => {
+      const overrideLog = captureLog();
+      const overrideCode = cli.run(['deploy', '--branch', 'feature/cairn-190', '--dry-run'], { cwd: dir, env: {} });
+      const overrideOut = overrideLog.out();
+      overrideLog.restore();
+
+      expect(overrideCode).toBe(0);
+      expect(overrideOut).toContain("pull --ff-only 'origin' 'feature/cairn-190'");
+
+      const defaultLog = captureLog();
+      const defaultCode = cli.run(['deploy', '--dry-run'], { cwd: dir, env: {} });
+      const defaultOut = defaultLog.out();
+      defaultLog.restore();
+
+      expect(defaultCode).toBe(0);
+      expect(defaultOut).toContain("pull --ff-only 'origin' 'main'");
+      expect(defaultOut).not.toContain('feature/cairn-190');
+    });
+  });
+
+  it('fails closed on a shell-hostile branch before planning any target command', () => {
+    withConfig({ mode: 'local', projectDir: '/srv/app', appNames: ['app'] }, (dir) => {
+      const cap = captureLog();
+      const code = cli.run(['deploy', '--branch', 'main;touch-pwned', '--dry-run'], { cwd: dir, env: {} });
+      const out = cap.out();
+      cap.restore();
+
+      expect(code).toBe(1);
+      expect(out).toMatch(/override: "branch".*valid git ref name/);
+      expect(out).not.toContain('[dry-run]');
+    });
+  });
+
+  it('rejects --branch without a value instead of deploying the configured branch', () => {
+    expect(() => cli.parseOptions(['--branch'])).toThrow(/Unknown argument: --branch/);
+  });
+});
+
 describe('no regression: every currently-valid invocation still dispatches', () => {
   it('deploy with every one of its real flags + --dry-run completes (exit 0)', () => {
     withConfig({ host: 'app@pi', projectDir: '/srv/app', appNames: ['app'], mode: 'ssh' }, (dir) => {
       const code = cli.run(
-        ['deploy', '--skip-build', '--skip-deps', '--skip-migrate', '--no-stash', '--dry-run', '--steal-lock', '--no-lock'],
+        ['deploy', '--skip-build', '--skip-deps', '--skip-migrate', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', 'feature/all-flags'],
         { cwd: dir, env: {} },
       );
       expect(code).toBe(0);

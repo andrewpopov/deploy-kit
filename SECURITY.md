@@ -21,10 +21,11 @@ hatch for the same reason: a bastion/jump-host `ProxyCommand` is a legitimate,
 intentionally-supported use, so entries are only shape-validated (must be a
 literal `Key=Value` string), never restricted in content.
 
-**Not trusted: the branch name resolved from the target.** When `branch` is
-left `null` (the default), deploy-kit resolves the target's `origin/HEAD` at
-deploy time and uses that name as the branch — a value chosen by whoever can
-rename the remote's default branch, not by the config author. Before this was
+**Not trusted: branch input.** An explicit config `branch` or CLI
+`deploy --branch NAME` value passes through the same strict git-ref allowlist.
+When neither is set, deploy-kit resolves the target's `origin/HEAD` at deploy
+time and uses that name as the branch — a value chosen by whoever can rename
+the remote's default branch, not by the config author. Before this was
 hardened, that resolved name reached `git pull --ff-only <remote> <branch>`
 on the target unescaped: git's own ref-name rules (`git check-ref-format`)
 still permit shell metacharacters such as `` ` ``, `$()`, `;`, `&`, and `|` in
@@ -34,7 +35,8 @@ renamed default branch was a real remote-shell-injection path, not a
 theoretical one.
 
 The **legacy (in-place) deploy pipeline** (`src/deploy.js`) closes this with
-two independent layers: an explicit `branch`/`remote` in the config file is
+two independent layers: an explicit `branch`/`remote` in the config file or
+CLI override is
 charset-validated at load time against that same git-refname allowlist
 (`src/config.js` `isValidRefName`), AND every branch/remote value — whether
 taken from config or resolved from `origin/HEAD` at runtime — is

@@ -17,7 +17,7 @@ const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
   '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
-  '--dir', '--json', '--local',
+  '--dir', '--json', '--local', '--branch',
 ];
 
 // Flags that take a following positional value. Kept in sync with the arity
@@ -26,7 +26,7 @@ const KNOWN_FLAGS = [
 // of its own (e.g. `--service --skip-build` must not read `--skip-build` as
 // a used flag; parseOptions consumes it as --service's value).
 const VALUE_FLAGS = new Set([
-  '--lines', '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env', '--dir',
+  '--lines', '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env', '--dir', '--branch',
 ]);
 
 // The set of flags each command actually reads. KNOWN_FLAGS above is only
@@ -41,7 +41,7 @@ const COMMAND_FLAGS = {
   'run-host-operations': ['--action', '--api-url-env', '--api-key-env'],
   'run-cairn-operations': [],
   'verify-pins': ['--dir', '--json'],
-  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock'],
+  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch'],
   rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock'],
   monitor: ['--steal-lock', '--no-lock', '--local'],
   status: [],
@@ -117,6 +117,7 @@ function parseOptions(args) {
     else if (a === '--api-url-env' && args[i + 1]) { options.apiUrlEnv = args[i + 1]; i += 1; }
     else if (a === '--api-key-env' && args[i + 1]) { options.apiKeyEnv = args[i + 1]; i += 1; }
     else if (a === '--dir' && args[i + 1]) { options.dir = args[i + 1]; i += 1; }
+    else if (a === '--branch' && args[i + 1]) { options.branch = args[i + 1]; i += 1; }
     else if (a === '--json') { options.json = true; }
     else if (a === '--local') { options.local = true; }
     else {
@@ -162,7 +163,7 @@ Commands:
                                             CAIRN_OPERATIONS_API_URL / CAIRN_OPERATIONS_API_KEY);
                                             takes no flags
   deploy [--skip-build|--skip-deps|--skip-migrate|--skip-pin-check]
-         [--no-stash] [--dry-run] [--steal-lock] [--no-lock]
+         [--no-stash] [--dry-run] [--steal-lock] [--no-lock] [--branch NAME]
                                             --skip-pin-check disables the post-install
                                             check that the installed tree matches what
                                             package.json pins. It is the escape hatch for
@@ -406,7 +407,9 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   // config afterward, so the same validation that applies to a config file also
   // applies here. `host` is left untouched — it still identifies the target in
   // the monitor header/alert event even when the run itself is local.
-  const configOverride = command === 'monitor' && options.local ? { mode: 'local' } : {};
+  const configOverride = {};
+  if (command === 'monitor' && options.local) configOverride.mode = 'local';
+  if (command === 'deploy' && options.branch) configOverride.branch = options.branch;
 
   let config;
   try {
