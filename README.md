@@ -23,6 +23,7 @@ npx deploy-kit init          # scaffold .deploy-kit.config.json + scripts block
 # edit the config for your app…
 npx deploy-kit deploy --dry-run   # print the exact command stream, run nothing
 npx deploy-kit deploy             # run it for real
+npx deploy-kit deploy --branch feature/demo  # one-run branch override
 ```
 
 ## Configure
@@ -84,7 +85,7 @@ text or redirection filenames.
 | `projectDir` | `string \| null` | `null` | both | 0.1 | Absolute path on the target; `cd`-ed into per step. |
 | `mode` | `'ssh' \| 'local'` | `'ssh'` | — | 0.1 | `ssh` = deploy from laptop; `local` = script runs on the box. |
 | `remote` | `string` | `'origin'` | both | 0.1 | Git remote to fetch/pull. |
-| `branch` | `string \| null` | `null` | both | 0.1 | `null` → resolve `origin/HEAD`, fall back to `master`. |
+| `branch` | `string \| null` | `null` | both | 0.1 | `null` → resolve `origin/HEAD`, fall back to `master`. `deploy --branch NAME` overrides this value for one invocation. |
 | `appNames` | `string[]` | `[]` | both | 0.1 | PM2 apps to (re)start; the first is the health-gated web app. |
 | `dbBoundApps` | `string[]` | `[]` | both | 0.1 | Apps stopped before migrate to release a SQLite lock; resumed on any failure. |
 | `tunnelName` | `string \| null` | `null` | both | 0.1 | cloudflared PM2 process name — ops-verb display only (use `ensureApps` to keep it up). |
@@ -480,6 +481,7 @@ npx deploy-kit run-host-operations --action DEPLOY_PRODUCTION  # claim one allow
 npx deploy-kit run-cairn-operations  # deprecated alias: same as above with the Cairn defaults
 npx deploy-kit deploy            # full pipeline
 npx deploy-kit deploy --dry-run  # print a complete deterministic command plan; contacts no target
+npx deploy-kit deploy --branch feature/demo  # deploy this validated branch once; config is unchanged
 npx deploy-kit rollback          # git reset to the pre-last-deploy SHA + rebuild + restart
 npx deploy-kit dashboard         # status + health + git
 npx deploy-kit status|health|resources|git
@@ -498,7 +500,7 @@ npx deploy-kit logs [--lines N] [--follow] [--errors]
 | `announce-discord` | `--webhook-env NAME` `--service NAME` | Convenience `deliveryEvent.command`: read the post-deploy delivery event on stdin, POST a release announcement to a Discord webhook (env var `NAME`, default `DISCORD_RELEASE_WEBHOOK`). Always exits 0 — an unset env var, malformed stdin, or a failed/timed-out POST is a clear stderr warning, never a failure, since a broken announcement must never fail an already-succeeded deploy. Opt-in — deploy/release stay policy-free. |
 | `run-host-operations` | `--action NAME` `--api-url-env ENV` `--api-key-env ENV` | Host-agent command. Requires a base URL and a narrowly scoped API key, read from the env vars named by `--api-url-env`/`--api-key-env` (default `HOST_OPERATIONS_API_URL` / `HOST_OPERATIONS_API_KEY`). Claims at most one request matching `--action`, runs this checkout's existing configured deploy pipeline, and completes the short-lived lease with a redacted result. It never executes a command, host, or path supplied by the operations API. Example: a Cairn-hosted operations API polling for `DEPLOY_CAIRN_PRODUCTION` requests would run `deploy-kit run-host-operations --action DEPLOY_CAIRN_PRODUCTION --api-url-env CAIRN_OPERATIONS_API_URL --api-key-env CAIRN_OPERATIONS_API_KEY`. |
 | `run-cairn-operations` | — | **Deprecated** alias for `run-host-operations` with the old fixed defaults (action `DEPLOY_CAIRN_PRODUCTION`, env vars `CAIRN_OPERATIONS_API_URL` / `CAIRN_OPERATIONS_API_KEY`). Kept for existing Cairn consumers; new integrations should use `run-host-operations` directly. |
-| `deploy` | `--skip-build` `--skip-deps` `--skip-migrate` `--no-stash` `--dry-run` `--steal-lock` `--no-lock` | Run the full pipeline. Under the release layout, `--no-stash` is rejected (nothing to stash — see Release layout below). |
+| `deploy` | `--skip-build` `--skip-deps` `--skip-migrate` `--skip-pin-check` `--no-stash` `--dry-run` `--steal-lock` `--no-lock` `--branch NAME` | Run the full pipeline. `--branch` selects a validated git branch for this invocation without changing config. Under the release layout, `--no-stash` is rejected (nothing to stash — see Release layout below). |
 | `rollback` | `--skip-build` `--skip-deps` `--dry-run` `--steal-lock` `--no-lock` | Reset to the recorded pre-deploy SHA, rebuild, restart, health-gate. Does **not** accept `--skip-migrate` or `--no-stash` — rollback never reads them. Under the release layout, `--skip-build`/`--skip-deps` are rejected (rollback is an instant flip to an already-built release — see Release layout below). |
 | — `--dry-run` | | Prints the complete deterministic command stream and executes nothing locally or remotely. Release-layout captured values are symbolic and internally consistent so every phase can be reviewed; config validation remains real. See Release layout below. |
 | `monitor` | `--steal-lock` `--no-lock` `--local` | Run the `monitor` checks, alert on transitions, exit `0`/`1`/`2`. For a cron. `--local` (Since 0.19) forces `mode:'local'` for this run. |

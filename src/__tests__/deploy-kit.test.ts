@@ -1560,8 +1560,8 @@ describe('tunnel', () => {
 
 describe('cli', () => {
   it('parseOptions parses flags and --lines arity, and REJECTS the removed --force', () => {
-    const o = cli.parseOptions(['--lines', '99', '--follow', '--errors', '--skip-build', '--dry-run', '--steal-lock', '--no-lock', '--no-stash']);
-    expect(o).toMatchObject({ lines: 99, follow: true, errors: true, skipBuild: true, dryRun: true, stealLock: true, lock: false, stash: false });
+    const o = cli.parseOptions(['--lines', '99', '--follow', '--errors', '--skip-build', '--dry-run', '--steal-lock', '--no-lock', '--no-stash', '--branch', 'feature/test']);
+    expect(o).toMatchObject({ lines: 99, follow: true, errors: true, skipBuild: true, dryRun: true, stealLock: true, lock: false, stash: false, branch: 'feature/test' });
     // `--force` was removed. Silently ignoring it let a caller believe it still
     // did something; it now throws, exactly as a removed CONFIG key does (BWK-136).
     expect(() => cli.parseOptions(['--force'])).toThrow(/Unknown argument: --force/);
@@ -1607,6 +1607,7 @@ describe('cli argument safety (BWK-136)', () => {
     expect(cli.parseOptions(['--no-stash'])).toMatchObject({ stash: false });
     expect(cli.parseOptions(['--no-lock'])).toMatchObject({ lock: false });
     expect(cli.parseOptions(['--steal-lock'])).toMatchObject({ stealLock: true });
+    expect(cli.parseOptions(['--branch', 'feature/test'])).toMatchObject({ branch: 'feature/test' });
     expect(cli.parseOptions(['--lines', '20'])).toMatchObject({ lines: 20 });
     expect(cli.parseOptions(['--follow', '--errors'])).toMatchObject({ follow: true, errors: true });
   });
