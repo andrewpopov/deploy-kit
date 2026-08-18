@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('path');
+const nodeOs = require('os');
 const nodeFs = require('fs');
 const { normalizeRuntime, shQuote } = require('./exec');
 const { log: defaultLog } = require('./log');
@@ -388,6 +389,39 @@ function validateAndStageCutDiff(runtime, cwd, { rootDir, fragments, manifestFil
   return { toStage, noteChanged };
 }
 
+// ---- local-mode detached temp worktree -------------------------------------
+
+// In `mode: 'local'` the controller checkout IS the deploy target (see
+// auto-cut-call.js's comment block), so the cut must never touch it -- a
+// failure partway would leave the live checkout on a stray `release/cut-*`
+// branch, breaking the in-place deploy that follows. `git worktree add
+// --detach <dir> <commit-ish>` shares the commit without claiming the branch
+// (unlike a non-detached worktree, which git rejects when the branch is
+// already checked out elsewhere), so it is safe to create even while the
+// controller sits on `config.branch`. Created OUTSIDE the project directory
+// (OS temp dir) so a local-mode deploy -- which pulls from `config.projectDir`
+// -- never sees it.
+function createLocalCutWorktree(runtime, controllerCwd, repoRootDir, commitish, { tmpdir = nodeOs.tmpdir, now } = {}) {
+  const topLevelRes = runLocal(runtime, controllerCwd, 'git rev-parse --show-toplevel');
+  const repoTopLevel = topLevelRes.output.trim();
+  const relFromTop = path.relative(repoTopLevel, repoRootDir);
+  const tmpWorktreeDir = path.join(
+    tmpdir(),
+    `deploy-kit-autocut-${isoCompactTimestamp(now())}-${process.pid}-${Math.random().toString(36).slice(2)}`,
+  );
+  runLocal(runtime, controllerCwd, `git worktree add --detach ${shQuote(tmpWorktreeDir)} ${shQuote(commitish)}`);
+  return { tmpWorktreeDir, cutRootDir: relFromTop ? path.join(tmpWorktreeDir, relFromTop) : tmpWorktreeDir };
+}
+
+// Always attempted, even after a failure mid-cut -- a leaked worktree blocks
+// later `worktree add` calls at the same path and lingers in `git worktree
+// list` forever. `allowFailure` on both so cleanup itself never masks (or
+// replaces) whatever error is already propagating out of the try block.
+function removeLocalCutWorktree(runtime, controllerCwd, tmpWorktreeDir) {
+  runLocal(runtime, controllerCwd, `git worktree remove --force ${shQuote(tmpWorktreeDir)}`, { allowFailure: true });
+  runLocal(runtime, controllerCwd, 'git worktree prune', { allowFailure: true });
+}
+
 // ---- main entry -------------------------------------------------------------
 
 /**
@@ -459,97 +493,123 @@ function autoCut(config, options = {}, ctx = {}) {
     return { ran: false, fragmentCount: 0 };
   }
 
-  // 6. Cut on a branch.
-  const pkgJsonPath = path.join(rootDir, 'package.json');
-  let pkgJson;
+  // 6-8. Cut, validate, commit, push, PR, merge. In `mode: 'local'` this all
+  // runs in a detached temp worktree, never the controller checkout itself
+  // (see createLocalCutWorktree's comment) -- `cutCwd`/`cutRootDir` are the
+  // controller checkout (`rootDir`) unchanged in every other mode, so ssh
+  // mode's command sequence is untouched. The worktree is always torn down in
+  // the `finally`, on every path including a thrown error.
+  const isLocalMode = config.mode === 'local';
+  let tmpWorktreeDir = null;
+  let cutCwd = rootDir;
+  let cutRootDir = rootDir;
+  let newVersion;
+  let mergeState;
+  let prNumber;
   try {
-    pkgJson = JSON.parse(fsImpl.readFileSync(pkgJsonPath, 'utf8'));
-  } catch (error) {
-    throw new Error(`auto-cut: could not read ${pkgJsonPath}: ${error.message}`);
-  }
-  if (!pkgJson.scripts || typeof pkgJson.scripts[CUT_SCRIPT_NAME] !== 'string') {
-    throw new Error(
-      `auto-cut: project package.json has no "${CUT_SCRIPT_NAME}" script. Install/configure release-kit `
-      + `(\`npm install ${RELEASE_KIT_PACKAGE}\` and a "${CUT_SCRIPT_NAME}": "release-kit cut" script) before enabling autoCut.`,
-    );
-  }
+    if (isLocalMode) {
+      const created = createLocalCutWorktree(runtime, rootDir, rootDir, baseTipX, { now, tmpdir: ctx.tmpdir });
+      tmpWorktreeDir = created.tmpWorktreeDir;
+      cutCwd = tmpWorktreeDir;
+      cutRootDir = created.cutRootDir;
+    }
 
-  const cutBranch = `release/cut-${isoCompactTimestamp(now())}`;
-  runLocal(runtime, rootDir, `git checkout -b ${shQuote(cutBranch)}`);
-  // Never `npx` -- it could silently fetch a different release-kit version
-  // than the one pinned in this project's package.json.
-  runLocal(runtime, rootDir, `npm run ${CUT_SCRIPT_NAME}`);
+    // 6. Cut on a branch.
+    const pkgJsonPath = path.join(cutRootDir, 'package.json');
+    let pkgJson;
+    try {
+      pkgJson = JSON.parse(fsImpl.readFileSync(pkgJsonPath, 'utf8'));
+    } catch (error) {
+      throw new Error(`auto-cut: could not read ${pkgJsonPath}: ${error.message}`);
+    }
+    if (!pkgJson.scripts || typeof pkgJson.scripts[CUT_SCRIPT_NAME] !== 'string') {
+      throw new Error(
+        `auto-cut: project package.json has no "${CUT_SCRIPT_NAME}" script. Install/configure release-kit `
+        + `(\`npm install ${RELEASE_KIT_PACKAGE}\` and a "${CUT_SCRIPT_NAME}": "release-kit cut" script) before enabling autoCut.`,
+      );
+    }
 
-  // 7. Validate the post-cut diff exactly, then stage ONLY the validated paths.
-  const manifestFiles = (config.autoCut && config.autoCut.manifestFiles) || ['package.json', 'package-lock.json'];
-  const notesDirRel = path.relative(rootDir, rkPaths.notesDir).split(path.sep).join('/');
-  const notePaths = (config.autoCut && config.autoCut.notePaths) || [notesDirRel];
-  const archiveDirRel = path.relative(rootDir, rkPaths.archiveDir).split(path.sep).join('/');
-  const { toStage, noteChanged } = validateAndStageCutDiff(runtime, rootDir, {
-    rootDir, fragments, manifestFiles, notePaths, archiveDirRel,
-  });
+    const cutBranch = `release/cut-${isoCompactTimestamp(now())}`;
+    runLocal(runtime, cutCwd, `git checkout -b ${shQuote(cutBranch)}`);
+    // Never `npx` -- it could silently fetch a different release-kit version
+    // than the one pinned in this project's package.json.
+    runLocal(runtime, cutCwd, `npm run ${CUT_SCRIPT_NAME}`);
 
-  let bumpedPkg;
-  try {
-    bumpedPkg = JSON.parse(fsImpl.readFileSync(pkgJsonPath, 'utf8'));
-  } catch (error) {
-    throw new Error(`auto-cut: could not re-read ${pkgJsonPath} after cutting: ${error.message}`);
-  }
-  const newVersion = String(bumpedPkg.version || '').trim();
-  if (!newVersion) {
-    throw new Error('auto-cut: could not determine the new version from the manifest after cutting');
-  }
-  const noteContainsVersion = noteChanged.some((rel) => {
-    const content = fsImpl.readFileSync(path.join(rootDir, rel), 'utf8');
-    return content.includes(newVersion);
-  });
-  if (!noteContainsVersion) {
-    throw new Error(`auto-cut: the new release note does not contain the new version "${newVersion}"`);
-  }
+    // 7. Validate the post-cut diff exactly, then stage ONLY the validated paths.
+    const manifestFiles = (config.autoCut && config.autoCut.manifestFiles) || ['package.json', 'package-lock.json'];
+    const notesDirRel = path.relative(rootDir, rkPaths.notesDir).split(path.sep).join('/');
+    const notePaths = (config.autoCut && config.autoCut.notePaths) || [notesDirRel];
+    const archiveDirRel = path.relative(rootDir, rkPaths.archiveDir).split(path.sep).join('/');
+    const { toStage, noteChanged } = validateAndStageCutDiff(runtime, cutCwd, {
+      rootDir, fragments, manifestFiles, notePaths, archiveDirRel,
+    });
 
-  runLocal(runtime, rootDir, `git add -- ${toStage.map((p) => `'${p.replace(/'/g, "'\\''")}'`).join(' ')}`);
-  runLocal(runtime, rootDir, `git commit -m ${shQuote(`release: cut ${newVersion}`)}`);
-  const cleanRes = runLocal(runtime, rootDir, 'git status --porcelain=v2 --ignore-submodules=no');
-  if (cleanRes.output.trim() !== '') {
-    throw new Error('auto-cut: working tree is not clean after committing the cut -- something outside the validated diff was left behind');
-  }
-  const cutShaRes = runLocal(runtime, rootDir, 'git rev-parse HEAD');
-  const cutSha = cutShaRes.output.trim();
+    let bumpedPkg;
+    try {
+      bumpedPkg = JSON.parse(fsImpl.readFileSync(pkgJsonPath, 'utf8'));
+    } catch (error) {
+      throw new Error(`auto-cut: could not re-read ${pkgJsonPath} after cutting: ${error.message}`);
+    }
+    newVersion = String(bumpedPkg.version || '').trim();
+    if (!newVersion) {
+      throw new Error('auto-cut: could not determine the new version from the manifest after cutting');
+    }
+    const noteContainsVersion = noteChanged.some((rel) => {
+      const content = fsImpl.readFileSync(path.join(cutRootDir, rel), 'utf8');
+      return content.includes(newVersion);
+    });
+    if (!noteContainsVersion) {
+      throw new Error(`auto-cut: the new release note does not contain the new version "${newVersion}"`);
+    }
 
-  // 8. Merge with a pre-merge CAS.
-  runLocal(runtime, rootDir, `git push -u ${shQuote(config.remote)} ${shQuote(cutBranch)}`);
-  const prTitle = `release: cut ${newVersion}`;
-  runLocal(runtime, rootDir, `gh pr create --base ${shQuote(config.branch)} --head ${shQuote(cutBranch)} --title ${shQuote(prTitle)} --body ${shQuote('Automated release cut by deploy-kit auto-cut.')}`);
-  const prNumberRes = runLocal(runtime, rootDir, `gh pr view ${shQuote(cutBranch)} --json number -q .number`);
-  const prNumber = Number(prNumberRes.output.trim());
-  if (!Number.isFinite(prNumber)) {
-    throw new Error(`auto-cut: could not resolve the PR number for ${cutBranch}`);
-  }
+    runLocal(runtime, cutCwd, `git add -- ${toStage.map((p) => `'${p.replace(/'/g, "'\\''")}'`).join(' ')}`);
+    runLocal(runtime, cutCwd, `git commit -m ${shQuote(`release: cut ${newVersion}`)}`);
+    const cleanRes = runLocal(runtime, cutCwd, 'git status --porcelain=v2 --ignore-submodules=no');
+    if (cleanRes.output.trim() !== '') {
+      throw new Error('auto-cut: working tree is not clean after committing the cut -- something outside the validated diff was left behind');
+    }
+    const cutShaRes = runLocal(runtime, cutCwd, 'git rev-parse HEAD');
+    const cutSha = cutShaRes.output.trim();
 
-  const preMergeBaseTip = runLocal(runtime, rootDir, `git ls-remote ${shQuote(config.remote)} ${shQuote(config.branch)}`).output.split('\t')[0].trim();
-  const preMergeHead = runLocal(runtime, rootDir, `gh pr view ${prNumber} --json headRefOid -q .headRefOid`).output.trim();
-  if (preMergeBaseTip !== baseTipX || preMergeHead !== cutSha) {
-    runLocal(runtime, rootDir, `gh pr close ${prNumber} --delete-branch`, { allowFailure: true });
-    throw new Error(
-      `auto-cut: base "${config.branch}" moved from ${baseTipX.slice(0, 12)} to ${preMergeBaseTip.slice(0, 12)} `
-      + 'immediately before merging -- abandoning the PR and branch rather than squashing onto a moved base',
-    );
-  }
+    // 8. Merge with a pre-merge CAS.
+    runLocal(runtime, cutCwd, `git push -u ${shQuote(config.remote)} ${shQuote(cutBranch)}`);
+    const prTitle = `release: cut ${newVersion}`;
+    runLocal(runtime, cutCwd, `gh pr create --base ${shQuote(config.branch)} --head ${shQuote(cutBranch)} --title ${shQuote(prTitle)} --body ${shQuote('Automated release cut by deploy-kit auto-cut.')}`);
+    const prNumberRes = runLocal(runtime, cutCwd, `gh pr view ${shQuote(cutBranch)} --json number -q .number`);
+    prNumber = Number(prNumberRes.output.trim());
+    if (!Number.isFinite(prNumber)) {
+      throw new Error(`auto-cut: could not resolve the PR number for ${cutBranch}`);
+    }
 
-  // `gh pr merge`'s exit code -- success OR failure -- is NOT evidence of the
-  // merge OUTCOME: a success can mean auto-merge was merely enabled/queued
-  // (branch protection / required checks pending), not that the PR actually
-  // merged, and a failure (timeout, transient network error) can mean it
-  // succeeded server-side anyway. Never trust the exit code either way --
-  // always poll the PR's actual state before concluding anything (spec step
-  // 10).
-  runLocal(runtime, rootDir, `gh pr merge ${prNumber} --squash --delete-branch`, { allowFailure: true });
-  const mergeState = pollForMergedState(runtime, rootDir, prNumber, { sleep: ctx.sleep || defaultSleep, log });
-  if (!mergeState.merged) {
-    throw new Error(
-      `auto-cut: PR #${prNumber} did not reach state MERGED (observed "${mergeState.state}") within `
-      + `${MERGE_POLL_ATTEMPTS} poll attempt(s) -- aborting rather than guessing whether the merge landed`,
-    );
+    const preMergeBaseTip = runLocal(runtime, cutCwd, `git ls-remote ${shQuote(config.remote)} ${shQuote(config.branch)}`).output.split('\t')[0].trim();
+    const preMergeHead = runLocal(runtime, cutCwd, `gh pr view ${prNumber} --json headRefOid -q .headRefOid`).output.trim();
+    if (preMergeBaseTip !== baseTipX || preMergeHead !== cutSha) {
+      runLocal(runtime, cutCwd, `gh pr close ${prNumber} --delete-branch`, { allowFailure: true });
+      throw new Error(
+        `auto-cut: base "${config.branch}" moved from ${baseTipX.slice(0, 12)} to ${preMergeBaseTip.slice(0, 12)} `
+        + 'immediately before merging -- abandoning the PR and branch rather than squashing onto a moved base',
+      );
+    }
+
+    // `gh pr merge`'s exit code -- success OR failure -- is NOT evidence of the
+    // merge OUTCOME: a success can mean auto-merge was merely enabled/queued
+    // (branch protection / required checks pending), not that the PR actually
+    // merged, and a failure (timeout, transient network error) can mean it
+    // succeeded server-side anyway. Never trust the exit code either way --
+    // always poll the PR's actual state before concluding anything (spec step
+    // 10).
+    runLocal(runtime, cutCwd, `gh pr merge ${prNumber} --squash --delete-branch`, { allowFailure: true });
+    mergeState = pollForMergedState(runtime, cutCwd, prNumber, { sleep: ctx.sleep || defaultSleep, log });
+    if (!mergeState.merged) {
+      throw new Error(
+        `auto-cut: PR #${prNumber} did not reach state MERGED (observed "${mergeState.state}") within `
+        + `${MERGE_POLL_ATTEMPTS} poll attempt(s) -- aborting rather than guessing whether the merge landed`,
+      );
+    }
+  } finally {
+    if (tmpWorktreeDir) {
+      removeLocalCutWorktree(runtime, rootDir, tmpWorktreeDir);
+    }
   }
 
   // 9. Resolve and persist R BEFORE anything else can fail.

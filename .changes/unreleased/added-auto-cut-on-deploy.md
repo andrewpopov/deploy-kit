@@ -46,5 +46,15 @@ is published permanently: a later deploy failure is a failed deployment of an
 existing release, never an uncut one — no branch reset, no revert, no version
 decrement.
 
-App cuts create no tags. `mode: 'local'` fails closed with an actionable message
-rather than cutting in a worktree that would collide with the deployed checkout.
+App cuts create no tags.
+
+In `mode: 'local'` the controller checkout IS the deploy target, so cutting
+there would create a `release/cut-*` branch in the very checkout being deployed
+— a failure partway would strand the live checkout on the wrong branch and trip
+the in-place deploy's own branch guard on the NEXT deploy too, and the cut would
+mutate live application source before the deploy had started. So local mode cuts
+in a detached temporary worktree instead: `git worktree add --detach` shares the
+commit without claiming the branch, so the controller checkout never moves and is
+never mutated, and the worktree is removed in a `finally` on every path. Preflight
+still validates the controller checkout — that is what the guards are about — and
+only the cut itself relocates. ssh mode is unchanged.

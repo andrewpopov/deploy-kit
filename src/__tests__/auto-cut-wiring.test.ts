@@ -57,9 +57,31 @@ function fakeReleaseKit() {
 // Mirrors auto-cut.test.ts's makeAutoCutRuntime, trimmed to the happy path --
 // autoCut()'s own edge cases are covered there; this file is about what
 // deploy()/deployRelease() do with the R it hands back.
-function autoCutLocalHandler(cmd: string, fs: ReturnType<typeof makeFakeFs>, state: { headCalls: number }): string {
+// Mutable across the sequence of a single autoCut() run -- 'git worktree add
+// --detach' (local mode only) reveals the actual temp worktree path git
+// would have used, which 'npm run release:cut' then needs in order to know
+// where to write the bumped package.json/note (mirroring how a real detached
+// worktree already contains a checkout of package.json at that commit, which
+// is why worktree creation also seeds it below).
+type WorktreeState = { dir: string | null };
+
+function autoCutLocalHandler(cmd: string, fs: ReturnType<typeof makeFakeFs>, state: { headCalls: number }, wt: WorktreeState): string {
   if (cmd.includes('ls-remote --symref')) return `ref: refs/heads/${BRANCH}\tHEAD\n${BASE_TIP}\tHEAD\n`;
   if (cmd.startsWith('git fetch ')) return '';
+  if (cmd === 'git rev-parse --show-toplevel') return '/repo\n';
+  if (cmd.startsWith('git worktree add --detach ')) {
+    const match = /^git worktree add --detach '([^']+)' '([^']+)'$/.exec(cmd);
+    const dir = match ? match[1] : '/tmp/fake-autocut-worktree';
+    wt.dir = dir;
+    // A real detached worktree already contains a full checkout at the
+    // commit it was created from -- seed it with the controller's pre-cut
+    // package.json so the "does release:cut exist" read (which happens
+    // BEFORE `npm run release:cut` runs) finds it.
+    fs.writeFileSync(`${dir}/package.json`, fs.readFileSync('/repo/package.json'));
+    return '';
+  }
+  if (cmd.startsWith('git worktree remove --force')) return '';
+  if (cmd === 'git worktree prune') return '';
   if (cmd.startsWith('git rev-parse') && cmd.includes(REMOTE) && cmd.includes(BRANCH)) return `${BASE_TIP}\n`;
   if (cmd === 'git status --porcelain=v2 --ignore-submodules=no') return '';
   if (cmd.includes('symbolic-ref -q --short HEAD')) return `${BRANCH}\n`;
@@ -75,10 +97,11 @@ function autoCutLocalHandler(cmd: string, fs: ReturnType<typeof makeFakeFs>, sta
   if (cmd.includes('gh repo view')) return 'andrewpopov/demo\n';
   if (cmd.startsWith('git checkout -b ')) return '';
   if (cmd === 'npm run release:cut') {
-    const pkg = JSON.parse(fs.readFileSync('/repo/package.json'));
+    const dir = wt.dir || '/repo';
+    const pkg = JSON.parse(fs.readFileSync(`${dir}/package.json`));
     pkg.version = '1.2.0';
-    fs.writeFileSync('/repo/package.json', JSON.stringify(pkg));
-    fs.writeFileSync('/repo/CHANGELOG.md', '## 1.2.0\n\n- fixed a thing\n');
+    fs.writeFileSync(`${dir}/package.json`, JSON.stringify(pkg));
+    fs.writeFileSync(`${dir}/CHANGELOG.md`, '## 1.2.0\n\n- fixed a thing\n');
     return '';
   }
   if (cmd === 'git status --porcelain=v2 --ignore-submodules=no --cutdiff') return '';
@@ -103,6 +126,7 @@ function autoCutLocalHandler(cmd: string, fs: ReturnType<typeof makeFakeFs>, sta
 function makeAutoCutLocal(fs: ReturnType<typeof makeFakeFs>) {
   let statusCalls = 0;
   const state = { headCalls: 0 };
+  const wt: WorktreeState = { dir: null };
   const postCutDiff = "1 M. N... 100644 100644 100644 abc abc package.json\n2 R100 N... 100644 100644 100644 abc abc R100 CHANGELOG.md\tCHANGELOG.md\n2 R100 N... 100644 100644 100644 abc abc R100 .changes/archive/1.2.0/fixed-a.md\t.changes/unreleased/fixed-a.md\n";
   return (cmd: string) => {
     if (cmd === 'git status --porcelain=v2 --ignore-submodules=no') {
@@ -110,7 +134,7 @@ function makeAutoCutLocal(fs: ReturnType<typeof makeFakeFs>) {
       if (statusCalls === 2) return postCutDiff;
       return '';
     }
-    return autoCutLocalHandler(cmd, fs, state);
+    return autoCutLocalHandler(cmd, fs, state, wt);
   };
 }
 
@@ -290,11 +314,24 @@ describe('deploy() + auto-cut: deploy-by-SHA', () => {
       .toThrow(/still reports tracked\/staged change\(s\)/);
   });
 
-  it('fails closed, by its own message, when mode is "local" and auto-cut would run', () => {
-    const { ctx } = makeCombinedRuntime();
+  it('mode "local": cuts in a detached temp worktree (not the controller checkout) and still reaches R', () => {
+    const { ctx, calls } = makeCombinedRuntime();
     const localConfig = legacyConfig({ mode: 'local' });
-    expect(() => deploy(localConfig, { projectRoot: ROOT }, ctx))
-      .toThrow(/local-mode deploy cannot safely auto-cut in the controller's own checkout/);
+    const result = deploy(localConfig, { projectRoot: ROOT }, ctx);
+    expect(result.healthy).toBe(true);
+    const worktreeAddCall = calls.find((c) => c.startsWith('git worktree add --detach '));
+    expect(worktreeAddCall).toBeDefined();
+    // Created from the resolved remote tip X, not any branch name.
+    expect(worktreeAddCall).toBe(`git worktree add --detach '${worktreeAddCall!.match(/^git worktree add --detach '([^']+)'/)![1]}' '${BASE_TIP}'`);
+    // The worktree is torn down again on the same run.
+    expect(calls.some((c) => c.startsWith('git worktree remove --force '))).toBe(true);
+    expect(calls.some((c) => c === 'git worktree prune')).toBe(true);
+    // Cleanup happens after the cut/push/merge sequence, not before it.
+    const addIdx = calls.indexOf(worktreeAddCall!);
+    const removeIdx = calls.findIndex((c) => c.startsWith('git worktree remove --force '));
+    expect(addIdx).toBeGreaterThanOrEqual(0);
+    expect(removeIdx).toBeGreaterThan(addIdx);
+    expect(calls.slice(addIdx, removeIdx)).toContain('npm run release:cut');
   });
 
   it('aborts by name, rather than restarting, when a preRestartCheck itself moves target HEAD off R', () => {
