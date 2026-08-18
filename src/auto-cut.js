@@ -1,0 +1,543 @@
+'use strict';
+
+const path = require('path');
+const nodeFs = require('fs');
+const { normalizeRuntime, shQuote } = require('./exec');
+const { log: defaultLog } = require('./log');
+
+// Where the crash-recovery pointer lives, relative to the project root. The
+// consumer project is expected to gitignore this (documented in README), same
+// spirit as deploy.js's `.deploy-kit-state.json` on the target.
+const PENDING_RELEASE_PATH = path.join('.deploy-kit', 'pending-release.json');
+
+const RELEASE_KIT_PACKAGE = '@andrewpopov/release-kit';
+const RELEASE_KIT_CONFIG_CANDIDATES = ['release-kit.config.js', 'release-kit.config.cjs'];
+const CUT_SCRIPT_NAME = 'release:cut';
+
+// ---- small local helpers ---------------------------------------------------
+
+// Run a shell one-liner on the LOCAL controller checkout (never the deploy
+// target -- auto-cut always runs on the machine invoking deploy-kit, before
+// either pipeline touches a host). Mirrors exec.js's `sh -c` idiom for
+// mode:'local' so the whole module stays testable through the same
+// normalizeRuntime seam as every other deploy-kit module, without pulling in
+// runOnTarget (which builds ssh/host commands from `config`, not applicable
+// here).
+function runLocal(runtime, cwd, command, { allowFailure = false, input } = {}) {
+  const execOptions = { cwd, encoding: 'utf8' };
+  if (input != null) execOptions.input = input;
+  try {
+    const output = runtime.execFileSync('sh', ['-c', command], execOptions);
+    return { ok: true, output: String(output || ''), stderr: '' };
+  } catch (error) {
+    const result = { ok: false, output: String((error && error.stdout) || ''), stderr: String((error && error.stderr) || ''), error };
+    if (!allowFailure) {
+      const detail = result.stderr ? `\n${result.stderr}` : '';
+      throw new Error(`auto-cut: command failed: ${command}${detail}`);
+    }
+    return result;
+  }
+}
+
+function findReleaseKitConfigPath(projectRoot, fsImpl) {
+  for (const name of RELEASE_KIT_CONFIG_CANDIDATES) {
+    const candidate = path.join(projectRoot, name);
+    if (fsImpl.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function readPendingRelease(projectRoot, fsImpl) {
+  const file = path.join(projectRoot, PENDING_RELEASE_PATH);
+  if (!fsImpl.existsSync(file)) return null;
+  let raw;
+  try {
+    raw = fsImpl.readFileSync(file, 'utf8');
+  } catch (error) {
+    throw new Error(`auto-cut: could not read ${PENDING_RELEASE_PATH}: ${error.message}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`auto-cut: ${PENDING_RELEASE_PATH} is not valid JSON: ${error.message}`);
+  }
+  if (!parsed || typeof parsed.sha !== 'string' || !parsed.sha) {
+    throw new Error(`auto-cut: ${PENDING_RELEASE_PATH} exists but is missing a "sha" — resolve or remove it by hand before retrying`);
+  }
+  return parsed;
+}
+
+function writePendingRelease(projectRoot, fsImpl, data) {
+  const dir = path.join(projectRoot, '.deploy-kit');
+  fsImpl.mkdirSync(dir, { recursive: true });
+  fsImpl.writeFileSync(path.join(projectRoot, PENDING_RELEASE_PATH), `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+}
+
+function clearPendingRelease(projectRoot, fsImpl) {
+  const file = path.join(projectRoot, PENDING_RELEASE_PATH);
+  if (fsImpl.existsSync(file)) fsImpl.unlinkSync(file);
+}
+
+// Fail closed: a release-kit.config.{js,cjs} exists at the project root but
+// the package itself is not resolvable from there. Warn-and-skip would
+// silently recreate the exact "stale dependency ships under a green deploy"
+// defect this feature exists to fix, so this always throws.
+function resolveReleaseKit(projectRoot, ctx) {
+  const resolve = ctx.resolve || ((name, opts) => require.resolve(name, opts));
+  const load = ctx.requireModule || ((modulePath) => require(modulePath));
+  let entry;
+  try {
+    entry = resolve(RELEASE_KIT_PACKAGE, { paths: [projectRoot] });
+  } catch {
+    throw new Error(
+      `auto-cut: release-kit.config was found at the project root but "${RELEASE_KIT_PACKAGE}" is not `
+      + `installed/resolvable from there. Run \`npm install ${RELEASE_KIT_PACKAGE}\` in the project, or `
+      + 'disable autoCut, before deploying.',
+    );
+  }
+  return load(entry);
+}
+
+function loadRkConfig(configPath, ctx) {
+  const load = ctx.requireModule || ((modulePath) => require(modulePath));
+  const mod = load(configPath);
+  const cfg = mod && mod.__esModule ? mod.default : mod;
+  if (!cfg || typeof cfg !== 'object') {
+    throw new Error(`auto-cut: ${configPath} did not export a release-kit config object`);
+  }
+  return cfg;
+}
+
+function isoCompactTimestamp(nowMs) {
+  return new Date(nowMs).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+}
+
+// ---- preflight --------------------------------------------------------------
+
+function assertNoInProgressGitOperation(runtime, cwd) {
+  const script = 'gd=$(git rev-parse --git-dir) || exit 1; '
+    + 'test -f "$gd/MERGE_HEAD" && echo merge && exit 0; '
+    + 'test -d "$gd/rebase-merge" && echo rebase && exit 0; '
+    + 'test -d "$gd/rebase-apply" && echo rebase && exit 0; '
+    + 'test -f "$gd/CHERRY_PICK_HEAD" && echo cherry-pick && exit 0; '
+    + 'test -f "$gd/REVERT_HEAD" && echo revert && exit 0; '
+    + 'test -f "$gd/BISECT_LOG" && echo bisect && exit 0; '
+    + 'echo none';
+  const res = runLocal(runtime, cwd, script);
+  const state = res.output.trim();
+  if (state && state !== 'none') {
+    throw new Error(`auto-cut: refusing to cut a release with a ${state} in progress on the controller checkout`);
+  }
+}
+
+function assertCleanWorkingTree(runtime, cwd) {
+  const res = runLocal(runtime, cwd, 'git status --porcelain=v2 --ignore-submodules=no');
+  if (res.output.trim() !== '') {
+    throw new Error('auto-cut: working tree is not clean (tracked, untracked, or submodule changes present); refusing to cut a release from a dirty checkout');
+  }
+}
+
+function assertOnConfiguredBranch(runtime, cwd, branch) {
+  const res = runLocal(runtime, cwd, 'git symbolic-ref -q --short HEAD', { allowFailure: true });
+  const current = res.output.trim();
+  if (!res.ok || !current) {
+    throw new Error('auto-cut: HEAD is detached; auto-cut requires the controller checkout to be on a branch');
+  }
+  if (current !== branch) {
+    throw new Error(`auto-cut: controller checkout is on branch "${current}", expected "${branch}"`);
+  }
+}
+
+function resolveRemoteDefaultBranch(runtime, cwd, remote) {
+  const res = runLocal(runtime, cwd, `git ls-remote --symref ${shQuote(remote)} HEAD`);
+  const match = /^ref:\s+refs\/heads\/(\S+)\s+HEAD/m.exec(res.output);
+  if (!match) {
+    throw new Error(`auto-cut: could not determine ${remote}'s default branch from \`git ls-remote --symref\``);
+  }
+  return match[1];
+}
+
+function assertBranchIsRemoteDefault(remoteDefaultBranch, branch) {
+  if (remoteDefaultBranch !== branch) {
+    throw new Error(`auto-cut: configured branch "${branch}" is not ${'the'} remote's actual default branch ("${remoteDefaultBranch}")`);
+  }
+}
+
+function fetchAndResolveRemoteTip(runtime, cwd, remote, branch) {
+  const fetchRes = runLocal(runtime, cwd, `git fetch ${shQuote(remote)}`, { allowFailure: true });
+  if (!fetchRes.ok) {
+    throw new Error(`auto-cut: \`git fetch ${remote}\` failed${fetchRes.stderr ? `: ${fetchRes.stderr}` : ''}`);
+  }
+  const res = runLocal(runtime, cwd, `git rev-parse ${shQuote(remote)}/${shQuote(branch)}`);
+  return res.output.trim();
+}
+
+function assertLocalHeadMatchesRemoteTip(runtime, cwd, remoteTip) {
+  const res = runLocal(runtime, cwd, 'git rev-parse HEAD');
+  const localHead = res.output.trim();
+  if (localHead !== remoteTip) {
+    throw new Error(
+      `auto-cut: local HEAD (${localHead.slice(0, 12)}) does not exactly equal the remote tip `
+      + `(${remoteTip.slice(0, 12)}) -- a locally-ahead branch would make the eventual fast-forward `
+      + 'fail; pull or push first',
+    );
+  }
+}
+
+function assertUnambiguousPushRemote(runtime, cwd, remote) {
+  const res = runLocal(runtime, cwd, 'git rev-parse --abbrev-ref --symbolic-full-name @{u}', { allowFailure: true });
+  const upstream = res.output.trim();
+  if (!res.ok || !upstream.includes('/')) {
+    throw new Error('auto-cut: no unambiguous upstream tracking branch configured for HEAD');
+  }
+  const upstreamRemote = upstream.slice(0, upstream.indexOf('/'));
+  if (upstreamRemote !== remote) {
+    throw new Error(`auto-cut: HEAD's upstream remote ("${upstreamRemote}") does not match the configured remote ("${remote}")`);
+  }
+}
+
+function assertGhRepoMatchesRemote(runtime, cwd, remote) {
+  const urlRes = runLocal(runtime, cwd, `git remote get-url --push ${shQuote(remote)}`);
+  const url = urlRes.output.trim();
+  const match = /github\.com[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?$/.exec(url);
+  if (!match) {
+    throw new Error(`auto-cut: could not parse an owner/repo out of ${remote}'s push URL ("${url}")`);
+  }
+  const [, remoteOwner, remoteRepo] = match;
+  const ghRes = runLocal(runtime, cwd, 'gh repo view --json owner,name -q "(.owner.login)+\\"/\\"+(.name)"', { allowFailure: true });
+  if (!ghRes.ok) {
+    throw new Error(`auto-cut: \`gh repo view\` failed; cannot confirm gh is authenticated against the same repo as ${remote}`);
+  }
+  const ghSlug = ghRes.output.trim();
+  const remoteSlug = `${remoteOwner}/${remoteRepo}`;
+  if (ghSlug !== remoteSlug) {
+    throw new Error(`auto-cut: \`gh\` resolves repo "${ghSlug}", but the ${remote} remote points at "${remoteSlug}" -- refusing to cut a PR against the wrong repo`);
+  }
+}
+
+function runPreflight(runtime, cwd, config, remoteDefaultBranch, remoteTip) {
+  assertCleanWorkingTree(runtime, cwd);
+  assertOnConfiguredBranch(runtime, cwd, config.branch);
+  assertBranchIsRemoteDefault(remoteDefaultBranch, config.branch);
+  assertNoInProgressGitOperation(runtime, cwd);
+  assertLocalHeadMatchesRemoteTip(runtime, cwd, remoteTip);
+  assertUnambiguousPushRemote(runtime, cwd, config.remote);
+  assertGhRepoMatchesRemote(runtime, cwd, config.remote);
+}
+
+// ---- post-cut diff validation ----------------------------------------------
+
+// Parse `git status --porcelain=v2` output into { path, status, from? } rows.
+// v2 also reports submodule state on the same line (an 'S...' flags field), so
+// this is the one read that covers tracked, untracked, AND submodule changes.
+// Formats (see git-status(1)):
+//   1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
+//   2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path><TAB><origPath>
+//   ? <path>
+//   u <XY> <sub> <m1> <m2> <m3> <mW> <hH1> <hI2> <hI3> <path>
+const ORDINARY_RE = /^1 \S+ \S+ \S+ \S+ \S+ \S+ \S+ (.*)$/;
+const RENAME_RE = /^2 \S+ \S+ \S+ \S+ \S+ \S+ \S+ \S+ (.*)$/;
+const UNMERGED_RE = /^u \S+ \S+ \S+ \S+ \S+ \S+ \S+ \S+ \S+ (.*)$/;
+function parsePorcelainV2(output) {
+  const rows = [];
+  for (const line of output.split('\n')) {
+    if (!line) continue;
+    const kind = line[0];
+    if (kind === '1') {
+      const match = ORDINARY_RE.exec(line);
+      if (match) rows.push({ path: match[1], status: 'modified' });
+    } else if (kind === '2') {
+      const match = RENAME_RE.exec(line);
+      if (match) {
+        const [newPath, oldPath] = match[1].split('\t');
+        rows.push({ path: newPath, from: oldPath, status: 'rename' });
+      }
+    } else if (kind === '?') {
+      rows.push({ path: line.slice(3), status: 'untracked' });
+    } else if (kind === 'u') {
+      const match = UNMERGED_RE.exec(line);
+      if (match) rows.push({ path: match[1], status: 'unmerged' });
+    }
+  }
+  return rows;
+}
+
+// Build the allowed-path classifier and assert the ACTUAL post-cut diff is
+// exactly the expected set: the manifest, the observed fragment paths
+// (consumed), the archived copies, and the note/index path(s). Anything else
+// aborts naming the unexpected path. Never `git add -A`.
+function validateAndStageCutDiff(runtime, cwd, { rootDir, fragments, manifestFiles, notePaths, archiveDirRel }) {
+  const statusRes = runLocal(runtime, cwd, 'git status --porcelain=v2 --ignore-submodules=no');
+  const rows = parsePorcelainV2(statusRes.output);
+  if (rows.length === 0) {
+    throw new Error('auto-cut: `npm run release:cut` produced no changes at all -- nothing to commit');
+  }
+
+  const fragmentRelPaths = new Set(fragments.map((f) => path.relative(rootDir, f.filePath).split(path.sep).join('/')));
+  const manifestSet = new Set(manifestFiles);
+  const notePrefixes = notePaths.map((p) => p.replace(/\/+$/, ''));
+
+  const matchesNotePath = (p) => notePrefixes.some((prefix) => p === prefix || p.startsWith(`${prefix}/`));
+  const matchesArchive = (p) => p === archiveDirRel || p.startsWith(`${archiveDirRel}/`);
+
+  const toStage = [];
+  const manifestChanged = [];
+  let fragmentsConsumed = 0;
+  let archivedCount = 0;
+  const noteChanged = [];
+
+  for (const row of rows) {
+    const p = row.path;
+    if (p.startsWith('../') || path.isAbsolute(p)) {
+      throw new Error(`auto-cut: cut diff contains a path escaping the repo root: "${p}"`);
+    }
+    if (manifestSet.has(p)) {
+      manifestChanged.push(p);
+      toStage.push(p);
+      continue;
+    }
+    if (row.status === 'rename' && fragmentRelPaths.has(row.from) && matchesArchive(p)) {
+      fragmentsConsumed += 1;
+      archivedCount += 1;
+      toStage.push(p);
+      continue;
+    }
+    if (fragmentRelPaths.has(p)) {
+      // Deleted-from-unreleased half of a fragment (matched separately if a
+      // rename didn't capture it, e.g. tracked as a plain delete + untracked add).
+      fragmentsConsumed += 1;
+      toStage.push(p);
+      continue;
+    }
+    if (matchesArchive(p)) {
+      archivedCount += 1;
+      toStage.push(p);
+      continue;
+    }
+    if (matchesNotePath(p)) {
+      noteChanged.push(p);
+      toStage.push(p);
+      continue;
+    }
+    throw new Error(`auto-cut: \`npm run release:cut\` touched an unexpected path outside the allowlist: "${p}"`);
+  }
+
+  if (manifestChanged.length === 0) {
+    throw new Error('auto-cut: `npm run release:cut` did not touch the manifest; expected exactly one manifest advance');
+  }
+  const manifestPrimary = manifestChanged.filter((p) => !p.endsWith('-lock.json') && !p.endsWith('.lock'));
+  if (manifestPrimary.length !== 1) {
+    throw new Error(`auto-cut: expected the manifest to advance exactly once, got ${manifestPrimary.length} manifest change(s): ${manifestChanged.join(', ')}`);
+  }
+  if (fragmentsConsumed !== fragments.length) {
+    throw new Error(`auto-cut: expected ${fragments.length} fragment(s) to be consumed, observed ${fragmentsConsumed}`);
+  }
+  if (fragments.length > 0 && archivedCount !== fragments.length) {
+    throw new Error(`auto-cut: expected ${fragments.length} archived fragment copy(ies) under "${archiveDirRel}", observed ${archivedCount}`);
+  }
+  if (noteChanged.length === 0) {
+    throw new Error('auto-cut: `npm run release:cut` did not produce a new release note under the configured note path(s)');
+  }
+
+  return { toStage, noteChanged };
+}
+
+// ---- main entry -------------------------------------------------------------
+
+/**
+ * Runs on the LOCAL controller checkout, before either deploy pipeline builds
+ * a candidate. Produces an immutable merged SHA `R` that the caller then
+ * deploys. See AUTOCUT-SPEC.md for the full flow this implements.
+ */
+function autoCut(config, options = {}, ctx = {}) {
+  const log = ctx.log || defaultLog;
+  const runtime = normalizeRuntime(ctx.runtime);
+  const fsImpl = ctx.fs || nodeFs;
+  const now = ctx.now || (() => Date.now());
+  const projectRoot = options.projectRoot || process.cwd();
+  const dryRun = options.dryRun === true;
+
+  // 1. Skip conditions.
+  if (options.autoCut === false || config.autoCut === false) {
+    return { ran: false };
+  }
+  const rkConfigPath = findReleaseKitConfigPath(projectRoot, fsImpl);
+  if (!rkConfigPath) {
+    return { ran: false };
+  }
+
+  // 10. Resume -- checked before ANY preflight or mutation, dry-run or not:
+  // the release may already be published, so re-running must hand back the
+  // SAME R, never cut (or deploy a descendant) again.
+  const pending = readPendingRelease(projectRoot, fsImpl);
+  if (pending) {
+    log.info(`auto-cut: resuming pending release ${pending.sha} (PR #${pending.prNumber}) -- not cutting again`);
+    return {
+      ran: true, resumed: true, sha: pending.sha, version: pending.version, prNumber: pending.prNumber,
+    };
+  }
+
+  if (options.branch) {
+    throw new Error('auto-cut: refusing to run with a --branch override in play; auto-cut always targets config.branch on the remote default branch');
+  }
+
+  // 3. Fail closed if release-kit itself isn't resolvable -- BEFORE the
+  // dry-run branch, so `--dry-run` can never silently skip this the way v1 did.
+  const releaseKit = resolveReleaseKit(projectRoot, ctx);
+  const rkConfig = loadRkConfig(rkConfigPath, ctx);
+  const rkPaths = releaseKit.resolvePaths(rkConfig);
+  const rootDir = rkPaths.rootDir;
+
+  // 2. Dry run: report what WOULD be cut, zero local git mutation, zero GitHub write.
+  if (dryRun) {
+    const fragments = releaseKit.collectFragments(rkConfig);
+    log.info(`auto-cut: [dry run] would cut a release from ${fragments.length} fragment(s); performing no local git mutation and no GitHub write`);
+    return { ran: false, dryRun: true, fragmentCount: fragments.length };
+  }
+
+  // 4. Preflight.
+  const remoteDefaultBranch = resolveRemoteDefaultBranch(runtime, rootDir, config.remote);
+  const remoteTip = fetchAndResolveRemoteTip(runtime, rootDir, config.remote, config.branch || remoteDefaultBranch);
+  runPreflight(runtime, rootDir, config, remoteDefaultBranch, remoteTip);
+  const baseTipX = remoteTip;
+
+  // 5. Fragments.
+  const fragments = releaseKit.collectFragments(rkConfig);
+  if (fragments.length === 0) {
+    return { ran: false, fragmentCount: 0 };
+  }
+
+  // 6. Cut on a branch.
+  const pkgJsonPath = path.join(rootDir, 'package.json');
+  let pkgJson;
+  try {
+    pkgJson = JSON.parse(fsImpl.readFileSync(pkgJsonPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`auto-cut: could not read ${pkgJsonPath}: ${error.message}`);
+  }
+  if (!pkgJson.scripts || typeof pkgJson.scripts[CUT_SCRIPT_NAME] !== 'string') {
+    throw new Error(
+      `auto-cut: project package.json has no "${CUT_SCRIPT_NAME}" script. Install/configure release-kit `
+      + `(\`npm install ${RELEASE_KIT_PACKAGE}\` and a "${CUT_SCRIPT_NAME}": "release-kit cut" script) before enabling autoCut.`,
+    );
+  }
+
+  const cutBranch = `release/cut-${isoCompactTimestamp(now())}`;
+  runLocal(runtime, rootDir, `git checkout -b ${shQuote(cutBranch)}`);
+  // Never `npx` -- it could silently fetch a different release-kit version
+  // than the one pinned in this project's package.json.
+  runLocal(runtime, rootDir, `npm run ${CUT_SCRIPT_NAME}`);
+
+  // 7. Validate the post-cut diff exactly, then stage ONLY the validated paths.
+  const manifestFiles = (config.autoCut && config.autoCut.manifestFiles) || ['package.json', 'package-lock.json'];
+  const notesDirRel = path.relative(rootDir, rkPaths.notesDir).split(path.sep).join('/');
+  const notePaths = (config.autoCut && config.autoCut.notePaths) || [notesDirRel];
+  const archiveDirRel = path.relative(rootDir, rkPaths.archiveDir).split(path.sep).join('/');
+  const { toStage, noteChanged } = validateAndStageCutDiff(runtime, rootDir, {
+    rootDir, fragments, manifestFiles, notePaths, archiveDirRel,
+  });
+
+  let bumpedPkg;
+  try {
+    bumpedPkg = JSON.parse(fsImpl.readFileSync(pkgJsonPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`auto-cut: could not re-read ${pkgJsonPath} after cutting: ${error.message}`);
+  }
+  const newVersion = String(bumpedPkg.version || '').trim();
+  if (!newVersion) {
+    throw new Error('auto-cut: could not determine the new version from the manifest after cutting');
+  }
+  const noteContainsVersion = noteChanged.some((rel) => {
+    const content = fsImpl.readFileSync(path.join(rootDir, rel), 'utf8');
+    return content.includes(newVersion);
+  });
+  if (!noteContainsVersion) {
+    throw new Error(`auto-cut: the new release note does not contain the new version "${newVersion}"`);
+  }
+
+  runLocal(runtime, rootDir, `git add -- ${toStage.map((p) => `'${p.replace(/'/g, "'\\''")}'`).join(' ')}`);
+  runLocal(runtime, rootDir, `git commit -m ${shQuote(`release: cut ${newVersion}`)}`);
+  const cleanRes = runLocal(runtime, rootDir, 'git status --porcelain=v2 --ignore-submodules=no');
+  if (cleanRes.output.trim() !== '') {
+    throw new Error('auto-cut: working tree is not clean after committing the cut -- something outside the validated diff was left behind');
+  }
+  const cutShaRes = runLocal(runtime, rootDir, 'git rev-parse HEAD');
+  const cutSha = cutShaRes.output.trim();
+
+  // 8. Merge with a pre-merge CAS.
+  runLocal(runtime, rootDir, `git push -u ${shQuote(config.remote)} ${shQuote(cutBranch)}`);
+  const prTitle = `release: cut ${newVersion}`;
+  runLocal(runtime, rootDir, `gh pr create --base ${shQuote(config.branch)} --head ${shQuote(cutBranch)} --title ${shQuote(prTitle)} --body ${shQuote('Automated release cut by deploy-kit auto-cut.')}`);
+  const prNumberRes = runLocal(runtime, rootDir, `gh pr view ${shQuote(cutBranch)} --json number -q .number`);
+  const prNumber = Number(prNumberRes.output.trim());
+  if (!Number.isFinite(prNumber)) {
+    throw new Error(`auto-cut: could not resolve the PR number for ${cutBranch}`);
+  }
+
+  const preMergeBaseTip = runLocal(runtime, rootDir, `git ls-remote ${shQuote(config.remote)} ${shQuote(config.branch)}`).output.split('\t')[0].trim();
+  const preMergeHead = runLocal(runtime, rootDir, `gh pr view ${prNumber} --json headRefOid -q .headRefOid`).output.trim();
+  if (preMergeBaseTip !== baseTipX || preMergeHead !== cutSha) {
+    runLocal(runtime, rootDir, `gh pr close ${prNumber} --delete-branch`, { allowFailure: true });
+    throw new Error(
+      `auto-cut: base "${config.branch}" moved from ${baseTipX.slice(0, 12)} to ${preMergeBaseTip.slice(0, 12)} `
+      + 'immediately before merging -- abandoning the PR and branch rather than squashing onto a moved base',
+    );
+  }
+
+  // `gh pr merge` failing (a timeout, a transient network error) is NOT
+  // evidence the merge did not happen -- it may well have succeeded
+  // server-side. Never let a failed merge COMMAND stand in for a failed
+  // merge OUTCOME: always re-query the PR's actual state before concluding
+  // either way (spec step 10).
+  const mergeRes = runLocal(runtime, rootDir, `gh pr merge ${prNumber} --squash --delete-branch`, { allowFailure: true });
+  if (!mergeRes.ok) {
+    const stateRes = runLocal(runtime, rootDir, `gh pr view ${prNumber} --json state -q .state`, { allowFailure: true });
+    const state = stateRes.output.trim();
+    if (!stateRes.ok || state !== 'MERGED') {
+      throw new Error(
+        `auto-cut: \`gh pr merge\` for PR #${prNumber} failed and a re-query found it `
+        + `${state ? `in state "${state}"` : 'in an unknown state'} (not MERGED) -- aborting rather than `
+        + 'guessing whether the merge landed',
+      );
+    }
+    // The merge command failed but the PR is actually MERGED server-side --
+    // fall through to the normal path below, which re-queries the merge SHA
+    // itself, so a flaky `gh pr merge` never blocks step 9 from running.
+  }
+
+  // 9. Resolve and persist R BEFORE anything else can fail.
+  const mergeShaRes = runLocal(runtime, rootDir, `gh pr view ${prNumber} --json mergeCommit -q .mergeCommit.oid`);
+  const mergedSha = mergeShaRes.output.trim();
+  if (!mergedSha) {
+    throw new Error(`auto-cut: PR #${prNumber} merged but the API returned no merge commit SHA -- resolve by hand`);
+  }
+  writePendingRelease(projectRoot, fsImpl, {
+    sha: mergedSha, version: newVersion, prNumber, at: new Date(now()).toISOString(),
+  });
+
+  runLocal(runtime, rootDir, `git fetch ${shQuote(config.remote)} ${shQuote(mergedSha)}`);
+  runLocal(runtime, rootDir, `git checkout ${shQuote(config.branch)}`);
+  // Fast-forward to R EXPLICITLY, never to the branch tip -- a descendant S
+  // landing between the merge and this line must never be silently followed.
+  runLocal(runtime, rootDir, `git merge --ff-only ${shQuote(mergedSha)}`);
+
+  // 11. Return R.
+  return {
+    ran: true, sha: mergedSha, version: newVersion, prNumber, fragmentCount: fragments.length,
+  };
+}
+
+// Clear the pending-release pointer once the caller's deployment of R has
+// actually succeeded -- the resume window closes only then, not at merge time.
+function clearAutoCutPending(options = {}, ctx = {}) {
+  const fsImpl = ctx.fs || nodeFs;
+  const projectRoot = options.projectRoot || process.cwd();
+  clearPendingRelease(projectRoot, fsImpl);
+}
+
+module.exports = {
+  autoCut,
+  clearAutoCutPending,
+  PENDING_RELEASE_PATH,
+};
