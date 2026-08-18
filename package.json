@@ -37,7 +37,8 @@
     "release:cut": "release-kit cut",
     "release:check": "release-kit check",
     "release:hygiene": "release-kit hygiene",
-    "verify:bins": "release-kit verify-bins"
+    "verify:bins": "release-kit verify-bins",
+    "prepare": "git config core.hooksPath .githooks || true"
   },
   "devDependencies": {
     "@andrewpopov/alert-kit": "github:andrewpopov/alert-kit#v0.6.1",
