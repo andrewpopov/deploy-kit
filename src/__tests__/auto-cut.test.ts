@@ -306,7 +306,9 @@ describe('autoCut', () => {
 
   it('the diff allowlist rejects an unexpected path', () => {
     const { runtime } = makeAutoCutRuntime({
-      postCutDiff: '1 M. N... 100644 100644 100644 abc abc package.json\n?? some/unexpected/file.txt\n',
+      // porcelain v2 untracked rows are `? <path>` (one '?', one space) --
+      // NOT the porcelain v1 `?? <path>` shape.
+      postCutDiff: '1 M. N... 100644 100644 100644 abc abc package.json\n? some/unexpected/file.txt\n',
     });
     const ctx = baseCtx();
     wireCutSideEffects(runtime, ctx.fs);
