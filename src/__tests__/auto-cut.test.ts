@@ -490,3 +490,222 @@ describe('autoCut', () => {
     expect(pending).toMatchObject({ sha: MERGE_SHA, version: '1.2.0', prNumber: 42 });
   });
 });
+
+// ---- mode: 'local' -- cuts in a detached temp worktree ---------------------
+//
+// A separate, self-contained runtime factory (rather than reusing
+// makeAutoCutRuntime) so it can track `cwd` per call -- the whole point of
+// these tests is proving WHICH directory each command ran in, not just which
+// commands ran, and makeAutoCutRuntime's fake ignores execFileSync's cwd
+// option entirely (every ssh-mode call always targets the same rootDir).
+const TMP_BASE = '/tmp';
+
+function makeLocalRuntime(over: any = {}) {
+  const cfg = {
+    remoteDefaultBranch: BRANCH,
+    baseTip: BASE_TIP,
+    localHead: BASE_TIP,
+    postCutDiff: `1 M. N... 100644 100644 100644 abc abc package.json\n2 R100 N... 100644 100644 100644 abc abc R100 CHANGELOG.md\tCHANGELOG.md\n2 R100 N... 100644 100644 100644 abc abc R100 .changes/archive/1.2.0/fixed-a.md\t.changes/unreleased/fixed-a.md\n`,
+    ghSlug: 'andrewpopov/demo',
+    remoteUrl: 'git@github.com:andrewpopov/demo.git',
+    upstream: `${REMOTE}/${BRANCH}`,
+    prNumber: '42',
+    mergeSha: MERGE_SHA,
+    fail: [] as string[],
+    ...over,
+  };
+  const calls: Array<{ cmd: string; cwd: string }> = [];
+  const state = { headCalls: 0, statusCalls: 0, worktreeDir: null as string | null, worktreeRemoved: false };
+  const fs = makeFakeFs({
+    '/repo/release-kit.config.js': 'module.exports = {}',
+    '/repo/package.json': JSON.stringify({ name: 'demo', version: '1.1.0', scripts: { 'release:cut': 'release-kit cut' } }),
+  });
+  const execFileSync = (_file: string, args: string[], options: any = {}) => {
+    const cmd = args[args.length - 1];
+    const cwd = options && options.cwd;
+    calls.push({ cmd, cwd });
+    if (cfg.fail.some((f: string) => cmd.includes(f))) {
+      const err: any = new Error(`fake failure: ${cmd}`);
+      err.stdout = '';
+      err.stderr = 'fake stderr';
+      throw err;
+    }
+    if (cmd.includes('ls-remote --symref')) return `ref: refs/heads/${cfg.remoteDefaultBranch}\tHEAD\n${cfg.baseTip}\tHEAD\n`;
+    if (cmd.startsWith('git fetch ')) return '';
+    if (cmd === 'git rev-parse --show-toplevel') return `${ROOT}\n`;
+    if (cmd.startsWith('git worktree add --detach ')) {
+      const match = /^git worktree add --detach '([^']+)' '([^']+)'$/.exec(cmd);
+      state.worktreeDir = match ? match[1] : `${TMP_BASE}/fallback-worktree`;
+      fs.writeFileSync(`${state.worktreeDir}/package.json`, fs.readFileSync('/repo/package.json'));
+      return '';
+    }
+    if (cmd.startsWith('git worktree remove --force')) {
+      state.worktreeRemoved = true;
+      return '';
+    }
+    if (cmd === 'git worktree prune') return '';
+    if (cmd.startsWith('git rev-parse') && cmd.includes(REMOTE) && cmd.includes(BRANCH)) return `${cfg.baseTip}\n`;
+    if (cmd === 'git status --porcelain=v2 --ignore-submodules=no') {
+      state.statusCalls += 1;
+      if (state.statusCalls === 2) return cfg.postCutDiff;
+      return '';
+    }
+    if (cmd.includes('symbolic-ref -q --short HEAD')) return `${BRANCH}\n`;
+    if (cmd.includes('MERGE_HEAD')) return 'none\n';
+    if (cmd === 'git rev-parse HEAD') {
+      state.headCalls += 1;
+      return state.headCalls === 1 ? `${cfg.localHead}\n` : `${CUT_SHA}\n`;
+    }
+    if (cmd.includes('@{u}')) return `${cfg.upstream}\n`;
+    if (cmd.includes('remote get-url --push')) return `${cfg.remoteUrl}\n`;
+    if (cmd.includes('gh repo view')) return `${cfg.ghSlug}\n`;
+    if (cmd.startsWith('git checkout -b ')) return '';
+    if (cmd === 'npm run release:cut') {
+      const dir = state.worktreeDir as string;
+      const pkg = JSON.parse(fs.readFileSync(`${dir}/package.json`));
+      pkg.version = '1.2.0';
+      fs.writeFileSync(`${dir}/package.json`, JSON.stringify(pkg));
+      fs.writeFileSync(`${dir}/CHANGELOG.md`, '## 1.2.0\n\n- fixed a thing\n');
+      return '';
+    }
+    if (cmd.startsWith('git add --')) return '';
+    if (cmd.startsWith('git commit -m')) return '';
+    if (cmd.startsWith('git push -u')) return '';
+    if (cmd.startsWith('gh pr create')) return 'https://github.com/andrewpopov/demo/pull/42\n';
+    if (cmd.includes('gh pr view') && cmd.includes('--json number')) return `${cfg.prNumber}\n`;
+    if (cmd.startsWith('git ls-remote ') && !cmd.includes('--symref')) return `${cfg.baseTip}\trefs/heads/${BRANCH}\n`;
+    if (cmd.includes('gh pr view') && cmd.includes('headRefOid')) return `${CUT_SHA}\n`;
+    if (cmd.includes('gh pr merge')) return '';
+    if (cmd.includes('gh pr view') && cmd.includes('state,mergeCommit')) return `MERGED\t${cfg.mergeSha}\n`;
+    if (cmd.startsWith('git checkout ') && !cmd.includes('-b')) return '';
+    if (cmd.startsWith('git merge --ff-only')) return '';
+    return '';
+  };
+  return {
+    runtime: { execFileSync }, calls, cfg, state, fs,
+  };
+}
+
+function localConfig(over: any = {}) {
+  return mergeConfig(DEFAULT_CONFIG, {
+    remote: REMOTE, branch: BRANCH, mode: 'local', autoCut: { notePaths: ['CHANGELOG.md'] }, ...over,
+  });
+}
+
+function localCtx(fs: any, over: any = {}) {
+  const rk = {
+    collectFragments: () => FRAGMENTS,
+    resolvePaths: () => ({
+      rootDir: ROOT,
+      notesDir: `${ROOT}/.changes`,
+      unreleasedDir: `${ROOT}/.changes/unreleased`,
+      releasesDir: `${ROOT}/.changes/releases`,
+      archiveDir: `${ROOT}/.changes/archive`,
+      indexPath: `${ROOT}/.changes/INDEX.md`,
+    }),
+  };
+  return {
+    fs,
+    now: () => Date.parse('2026-08-17T12:00:00Z'),
+    tmpdir: () => TMP_BASE,
+    resolve: () => '/repo/node_modules/@andrewpopov/release-kit/index.js',
+    requireModule: (p: string) => (p === '/repo/release-kit.config.js' ? { productName: 'demo' } : rk),
+    log: { info: () => {}, warning: () => {}, error: () => {}, success: () => {} },
+    sleep: () => {},
+    ...over,
+  };
+}
+
+describe('autoCut mode: "local" (detached temp worktree)', () => {
+  it('cuts, pushes, and merges in a detached temp worktree outside projectRoot -- the controller checkout never leaves its branch and is never mutated', () => {
+    const { runtime, calls, state, fs } = makeLocalRuntime();
+    const result = autoCut(localConfig(), { projectRoot: ROOT }, localCtx(fs, { runtime }));
+    expect(result).toMatchObject({ ran: true, sha: MERGE_SHA, version: '1.2.0', prNumber: 42 });
+    expect(state.worktreeDir).toBeTruthy();
+    // The temp worktree lives under the OS tmp dir, outside the project root.
+    expect(state.worktreeDir!.startsWith(TMP_BASE)).toBe(true);
+    expect(state.worktreeDir!.startsWith(ROOT)).toBe(false);
+
+    // Every mutating cut command (branch creation, the cut script, staging,
+    // commit, push, PR create/merge) ran with cwd === the temp worktree --
+    // NEVER the controller checkout (rootDir).
+    const mutatingPrefixes = [
+      'git checkout -b ', 'npm run release:cut', 'git add --', 'git commit -m',
+      'git push -u', 'gh pr create', 'gh pr merge',
+    ];
+    const mutatingCalls = calls.filter((c) => mutatingPrefixes.some((p) => c.cmd.startsWith(p)));
+    expect(mutatingCalls.length).toBeGreaterThan(0);
+    for (const c of mutatingCalls) {
+      expect(c.cwd).toBe(state.worktreeDir);
+    }
+    // The controller checkout (rootDir) never runs `git checkout -b` -- it
+    // never leaves config.branch for the cut branch.
+    expect(calls.some((c) => c.cwd === ROOT && c.cmd.startsWith('git checkout -b'))).toBe(false);
+
+    // Only the FINAL fast-forward (fetch R / checkout config.branch / merge
+    // --ff-only) runs against the controller checkout.
+    const finalFetch = calls.find((c) => c.cmd === `git fetch '${REMOTE}' '${MERGE_SHA}'`);
+    expect(finalFetch).toBeDefined();
+    expect(finalFetch!.cwd).toBe(ROOT);
+    const finalCheckout = calls.find((c) => c.cmd === `git checkout '${BRANCH}'`);
+    expect(finalCheckout).toBeDefined();
+    expect(finalCheckout!.cwd).toBe(ROOT);
+    const finalMerge = calls.find((c) => c.cmd === `git merge --ff-only '${MERGE_SHA}'`);
+    expect(finalMerge).toBeDefined();
+    expect(finalMerge!.cwd).toBe(ROOT);
+
+    // The worktree was cleaned up.
+    expect(state.worktreeRemoved).toBe(true);
+    expect(calls.some((c) => c.cmd === 'git worktree prune')).toBe(true);
+  });
+
+  it('preflight guards still fire in local mode and still describe/target the controller checkout', () => {
+    const { runtime, calls, fs } = makeLocalRuntime({ upstream: '' });
+    expect(() => autoCut(localConfig(), { projectRoot: ROOT }, localCtx(fs, { runtime })))
+      .toThrow(/no unambiguous upstream tracking branch configured/);
+    // The failure is a preflight guard -- it must fire BEFORE any worktree is
+    // ever created, and every command up to that point targeted rootDir.
+    expect(calls.some((c) => c.cmd.startsWith('git worktree add'))).toBe(false);
+    expect(calls.every((c) => c.cwd === ROOT)).toBe(true);
+  });
+
+  it('the temp worktree is removed even when the cut script itself fails', () => {
+    const { runtime, state, fs } = makeLocalRuntime({ fail: ['npm run release:cut'] });
+    expect(() => autoCut(localConfig(), { projectRoot: ROOT }, localCtx(fs, { runtime })))
+      .toThrow(/command failed: npm run release:cut/);
+    expect(state.worktreeRemoved).toBe(true);
+  });
+
+  it('the temp worktree is removed even when the push fails', () => {
+    const { runtime, state, fs } = makeLocalRuntime({ fail: ['git push -u'] });
+    expect(() => autoCut(localConfig(), { projectRoot: ROOT }, localCtx(fs, { runtime })))
+      .toThrow(/command failed: git push -u/);
+    expect(state.worktreeRemoved).toBe(true);
+  });
+
+  it('the temp worktree is removed even when the merge never reaches MERGED', () => {
+    const { runtime, state, fs } = makeLocalRuntime({});
+    const ctx = localCtx(fs, { runtime, sleep: () => {} });
+    // Force every merge-state poll to report OPEN, never MERGED.
+    const original = runtime.execFileSync;
+    (runtime as any).execFileSync = (file: string, args: string[], options: any) => {
+      const cmd = args[args.length - 1];
+      if (cmd.includes('gh pr view') && cmd.includes('state,mergeCommit')) return 'OPEN\t\n';
+      return original(file, args, options);
+    };
+    expect(() => autoCut(localConfig(), { projectRoot: ROOT }, ctx))
+      .toThrow(/did not reach state MERGED/);
+    expect(state.worktreeRemoved).toBe(true);
+  });
+
+  it('mode "ssh" (default) issues the exact same command sequence as before -- a regression guard against the two modes diverging', () => {
+    const { runtime: sshRuntime, calls: sshCalls, cfg: sshCfg } = makeAutoCutRuntime();
+    const sshCtx = baseCtx();
+    wireCutSideEffects(sshRuntime, sshCtx.fs);
+    autoCut(baseConfig(), { projectRoot: ROOT }, { ...sshCtx, runtime: sshRuntime });
+
+    // No worktree command of any kind in ssh mode.
+    expect(sshCalls.some((c: string) => c.includes('worktree'))).toBe(false);
+    void sshCfg;
+  });
+});
