@@ -53,3 +53,33 @@ describe('git commands the source issues are accepted by a real git', () => {
     });
   }
 });
+
+/**
+ * The owner/repo parser used to require a literal `github.com` host. Every
+ * repo in this fleet uses an SSH host ALIAS (`git@github-personal:owner/repo.git`,
+ * routed to github.com by ~/.ssh/config), so auto-cut aborted on the real
+ * remote of every single repo it was meant to serve — invisible to the fake
+ * runtime, which returns a canned github.com URL.
+ */
+describe('remote push URL -> owner/repo', () => {
+  const parse = (url: string): string | null => {
+    const m = /[:/]([^/\s:]+)\/([^/\s]+?)(?:\.git)?$/.exec(url);
+    return m ? `${m[1]}/${m[2]}` : null;
+  };
+
+  test.each([
+    ['git@github-personal:andrewpopov/smarthome.git', 'andrewpopov/smarthome'],
+    ['git@github-work:someorg/repo.git', 'someorg/repo'],
+    ['git@github.com:andrewpopov/cairn.git', 'andrewpopov/cairn'],
+    ['https://github.com/andrewpopov/bewks.git', 'andrewpopov/bewks'],
+    ['https://github.com/andrewpopov/bewks', 'andrewpopov/bewks'],
+    ['ssh://git@github.com/andrewpopov/mizen.git', 'andrewpopov/mizen'],
+  ])('parses %s', (url, expected) => {
+    expect(parse(url)).toBe(expected);
+  });
+
+  test('the parser in auto-cut.js is the one under test here', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'auto-cut.js'), 'utf8');
+    expect(src).toContain('[:/]([^/\\s:]+)\\/([^/\\s]+?)(?:\\.git)?$');
+  });
+});

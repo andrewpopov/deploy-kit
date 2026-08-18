@@ -246,7 +246,13 @@ function assertUnambiguousPushRemote(runtime, cwd, remote) {
 function assertGhRepoMatchesRemote(runtime, cwd, remote) {
   const urlRes = runLocal(runtime, cwd, `git remote get-url --push ${shQuote(remote)}`);
   const url = urlRes.output.trim();
-  const match = /github\.com[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?$/.exec(url);
+  // Match owner/repo without insisting the host is literally github.com. SSH
+  // host ALIASES are the norm in this fleet -- `git@github-personal:owner/repo.git`
+  // routes to github.com via ~/.ssh/config, and a github.com-only pattern
+  // rejects it outright. Covers scp-style (`user@host:owner/repo`), ssh://,
+  // https:// and git:// forms alike; the gh-vs-remote comparison below is what
+  // actually establishes the repo identity, so the host itself is not the check.
+  const match = /[:/]([^/\s:]+)\/([^/\s]+?)(?:\.git)?$/.exec(url);
   if (!match) {
     throw new Error(`auto-cut: could not parse an owner/repo out of ${remote}'s push URL ("${url}")`);
   }
