@@ -306,7 +306,14 @@ function parsePorcelainV2(output) {
         rows.push({ path: newPath, from: oldPath, status: 'rename' });
       }
     } else if (kind === '?') {
-      rows.push({ path: line.slice(3), status: 'untracked' });
+      // Untracked rows are `? <path>` -- a 2-char prefix ('?' + one space),
+      // not 3. slice(3) ate the path's first character (".changes/archive/"
+      // -> "changes/archive/"), which never matched `archiveDirRel` and
+      // aborted every cut whose archive directory didn't already exist as a
+      // tracked path -- i.e. every real cut of a fresh version. Caught by
+      // the real-git integration test, never by the synthetic-runtime unit
+      // tests (none of which happened to exercise this branch).
+      rows.push({ path: line.slice(2), status: 'untracked' });
     } else if (kind === 'u') {
       const match = UNMERGED_RE.exec(line);
       if (match) rows.push({ path: match[1], status: 'unmerged' });
@@ -330,7 +337,17 @@ function validateAndStageCutDiff(runtime, cwd, { rootDir, fragments, manifestFil
   const manifestSet = new Set(manifestFiles);
   const notePrefixes = notePaths.map((p) => p.replace(/\/+$/, ''));
 
-  const matchesNotePath = (p) => notePrefixes.some((prefix) => p === prefix || p.startsWith(`${prefix}/`));
+  // A note/index path can itself be reported two ways: as the file/dir
+  // directly (or something beneath it -- the notesDir case), OR, when the
+  // path's own ancestor directory is ENTIRELY new (e.g. a fresh top-level
+  // `docs/` holding only the regenerated index), git collapses the whole new
+  // directory into one untracked porcelain row (`docs/`) rather than
+  // descending into it. That row is the same regenerated file at coarser
+  // granularity, so it must match too -- the reverse containment check
+  // (`prefix.startsWith(p)` for a directory row `p`) catches it.
+  const matchesNotePath = (p) => notePrefixes.some((prefix) => p === prefix
+    || p.startsWith(`${prefix}/`)
+    || (p.endsWith('/') && prefix.startsWith(p)));
   const matchesArchive = (p) => p === archiveDirRel || p.startsWith(`${archiveDirRel}/`);
 
   const toStage = [];
@@ -368,7 +385,19 @@ function validateAndStageCutDiff(runtime, cwd, { rootDir, fragments, manifestFil
       continue;
     }
     if (matchesNotePath(p)) {
-      noteChanged.push(p);
+      // Normally `p` IS the changed file (a rename/modify row under the
+      // notes dir) and is exactly what the caller wants to read back to
+      // confirm the new version landed in it. The one exception is the
+      // directory-collapse case from matchesNotePath above: when `p` itself
+      // is a wholly-new ANCESTOR directory (e.g. `docs/` collapsing an
+      // index at `docs/PATCH_NOTES.md`), record the configured file path
+      // instead, since `p` is not a file the caller can read.
+      if (p.endsWith('/')) {
+        const coveredPrefix = notePrefixes.find((prefix) => prefix.startsWith(p));
+        if (coveredPrefix && !noteChanged.includes(coveredPrefix)) noteChanged.push(coveredPrefix);
+      } else if (!noteChanged.includes(p)) {
+        noteChanged.push(p);
+      }
       toStage.push(p);
       continue;
     }
@@ -426,6 +455,26 @@ function createLocalCutWorktree(runtime, controllerCwd, repoRootDir, commitish, 
 function removeLocalCutWorktree(runtime, controllerCwd, tmpWorktreeDir) {
   runLocal(runtime, controllerCwd, `git worktree remove --force ${shQuote(tmpWorktreeDir)}`, { allowFailure: true });
   runLocal(runtime, controllerCwd, 'git worktree prune', { allowFailure: true });
+}
+
+// ssh-mode failure recovery: undoes exactly what the cut itself may have
+// done to the CONTROLLER checkout -- nothing more. preflight already asserted
+// the tree was clean before the cut began, so discarding tracked/untracked
+// changes on the cut branch is safe (anything present was produced by the
+// cut script or the `git add`/`commit` steps that followed it, never by the
+// caller). Runs on ANY failure after `git checkout -b <cutBranch>`, whether
+// the branch was actually created (checkout -b itself may be the failure) or
+// commits/push/PR/merge failed further along -- every step here is
+// best-effort (`allowFailure: true`) so a cleanup hiccup never masks the
+// original error that triggered it. Never invoked in local mode: that cut
+// runs in its own detached temp worktree, so the controller checkout is
+// never on the cut branch to begin with.
+function restoreControllerCheckoutAfterFailedCut(runtime, rootDir, originalBranch, cutBranch) {
+  if (!cutBranch) return;
+  runLocal(runtime, rootDir, 'git reset --hard HEAD', { allowFailure: true });
+  runLocal(runtime, rootDir, 'git clean -fd', { allowFailure: true });
+  runLocal(runtime, rootDir, `git checkout ${shQuote(originalBranch)}`, { allowFailure: true });
+  runLocal(runtime, rootDir, `git branch -D ${shQuote(cutBranch)}`, { allowFailure: true });
 }
 
 // ---- main entry -------------------------------------------------------------
@@ -512,6 +561,7 @@ function autoCut(config, options = {}, ctx = {}) {
   let newVersion;
   let mergeState;
   let prNumber;
+  let cutBranch = null;
   try {
     if (isLocalMode) {
       const created = createLocalCutWorktree(runtime, rootDir, rootDir, baseTipX, { now, tmpdir: ctx.tmpdir });
@@ -535,82 +585,115 @@ function autoCut(config, options = {}, ctx = {}) {
       );
     }
 
-    const cutBranch = `release/cut-${isoCompactTimestamp(now())}`;
+    cutBranch = `release/cut-${isoCompactTimestamp(now())}`;
     runLocal(runtime, cutCwd, `git checkout -b ${shQuote(cutBranch)}`);
-    // Never `npx` -- it could silently fetch a different release-kit version
-    // than the one pinned in this project's package.json.
-    runLocal(runtime, cutCwd, `npm run ${CUT_SCRIPT_NAME}`);
 
-    // 7. Validate the post-cut diff exactly, then stage ONLY the validated paths.
-    const manifestFiles = (config.autoCut && config.autoCut.manifestFiles) || ['package.json', 'package-lock.json'];
-    const notesDirRel = path.relative(rootDir, rkPaths.notesDir).split(path.sep).join('/');
-    const notePaths = (config.autoCut && config.autoCut.notePaths) || [notesDirRel];
-    const archiveDirRel = path.relative(rootDir, rkPaths.archiveDir).split(path.sep).join('/');
-    const { toStage, noteChanged } = validateAndStageCutDiff(runtime, cutCwd, {
-      rootDir, fragments, manifestFiles, notePaths, archiveDirRel,
-    });
-
-    let bumpedPkg;
+    // From here on, in ssh mode (isLocalMode === false, cutCwd === rootDir --
+    // the controller's own checkout), ANY failure must not leave the
+    // controller sitting on the cut branch with the cut's changes in the
+    // working tree: that is exactly the hazard local mode's detached
+    // worktree exists to avoid, and it would strand the checkout so the next
+    // deploy's own preflight (must be on config.branch, tree must be clean)
+    // aborts too. So this whole span -- running the cut script through the
+    // merge poll -- is guarded: any throw restores the checkout to
+    // config.branch with a clean tree and deletes the temp branch, then
+    // rethrows the original error. Local mode is exempt: the cut runs in a
+    // disposable detached worktree that the outer `finally` already tears
+    // down, and the controller checkout itself is never touched.
     try {
-      bumpedPkg = JSON.parse(fsImpl.readFileSync(pkgJsonPath, 'utf8'));
+      // Never `npx` -- it could silently fetch a different release-kit version
+      // than the one pinned in this project's package.json.
+      runLocal(runtime, cutCwd, `npm run ${CUT_SCRIPT_NAME}`);
+
+      // 7. Validate the post-cut diff exactly, then stage ONLY the validated paths.
+      const manifestFiles = (config.autoCut && config.autoCut.manifestFiles) || ['package.json', 'package-lock.json'];
+      const notesDirRel = path.relative(rootDir, rkPaths.notesDir).split(path.sep).join('/');
+      const configuredNotePaths = (config.autoCut && config.autoCut.notePaths) || [notesDirRel];
+      // The regenerated patch-notes index (e.g. docs/PATCH_NOTES.md) is a
+      // legitimate, expected output of every cut -- release-kit rewrites it in
+      // the same commit as the note itself. Derive it from resolvePaths()
+      // rather than hardcoding a filename, and always include it regardless of
+      // the notePaths escape hatch above (which exists to widen/replace the
+      // notes-dir expectation, not to opt back OUT of the index release-kit
+      // itself unconditionally writes).
+      const indexPathRel = rkPaths.indexPath
+        ? path.relative(rootDir, rkPaths.indexPath).split(path.sep).join('/')
+        : null;
+      const notePaths = indexPathRel && !configuredNotePaths.includes(indexPathRel)
+        ? [...configuredNotePaths, indexPathRel]
+        : configuredNotePaths;
+      const archiveDirRel = path.relative(rootDir, rkPaths.archiveDir).split(path.sep).join('/');
+      const { toStage, noteChanged } = validateAndStageCutDiff(runtime, cutCwd, {
+        rootDir, fragments, manifestFiles, notePaths, archiveDirRel,
+      });
+
+      let bumpedPkg;
+      try {
+        bumpedPkg = JSON.parse(fsImpl.readFileSync(pkgJsonPath, 'utf8'));
+      } catch (error) {
+        throw new Error(`auto-cut: could not re-read ${pkgJsonPath} after cutting: ${error.message}`);
+      }
+      newVersion = String(bumpedPkg.version || '').trim();
+      if (!newVersion) {
+        throw new Error('auto-cut: could not determine the new version from the manifest after cutting');
+      }
+      const noteContainsVersion = noteChanged.some((rel) => {
+        const content = fsImpl.readFileSync(path.join(cutRootDir, rel), 'utf8');
+        return content.includes(newVersion);
+      });
+      if (!noteContainsVersion) {
+        throw new Error(`auto-cut: the new release note does not contain the new version "${newVersion}"`);
+      }
+
+      runLocal(runtime, cutCwd, `git add -- ${toStage.map((p) => `'${p.replace(/'/g, "'\\''")}'`).join(' ')}`);
+      runLocal(runtime, cutCwd, `git commit -m ${shQuote(`release: cut ${newVersion}`)}`);
+      const cleanRes = runLocal(runtime, cutCwd, 'git status --porcelain=v2 --ignore-submodules=none');
+      if (cleanRes.output.trim() !== '') {
+        throw new Error('auto-cut: working tree is not clean after committing the cut -- something outside the validated diff was left behind');
+      }
+      const cutShaRes = runLocal(runtime, cutCwd, 'git rev-parse HEAD');
+      const cutSha = cutShaRes.output.trim();
+
+      // 8. Merge with a pre-merge CAS.
+      runLocal(runtime, cutCwd, `git push -u ${shQuote(config.remote)} ${shQuote(cutBranch)}`);
+      const prTitle = `release: cut ${newVersion}`;
+      runLocal(runtime, cutCwd, `gh pr create --base ${shQuote(config.branch)} --head ${shQuote(cutBranch)} --title ${shQuote(prTitle)} --body ${shQuote('Automated release cut by deploy-kit auto-cut.')}`);
+      const prNumberRes = runLocal(runtime, cutCwd, `gh pr view ${shQuote(cutBranch)} --json number -q .number`);
+      prNumber = Number(prNumberRes.output.trim());
+      if (!Number.isFinite(prNumber)) {
+        throw new Error(`auto-cut: could not resolve the PR number for ${cutBranch}`);
+      }
+
+      const preMergeBaseTip = runLocal(runtime, cutCwd, `git ls-remote ${shQuote(config.remote)} ${shQuote(config.branch)}`).output.split('\t')[0].trim();
+      const preMergeHead = runLocal(runtime, cutCwd, `gh pr view ${prNumber} --json headRefOid -q .headRefOid`).output.trim();
+      if (preMergeBaseTip !== baseTipX || preMergeHead !== cutSha) {
+        runLocal(runtime, cutCwd, `gh pr close ${prNumber} --delete-branch`, { allowFailure: true });
+        throw new Error(
+          `auto-cut: base "${config.branch}" moved from ${baseTipX.slice(0, 12)} to ${preMergeBaseTip.slice(0, 12)} `
+          + 'immediately before merging -- abandoning the PR and branch rather than squashing onto a moved base',
+        );
+      }
+
+      // `gh pr merge`'s exit code -- success OR failure -- is NOT evidence of the
+      // merge OUTCOME: a success can mean auto-merge was merely enabled/queued
+      // (branch protection / required checks pending), not that the PR actually
+      // merged, and a failure (timeout, transient network error) can mean it
+      // succeeded server-side anyway. Never trust the exit code either way --
+      // always poll the PR's actual state before concluding anything (spec step
+      // 10).
+      runLocal(runtime, cutCwd, `gh pr merge ${prNumber} --squash --delete-branch`, { allowFailure: true });
+      mergeState = pollForMergedState(runtime, cutCwd, prNumber, { sleep: ctx.sleep || defaultSleep, log });
+      if (!mergeState.merged) {
+        throw new Error(
+          `auto-cut: PR #${prNumber} did not reach state MERGED (observed "${mergeState.state}") within `
+          + `${MERGE_POLL_ATTEMPTS} poll attempt(s) -- aborting rather than guessing whether the merge landed`,
+        );
+      }
     } catch (error) {
-      throw new Error(`auto-cut: could not re-read ${pkgJsonPath} after cutting: ${error.message}`);
-    }
-    newVersion = String(bumpedPkg.version || '').trim();
-    if (!newVersion) {
-      throw new Error('auto-cut: could not determine the new version from the manifest after cutting');
-    }
-    const noteContainsVersion = noteChanged.some((rel) => {
-      const content = fsImpl.readFileSync(path.join(cutRootDir, rel), 'utf8');
-      return content.includes(newVersion);
-    });
-    if (!noteContainsVersion) {
-      throw new Error(`auto-cut: the new release note does not contain the new version "${newVersion}"`);
-    }
-
-    runLocal(runtime, cutCwd, `git add -- ${toStage.map((p) => `'${p.replace(/'/g, "'\\''")}'`).join(' ')}`);
-    runLocal(runtime, cutCwd, `git commit -m ${shQuote(`release: cut ${newVersion}`)}`);
-    const cleanRes = runLocal(runtime, cutCwd, 'git status --porcelain=v2 --ignore-submodules=none');
-    if (cleanRes.output.trim() !== '') {
-      throw new Error('auto-cut: working tree is not clean after committing the cut -- something outside the validated diff was left behind');
-    }
-    const cutShaRes = runLocal(runtime, cutCwd, 'git rev-parse HEAD');
-    const cutSha = cutShaRes.output.trim();
-
-    // 8. Merge with a pre-merge CAS.
-    runLocal(runtime, cutCwd, `git push -u ${shQuote(config.remote)} ${shQuote(cutBranch)}`);
-    const prTitle = `release: cut ${newVersion}`;
-    runLocal(runtime, cutCwd, `gh pr create --base ${shQuote(config.branch)} --head ${shQuote(cutBranch)} --title ${shQuote(prTitle)} --body ${shQuote('Automated release cut by deploy-kit auto-cut.')}`);
-    const prNumberRes = runLocal(runtime, cutCwd, `gh pr view ${shQuote(cutBranch)} --json number -q .number`);
-    prNumber = Number(prNumberRes.output.trim());
-    if (!Number.isFinite(prNumber)) {
-      throw new Error(`auto-cut: could not resolve the PR number for ${cutBranch}`);
-    }
-
-    const preMergeBaseTip = runLocal(runtime, cutCwd, `git ls-remote ${shQuote(config.remote)} ${shQuote(config.branch)}`).output.split('\t')[0].trim();
-    const preMergeHead = runLocal(runtime, cutCwd, `gh pr view ${prNumber} --json headRefOid -q .headRefOid`).output.trim();
-    if (preMergeBaseTip !== baseTipX || preMergeHead !== cutSha) {
-      runLocal(runtime, cutCwd, `gh pr close ${prNumber} --delete-branch`, { allowFailure: true });
-      throw new Error(
-        `auto-cut: base "${config.branch}" moved from ${baseTipX.slice(0, 12)} to ${preMergeBaseTip.slice(0, 12)} `
-        + 'immediately before merging -- abandoning the PR and branch rather than squashing onto a moved base',
-      );
-    }
-
-    // `gh pr merge`'s exit code -- success OR failure -- is NOT evidence of the
-    // merge OUTCOME: a success can mean auto-merge was merely enabled/queued
-    // (branch protection / required checks pending), not that the PR actually
-    // merged, and a failure (timeout, transient network error) can mean it
-    // succeeded server-side anyway. Never trust the exit code either way --
-    // always poll the PR's actual state before concluding anything (spec step
-    // 10).
-    runLocal(runtime, cutCwd, `gh pr merge ${prNumber} --squash --delete-branch`, { allowFailure: true });
-    mergeState = pollForMergedState(runtime, cutCwd, prNumber, { sleep: ctx.sleep || defaultSleep, log });
-    if (!mergeState.merged) {
-      throw new Error(
-        `auto-cut: PR #${prNumber} did not reach state MERGED (observed "${mergeState.state}") within `
-        + `${MERGE_POLL_ATTEMPTS} poll attempt(s) -- aborting rather than guessing whether the merge landed`,
-      );
+      if (!isLocalMode) {
+        restoreControllerCheckoutAfterFailedCut(runtime, rootDir, config.branch, cutBranch);
+      }
+      throw error;
     }
   } finally {
     if (tmpWorktreeDir) {
