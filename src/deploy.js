@@ -350,7 +350,7 @@ function deploy(config, options = {}, ctx = {}) {
       // as the stash's own "tracked-only" contract above); a leftover
       // TRACKED or staged change is not.
       if (R) {
-        const postStashStatus = runOnTarget('git status --porcelain=v2 --ignore-submodules=no', config, { runtime, capture: true });
+        const postStashStatus = runOnTarget('git status --porcelain=v2 --ignore-submodules=none', config, { runtime, capture: true });
         const trackedOrStaged = (postStashStatus.output || '')
           .split('\n')
           .filter((line) => line.startsWith('1') || line.startsWith('2') || line.startsWith('u'));

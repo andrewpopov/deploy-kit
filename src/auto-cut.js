@@ -178,7 +178,7 @@ function assertNoInProgressGitOperation(runtime, cwd) {
 }
 
 function assertCleanWorkingTree(runtime, cwd) {
-  const res = runLocal(runtime, cwd, 'git status --porcelain=v2 --ignore-submodules=no');
+  const res = runLocal(runtime, cwd, 'git status --porcelain=v2 --ignore-submodules=none');
   if (res.output.trim() !== '') {
     throw new Error('auto-cut: working tree is not clean (tracked, untracked, or submodule changes present); refusing to cut a release from a dirty checkout');
   }
@@ -314,7 +314,7 @@ function parsePorcelainV2(output) {
 // (consumed), the archived copies, and the note/index path(s). Anything else
 // aborts naming the unexpected path. Never `git add -A`.
 function validateAndStageCutDiff(runtime, cwd, { rootDir, fragments, manifestFiles, notePaths, archiveDirRel }) {
-  const statusRes = runLocal(runtime, cwd, 'git status --porcelain=v2 --ignore-submodules=no');
+  const statusRes = runLocal(runtime, cwd, 'git status --porcelain=v2 --ignore-submodules=none');
   const rows = parsePorcelainV2(statusRes.output);
   if (rows.length === 0) {
     throw new Error('auto-cut: `npm run release:cut` produced no changes at all -- nothing to commit');
@@ -564,7 +564,7 @@ function autoCut(config, options = {}, ctx = {}) {
 
     runLocal(runtime, cutCwd, `git add -- ${toStage.map((p) => `'${p.replace(/'/g, "'\\''")}'`).join(' ')}`);
     runLocal(runtime, cutCwd, `git commit -m ${shQuote(`release: cut ${newVersion}`)}`);
-    const cleanRes = runLocal(runtime, cutCwd, 'git status --porcelain=v2 --ignore-submodules=no');
+    const cleanRes = runLocal(runtime, cutCwd, 'git status --porcelain=v2 --ignore-submodules=none');
     if (cleanRes.output.trim() !== '') {
       throw new Error('auto-cut: working tree is not clean after committing the cut -- something outside the validated diff was left behind');
     }
