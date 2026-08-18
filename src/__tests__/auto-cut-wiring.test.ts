@@ -83,7 +83,7 @@ function autoCutLocalHandler(cmd: string, fs: ReturnType<typeof makeFakeFs>, sta
   if (cmd.startsWith('git worktree remove --force')) return '';
   if (cmd === 'git worktree prune') return '';
   if (cmd.startsWith('git rev-parse') && cmd.includes(REMOTE) && cmd.includes(BRANCH)) return `${BASE_TIP}\n`;
-  if (cmd === 'git status --porcelain=v2 --ignore-submodules=no') return '';
+  if (cmd === 'git status --porcelain=v2 --ignore-submodules=none') return '';
   if (cmd.includes('symbolic-ref -q --short HEAD')) return `${BRANCH}\n`;
   if (cmd.includes('MERGE_HEAD') || cmd.includes('rebase-merge') || cmd.includes('rebase-apply') || cmd.includes('CHERRY_PICK_HEAD') || cmd.includes('REVERT_HEAD') || cmd.includes('BISECT_LOG')) return 'none\n';
   if (cmd === 'git rev-parse HEAD') {
@@ -104,7 +104,7 @@ function autoCutLocalHandler(cmd: string, fs: ReturnType<typeof makeFakeFs>, sta
     fs.writeFileSync(`${dir}/CHANGELOG.md`, '## 1.2.0\n\n- fixed a thing\n');
     return '';
   }
-  if (cmd === 'git status --porcelain=v2 --ignore-submodules=no --cutdiff') return '';
+  if (cmd === 'git status --porcelain=v2 --ignore-submodules=none --cutdiff') return '';
   if (cmd.startsWith('git add --')) return '';
   if (cmd.startsWith('git commit -m')) return '';
   if (cmd.startsWith('git push -u')) return '';
@@ -129,7 +129,7 @@ function makeAutoCutLocal(fs: ReturnType<typeof makeFakeFs>) {
   const wt: WorktreeState = { dir: null };
   const postCutDiff = "1 M. N... 100644 100644 100644 abc abc package.json\n2 R100 N... 100644 100644 100644 abc abc R100 CHANGELOG.md\tCHANGELOG.md\n2 R100 N... 100644 100644 100644 abc abc R100 .changes/archive/1.2.0/fixed-a.md\t.changes/unreleased/fixed-a.md\n";
   return (cmd: string) => {
-    if (cmd === 'git status --porcelain=v2 --ignore-submodules=no') {
+    if (cmd === 'git status --porcelain=v2 --ignore-submodules=none') {
       statusCalls += 1;
       if (statusCalls === 2) return postCutDiff;
       return '';
@@ -188,7 +188,7 @@ function makeTargetHandler(over: TargetOverrides = {}) {
       if (tamperAfterMerge) return `${'d'.repeat(40)}\n`; // something else entirely, every subsequent read
       return merged ? `${MERGE_SHA}\n` : `${TARGET_HEAD}\n`;
     }
-    if (cmd === 'git status --porcelain=v2 --ignore-submodules=no') {
+    if (cmd === 'git status --porcelain=v2 --ignore-submodules=none') {
       return postStashDirty ? '1 .M N... 100644 100644 100644 abc abc dirty-file.txt\n' : '';
     }
     if (cmd.includes('curl')) return '200';

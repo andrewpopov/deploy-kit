@@ -80,7 +80,7 @@ function makeAutoCutRuntime(over: any = {}) {
       // descendant S having landed on the branch after the merge.
       return `${rangeCounters.remoteBranchRevParse === 1 ? cfg.baseTip : cfg.movedBranchTip}\n`;
     }
-    if (cmd === 'git status --porcelain=v2 --ignore-submodules=no') {
+    if (cmd === 'git status --porcelain=v2 --ignore-submodules=none') {
       rangeCounters.status = (rangeCounters.status || 0) + 1;
       if (rangeCounters.status === 1) return cfg.statusQueue[0];
       if (rangeCounters.status === 2) return cfg.postCutDiff;
@@ -545,7 +545,7 @@ function makeLocalRuntime(over: any = {}) {
     }
     if (cmd === 'git worktree prune') return '';
     if (cmd.startsWith('git rev-parse') && cmd.includes(REMOTE) && cmd.includes(BRANCH)) return `${cfg.baseTip}\n`;
-    if (cmd === 'git status --porcelain=v2 --ignore-submodules=no') {
+    if (cmd === 'git status --porcelain=v2 --ignore-submodules=none') {
       state.statusCalls += 1;
       if (state.statusCalls === 2) return cfg.postCutDiff;
       return '';
