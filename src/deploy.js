@@ -11,6 +11,8 @@ const { log: defaultLog } = require('./log');
 const { backupIdFromOutput, backupReferenceFromId } = require('./backup-reference');
 const { resolveBranch } = require('./branch');
 const { onlineAppNames } = require('./pm2-state');
+const { runAutoCutPreflight } = require('./auto-cut-call');
+const { clearAutoCutPending } = require('./auto-cut');
 
 function defaultSleep(seconds) {
   const ms = seconds * 1000;
@@ -160,6 +162,7 @@ function deploy(config, options = {}, ctx = {}) {
   const sleep = ctx.sleep || defaultSleep;
   const runtime = ctx.runtime;
   const c = { ...ctx, log, sleep, runtime };
+
   const {
     skipDeps = false,
     skipBuild = false,
@@ -239,6 +242,12 @@ function deploy(config, options = {}, ctx = {}) {
     gate({ message, command }, config, c, { onFail: resumeDbApps });
   };
 
+  // Populated inside the try block, AFTER lock acquisition and target
+  // preflight (assertNotReleaseHost, pre-deploy checks) -- see the comment at
+  // the auto-cut call site below for why it must not run any earlier.
+  let autoCutResult = { ran: false };
+  let R = null;
+
   const release = acquireLock(config, c, { steal: stealLock });
   // DO NOT DELETE THIS AS DEAD CODE. `onSignal`'s body is in fact unreachable
   // for a signal that arrives mid-deploy -- but merely REGISTERING it is what
@@ -272,6 +281,7 @@ function deploy(config, options = {}, ctx = {}) {
     // Fail closed if the host was migrated to the release layout but this config
     // still asks for a legacy in-place deploy.
     assertNotReleaseHost(config, c);
+
     // Pre-deploy checks: user-defined gates run BEFORE anything is touched (no stash,
     // fetch, or pull yet). Each is a command on the target; a non-zero exit aborts the
     // deploy with nothing changed. Use for preconditions — free disk, DB reachable,
@@ -281,11 +291,78 @@ function deploy(config, options = {}, ctx = {}) {
       steps.push(`check:${check.name}`);
     }
 
+    // Auto-cut, on the LOCAL controller checkout, runs here -- AFTER the lock is
+    // held and after target preflight (assertNotReleaseHost, pre-deploy checks)
+    // have already rejected an un-deployable target, but still BEFORE anything
+    // below fetches/builds a candidate. Running it any earlier would mutate
+    // GitHub (cut, push, open, and merge a PR) for a deploy that target
+    // preflight was always going to reject anyway -- wasting a real release.
+    // Disabled/unconfigured (no release-kit.config.*, `autoCut: false`) returns
+    // { ran: false } and this whole legacy pipeline proceeds exactly as it
+    // always has -- deploying whatever `resolveBranch` resolved above, same as
+    // before auto-cut existed. When it DID run, `R` (the immutable merged sha)
+    // takes over from the branch tip as what this deploy actually brings the
+    // target to.
+    autoCutResult = runAutoCutPreflight(config, options, c);
+    R = autoCutResult.ran ? autoCutResult.sha : null;
+    if (R) {
+      log.info(`auto-cut: deploying release ${autoCutResult.version} (${R.slice(0, 12)}, PR #${autoCutResult.prNumber})`);
+    }
+
+    // Auto-cut produced an immutable release `R` that this deploy must bring
+    // the target to EXACTLY -- never the branch tip, and never silently follow
+    // whatever `git pull` would otherwise resolve. Assert the target is in a
+    // state where that is even meaningful before anything else runs: on the
+    // expected branch, not detached. A detached (or wrong-branch) target has
+    // no well-defined "current position" for the ancestor check below to
+    // reason about, and `git merge --ff-only` further down would either fail
+    // confusingly or (worse, on the wrong branch) fast-forward the wrong ref.
+    if (R) {
+      const headStateRes = runOnTarget('git symbolic-ref -q --short HEAD', config, { runtime, capture: true });
+      const currentBranch = (headStateRes.output || '').trim();
+      if (!headStateRes.ok || !currentBranch) {
+        throw new Error(
+          `Deploy aborted: auto-cut produced release ${R.slice(0, 12)}, but the target checkout at `
+          + `${config.projectDir} has a detached HEAD. auto-cut requires the target to be on branch `
+          + `"${branch}" so it can be fast-forwarded to the release; check out "${branch}" on the target, `
+          + 'or pass --no-auto-cut.',
+        );
+      }
+      if (currentBranch !== branch) {
+        throw new Error(
+          `Deploy aborted: auto-cut produced release ${R.slice(0, 12)}, but the target checkout at `
+          + `${config.projectDir} is on branch "${currentBranch}", expected "${branch}". Check out `
+          + `"${branch}" on the target, or pass --no-auto-cut.`,
+        );
+      }
+    }
+
     if (stash) {
       // Tracked-only stash: never sweep untracked .ssh/.cloudflared into a stash —
       // that would break the tunnel and lose the key mid-deploy.
       run('Stashing local tracked changes', `git stash push -m "deploy-kit $(date -u +%FT%TZ)" || true`, { tolerate: true });
       steps.push('stash');
+      // Only under the auto-cut (`R`) path: the stash above is TOLERATED (its
+      // `|| true` makes `res.ok` true even when the stash itself failed), so a
+      // green step is not proof the working tree actually went clean --
+      // exactly the kind of unproven "should be fine" state the rest of this
+      // block refuses to build on. Untracked-but-ignored files are fine (same
+      // as the stash's own "tracked-only" contract above); a leftover
+      // TRACKED or staged change is not.
+      if (R) {
+        const postStashStatus = runOnTarget('git status --porcelain=v2 --ignore-submodules=no', config, { runtime, capture: true });
+        const trackedOrStaged = (postStashStatus.output || '')
+          .split('\n')
+          .filter((line) => line.startsWith('1') || line.startsWith('2') || line.startsWith('u'));
+        if (!postStashStatus.ok || trackedOrStaged.length) {
+          throw new Error(
+            `Deploy aborted: auto-cut release ${R.slice(0, 12)} requires a clean target checkout after `
+            + `stashing, but \`git status\` still reports tracked/staged change(s) at ${config.projectDir}: `
+            + `${trackedOrStaged.map((l) => l.trim()).join(', ') || '(status command itself failed)'}. `
+            + 'Resolve by hand on the target, then retry.',
+          );
+        }
+      }
     }
 
     // Record the current SHA before pulling so `deploy-kit rollback` can reset to
@@ -341,9 +418,53 @@ function deploy(config, options = {}, ctx = {}) {
       }
     }
 
-    run('Fetching latest', `git fetch ${shQuote(config.remote)} --prune`);
-    run(`Pulling ${config.remote}/${branch} (--ff-only)`, `git pull --ff-only ${shQuote(config.remote)} ${shQuote(branch)}`);
-    steps.push(`pull:${branch}`);
+    if (R) {
+      // Deploy-by-SHA: bring the target to the EXACT release auto-cut merged,
+      // never the branch tip a plain `git pull` would resolve (a descendant
+      // landing on the remote between the merge and this line must never be
+      // silently followed).
+      run(`Fetching auto-cut release ${R.slice(0, 12)}`, `git fetch ${shQuote(config.remote)} ${shQuote(R)}`);
+      const haveR = runOnTarget(`git cat-file -e ${shQuote(`${R}^{commit}`)}`, config, { runtime });
+      if (!haveR.ok) {
+        throw new Error(
+          `Deploy aborted: fetched ${config.remote} for auto-cut release ${R.slice(0, 12)}, but \`git cat-file `
+          + `-e ${R}^{commit}\` still fails on the target at ${config.projectDir} -- the commit is not actually `
+          + 'present there. Refusing to merge to a commit the target does not have.',
+        );
+      }
+
+      const preMergeHeadRes = runOnTarget('git rev-parse HEAD', config, { runtime, capture: true });
+      const preMergeHead = (preMergeHeadRes.output || '').trim();
+      const ancestorRes = runOnTarget(`git merge-base --is-ancestor ${shQuote(preMergeHead)} ${shQuote(R)}`, config, { runtime });
+      if (!ancestorRes.ok) {
+        throw new Error(
+          `Deploy aborted: target HEAD (${preMergeHead.slice(0, 12)}) at ${config.projectDir} is NOT an `
+          + `ancestor of auto-cut release ${R.slice(0, 12)} -- the target may already be ahead of ${R.slice(0, 12)} `
+          + 'or have diverged onto unrelated history. Refusing to downgrade or force-merge a target that is '
+          + 'already ahead of the release; investigate by hand.',
+        );
+      }
+
+      run(`Merging to auto-cut release ${R.slice(0, 12)} (--ff-only)`, `git merge --ff-only ${shQuote(R)}`);
+      steps.push(`merge:${R}`);
+
+      // HEAD-equals-R assertion #1 of 2: right after the fast-forward, before
+      // any candidate work (install/build/migrate) begins.
+      const headAfterMergeRes = runOnTarget('git rev-parse HEAD', config, { runtime, capture: true });
+      const headAfterMerge = (headAfterMergeRes.output || '').trim();
+      if (headAfterMerge !== R) {
+        throw new Error(
+          `Deploy aborted: expected HEAD to equal auto-cut release ${R.slice(0, 12)} immediately after the `
+          + `fast-forward merge, but HEAD at ${config.projectDir} is ${headAfterMerge.slice(0, 12) || '(empty)'} `
+          + '-- something mutated HEAD mid-deploy (a hook, or a concurrent process on the target). Aborting '
+          + 'rather than proceeding on the wrong commit.',
+        );
+      }
+    } else {
+      run('Fetching latest', `git fetch ${shQuote(config.remote)} --prune`);
+      run(`Pulling ${config.remote}/${branch} (--ff-only)`, `git pull --ff-only ${shQuote(config.remote)} ${shQuote(branch)}`);
+      steps.push(`pull:${branch}`);
+    }
 
     if (stash) {
       // Drop the stash we just created (matched by our marker) so tracked-change
@@ -514,10 +635,37 @@ function deploy(config, options = {}, ctx = {}) {
     // build, with any dbBoundApps still paused. A failure here resumes paused apps
     // first (safeStep), same contract as a failed build in this window. Generic:
     // the kit runs them, the consumer supplies them (e.g. a port-conflict guard
-    // against the freshly-built candidate before it takes over the port).
+    // against the freshly-built candidate before it takes over the port). Each
+    // check is an ARBITRARY command a consumer supplies -- one could itself run
+    // `git pull`/`git checkout` and move HEAD -- so the HEAD-equals-R assertion
+    // below MUST run after every one of these, never before, or a check that
+    // moves HEAD could let a descendant of R ship silently past every guard.
     for (const check of config.preRestartChecks) {
       safeStep(`Pre-restart check: ${check.name}`, check.command);
       steps.push(`pre-restart-check:${check.name}`);
+    }
+
+    // HEAD-equals-R assertion #2 of 2: right before activation/cutover
+    // (restart), AFTER every pre-restart check has run. Install/generate/
+    // verify-pins/migrate/preRestartChecks have all run since assertion #1 --
+    // any one of them (a hook, a generator, or an arbitrary consumer-supplied
+    // check command) could in principle have moved HEAD -- so re-confirm the
+    // target is about to restart onto the exact release auto-cut produced,
+    // not something else.
+    if (R) {
+      const headBeforeActivateRes = runOnTarget('git rev-parse HEAD', config, { runtime, capture: true });
+      const headBeforeActivate = (headBeforeActivateRes.output || '').trim();
+      if (headBeforeActivate !== R) {
+        // Same recovery contract as every other gate in the paused window
+        // (safeStep): resume any dbBoundApps we paused before aborting.
+        resumeDbApps();
+        throw new Error(
+          `Deploy aborted: expected HEAD to still equal auto-cut release ${R.slice(0, 12)} immediately before `
+          + `activation, but HEAD at ${config.projectDir} is ${headBeforeActivate.slice(0, 12) || '(empty)'} `
+          + '-- something mutated HEAD mid-deploy (a hook, or a concurrent process on the target, or a '
+          + 'pre-restart check). Aborting rather than restarting onto the wrong commit.',
+        );
+      }
     }
 
     if (config.appNames.length) {
@@ -605,6 +753,21 @@ function deploy(config, options = {}, ctx = {}) {
         );
       }
       deliveryEvent = { delivered };
+    }
+
+    // The resume window (crash-recovery pointer at .deploy-kit/pending-release.json
+    // on the CONTROLLER) only closes once R has actually landed on the target --
+    // a full, healthy deployment, right here, not at merge time (auto-cut itself
+    // never clears it). Best-effort: a failure clearing the pointer must never
+    // turn an otherwise-successful deploy into a failure -- worst case a future
+    // auto-cut run logs a redundant "resuming" message for a release that
+    // already shipped.
+    if (autoCutResult.ran) {
+      try {
+        clearAutoCutPending({ projectRoot: options.projectRoot || process.cwd() }, c);
+      } catch (error) {
+        log.warning(`auto-cut: could not clear the pending-release pointer after a successful deploy: ${error.message}`);
+      }
     }
 
     log.success('Deployment completed successfully');

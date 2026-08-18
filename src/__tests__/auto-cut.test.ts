@@ -22,6 +22,11 @@ function makeFakeFs(initialFiles: Record<string, string> = {}) {
       return files.get(p) as string;
     },
     writeFileSync: (p: string, content: string) => { files.set(p, content); },
+    renameSync: (from: string, to: string) => {
+      if (!files.has(from)) { const e: any = new Error(`ENOENT: ${from}`); throw e; }
+      files.set(to, files.get(from) as string);
+      files.delete(from);
+    },
     mkdirSync: (p: string) => { dirs.add(p); },
     unlinkSync: (p: string) => { files.delete(p); },
     files,
@@ -99,7 +104,10 @@ function makeAutoCutRuntime(over: any = {}) {
     if (cmd.includes('gh pr view') && cmd.includes('--json number')) return `${cfg.prNumber}\n`;
     if (cmd.startsWith('git ls-remote ') && !cmd.includes('--symref')) return `${cfg.preMergeBaseTip}\trefs/heads/${BRANCH}\n`;
     if (cmd.includes('gh pr view') && cmd.includes('headRefOid')) return `${cfg.preMergeHead}\n`;
-    if (cmd.includes('gh pr view') && cmd.includes('--json state -q .state')) return `${cfg.prMergeReQueryState}\n`;
+    if (cmd.includes('gh pr view') && cmd.includes('state,mergeCommit')) {
+      const sha = cfg.prMergeReQueryState === 'MERGED' ? cfg.mergeSha : '';
+      return `${cfg.prMergeReQueryState}\t${sha}\n`;
+    }
     if (cmd.includes('gh pr merge')) return '';
     if (cmd.includes('gh pr close')) return '';
     if (cmd.includes('gh pr view') && cmd.includes('mergeCommit')) return `${cfg.mergeSha}\n`;
@@ -151,6 +159,7 @@ function baseCtx(over: any = {}) {
       return rk;
     }),
     log: { info: () => {}, warning: () => {}, error: () => {}, success: () => {} },
+    sleep: over.sleep || (() => {}), // never really sleep in tests -- the merge-state poll retries bounded
     ...over,
   };
 }
@@ -330,6 +339,39 @@ describe('autoCut', () => {
     expect(pending).toMatchObject({ sha: MERGE_SHA, version: '1.2.0', prNumber: 42 });
   });
 
+  it('persists pending-release.json atomically: writeFileSync to a temp path distinct from the final path, then renameSync to the final path', () => {
+    const { runtime } = makeAutoCutRuntime();
+    const ctx = baseCtx();
+    wireCutSideEffects(runtime, ctx.fs);
+    const finalPath = `/repo/${PENDING_RELEASE_PATH}`;
+    const fsCalls: Array<{ op: string; args: string[] }> = [];
+    const originalWrite = ctx.fs.writeFileSync;
+    const originalRename = ctx.fs.renameSync;
+    (ctx.fs as any).writeFileSync = (p: string, content: string) => {
+      fsCalls.push({ op: 'writeFileSync', args: [p] });
+      return originalWrite(p, content);
+    };
+    (ctx.fs as any).renameSync = (from: string, to: string) => {
+      fsCalls.push({ op: 'renameSync', args: [from, to] });
+      return originalRename(from, to);
+    };
+    autoCut(baseConfig(), { projectRoot: ROOT }, { ...ctx, runtime });
+    // Find the write/rename pair whose rename target is the pending-release
+    // final path (other writeFileSync/renameSync calls happen for the cut
+    // itself via the fake fs, e.g. package.json/CHANGELOG.md, which never
+    // go through renameSync at all).
+    const renameToFinal = fsCalls.find((c) => c.op === 'renameSync' && c.args[1] === finalPath);
+    expect(renameToFinal).toBeDefined();
+    const tmpPath = renameToFinal!.args[0];
+    expect(tmpPath).not.toBe(finalPath);
+    const writeToTmp = fsCalls.find((c) => c.op === 'writeFileSync' && c.args[0] === tmpPath);
+    expect(writeToTmp).toBeDefined();
+    // Never a direct writeFileSync straight to the final pending-release path.
+    expect(fsCalls.some((c) => c.op === 'writeFileSync' && c.args[0] === finalPath)).toBe(false);
+    const pending = JSON.parse(ctx.fs.readFileSync(finalPath));
+    expect(pending).toMatchObject({ sha: MERGE_SHA, version: '1.2.0', prNumber: 42 });
+  });
+
   it('the resume path returns the persisted SHA without cutting again', () => {
     const { runtime, calls } = makeAutoCutRuntime();
     const ctx = baseCtx({
@@ -346,6 +388,23 @@ describe('autoCut', () => {
       ran: true, resumed: true, sha: MERGE_SHA, version: '1.2.0', prNumber: 42,
     });
     // No cut, no push, no PR/merge activity — resume is a pure read.
+    expect(calls).toEqual([]);
+  });
+
+  it('throws the --branch-override message rather than resuming, even when a pending release exists', () => {
+    const { runtime, calls } = makeAutoCutRuntime();
+    const ctx = baseCtx({
+      fs: makeFakeFs({
+        '/repo/release-kit.config.js': 'module.exports = {}',
+        '/repo/package.json': JSON.stringify({ name: 'demo', version: '1.1.0', scripts: { 'release:cut': 'release-kit cut' } }),
+        [`/repo/${PENDING_RELEASE_PATH}`]: JSON.stringify({
+          sha: MERGE_SHA, version: '1.2.0', prNumber: 42, at: '2026-08-17T12:00:00Z',
+        }),
+      }),
+    });
+    expect(() => autoCut(baseConfig(), { projectRoot: ROOT, branch: 'hotfix' }, { ...ctx, runtime }))
+      .toThrow(/refusing to run with a --branch override in play/);
+    // The override guard must win BEFORE the pending release is ever read/acted on.
     expect(calls).toEqual([]);
   });
 
@@ -390,18 +449,44 @@ describe('autoCut', () => {
       ran: true, sha: MERGE_SHA, version: '1.2.0', prNumber: 42, fragmentCount: 1,
     });
     expect(calls.some((c: string) => c.includes('gh pr merge'))).toBe(true);
-    expect(calls.some((c: string) => c.includes('--json state -q .state'))).toBe(true);
+    expect(calls.some((c: string) => c.includes('state,mergeCommit'))).toBe(true);
     const pending = JSON.parse(ctx.fs.readFileSync(`/repo/${PENDING_RELEASE_PATH}`));
     expect(pending).toMatchObject({ sha: MERGE_SHA, version: '1.2.0', prNumber: 42 });
   });
 
-  it('aborts, naming the actual PR state, when `gh pr merge` fails and a re-query finds it still OPEN', () => {
+  it('aborts, naming the actual PR state, when `gh pr merge` fails and re-polling never reaches MERGED', () => {
     const { runtime, calls } = makeAutoCutRuntime({ fail: ['gh pr merge'], prMergeReQueryState: 'OPEN' });
     const ctx = baseCtx();
     wireCutSideEffects(runtime, ctx.fs);
     expect(() => autoCut(baseConfig(), { projectRoot: ROOT }, { ...ctx, runtime }))
-      .toThrow(/`gh pr merge` for PR #42 failed and a re-query found it in state "OPEN" \(not MERGED\)/);
+      .toThrow(/PR #42 did not reach state MERGED \(observed "OPEN"\) within 10 poll attempt\(s\)/);
     expect(ctx.fs.existsSync(`/repo/${PENDING_RELEASE_PATH}`)).toBe(false);
-    expect(calls.some((c: string) => c.includes('--json state -q .state'))).toBe(true);
+    expect(calls.some((c: string) => c.includes('state,mergeCommit'))).toBe(true);
+  });
+
+  it('succeeds via the queued-then-merged path: a merge exit-0 that only queued the PR is not trusted, and the second poll finding MERGED with a SHA is what is used', () => {
+    const { runtime } = makeAutoCutRuntime();
+    const ctx = baseCtx();
+    wireCutSideEffects(runtime, ctx.fs);
+    let pollCount = 0;
+    const original = runtime.execFileSync;
+    runtime.execFileSync = (file: string, args: string[], options: any) => {
+      const cmd = args[args.length - 1];
+      if (cmd.includes('gh pr view') && cmd.includes('state,mergeCommit')) {
+        pollCount += 1;
+        // First poll: merge command exited 0 but only enabled/queued auto-merge --
+        // the PR is still open. Second poll: it has actually landed.
+        if (pollCount === 1) return 'OPEN\t\n';
+        return `MERGED\t${MERGE_SHA}\n`;
+      }
+      return original(file, args, options);
+    };
+    const result = autoCut(baseConfig(), { projectRoot: ROOT }, { ...ctx, runtime });
+    expect(result).toEqual({
+      ran: true, sha: MERGE_SHA, version: '1.2.0', prNumber: 42, fragmentCount: 1,
+    });
+    expect(pollCount).toBe(2);
+    const pending = JSON.parse(ctx.fs.readFileSync(`/repo/${PENDING_RELEASE_PATH}`));
+    expect(pending).toMatchObject({ sha: MERGE_SHA, version: '1.2.0', prNumber: 42 });
   });
 });

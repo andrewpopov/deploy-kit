@@ -17,7 +17,7 @@ const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
   '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
-  '--dir', '--json', '--local', '--branch',
+  '--dir', '--json', '--local', '--branch', '--no-auto-cut',
 ];
 
 // Flags that take a following positional value. Kept in sync with the arity
@@ -41,7 +41,7 @@ const COMMAND_FLAGS = {
   'run-host-operations': ['--action', '--api-url-env', '--api-key-env'],
   'run-cairn-operations': [],
   'verify-pins': ['--dir', '--json'],
-  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch'],
+  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut'],
   rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock'],
   monitor: ['--steal-lock', '--no-lock', '--local'],
   status: [],
@@ -111,6 +111,7 @@ function parseOptions(args) {
     else if (a === '--dry-run') options.dryRun = true;
     else if (a === '--steal-lock') options.stealLock = true;
     else if (a === '--no-lock') options.lock = false;
+    else if (a === '--no-auto-cut') options.autoCut = false;
     else if (a === '--webhook-env' && args[i + 1]) { options.webhookEnv = args[i + 1]; i += 1; }
     else if (a === '--service' && args[i + 1]) { options.service = args[i + 1]; i += 1; }
     else if (a === '--action' && args[i + 1]) { options.action = args[i + 1]; i += 1; }
@@ -423,7 +424,14 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   switch (command) {
     case 'deploy':
       try {
-        deploy(config, options, options.dryRun ? dryRunContext(config) : {});
+        // projectRoot anchors auto-cut's release-kit.config.* lookup to the
+        // directory the CLI actually resolved `.deploy-kit.config.json` from,
+        // not whatever `process.cwd()` happens to be inside the process --
+        // without this, auto-cut() would default to `process.cwd()` itself
+        // (see auto-cut.js), which is wrong for anything invoking the CLI
+        // programmatically (or under test) from a different working directory
+        // than `cwd`.
+        deploy(config, { ...options, projectRoot: cwd }, options.dryRun ? dryRunContext(config) : {});
         return 0;
       } catch (error) {
         log.error(error instanceof Error ? error.message : String(error));

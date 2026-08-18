@@ -32,6 +32,9 @@ const baseConfig = mergeConfig(DEFAULT_CONFIG, {
   hooks: {
     install: 'npm ci', backup: 'npm run db:backup', migrate: 'npm run db:migrate', build: 'npm run build',
   },
+  // See lock.test.ts's lockConfig comment: keep auto-cut out of tests that
+  // aren't exercising it.
+  autoCut: false,
 });
 
 // A fake execFileSync that records every command, fails any command matching

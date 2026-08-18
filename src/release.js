@@ -7,6 +7,8 @@ const { backupIdFromOutput, isSafeBackupId, backupReferenceFromId } = require('.
 const { resolveBranch } = require('./branch');
 const { buildPinCheckProgram, PIN_CHECK_COMMAND } = require('./pin-gate');
 const { parsePm2List } = require('./pm2-state');
+const { runAutoCutPreflight } = require('./auto-cut-call');
+const { clearAutoCutPending } = require('./auto-cut');
 
 // Bump when the on-host layout changes shape. The host migration writes this
 // version into .deploy-kit-layout; a release deploy refuses a host whose marker
@@ -295,6 +297,14 @@ function deployRelease(config, options = {}, ctx = {}) {
   const sleep = ctx.sleep || defaultSleep;
   const c = { ...ctx, log, sleep, runtime: ctx.runtime };
   const paths = releasePaths(config);
+
+  // Populated inside the try block below, AFTER lock acquisition and target
+  // preflight (preflight(), assertNoInterruptedDeploy(), pre-deploy checks)
+  // -- see the auto-cut call site further down for why it must not run any
+  // earlier.
+  let autoCutResult = { ran: false };
+  let R = null;
+
   const {
     skipMigrate = false, stealLock = false, skipBuild = false, skipDeps = false, stash,
     // Same precedence as the legacy pipeline: an explicitly supplied option
@@ -565,6 +575,25 @@ function deployRelease(config, options = {}, ctx = {}) {
       if (!res.ok) throw new Error(`Pre-deploy check failed: ${check.name}`);
     }
 
+    // Auto-cut, on the LOCAL controller checkout, runs here -- AFTER the lock
+    // is held and after target preflight (preflight(), assertNoInterruptedDeploy(),
+    // pre-deploy checks) have already rejected an un-deployable target, but
+    // still BEFORE the materialize phase below fetches/resolves anything.
+    // Running it any earlier (e.g. before the `--no-stash`-combination and
+    // postDeployChecks[].onFailure option validation above) would mutate
+    // GitHub (cut, push, open, and merge a PR) for a deploy that was always
+    // going to be rejected anyway -- wasting a real release. See deploy.js's
+    // matching call for the full rationale; identical here so both pipelines
+    // behave the same whether a release-layout deploy was reached directly or
+    // via deploy()'s delegation (deploy.js's own call site is skipped in that
+    // case -- see the `return require('./release').deployRelease(...)` branch
+    // above the legacy setup).
+    autoCutResult = runAutoCutPreflight(config, options, c);
+    R = autoCutResult.ran ? autoCutResult.sha : null;
+    if (R) {
+      log.info(`auto-cut: deploying release ${autoCutResult.version} (${R.slice(0, 12)}, PR #${autoCutResult.prNumber})`);
+    }
+
     const pointers = readPointers(config, paths, c);
     // A present current pointer must always be a valid release target (a corrupt
     // pointer must never be trusted, disruptive deploy or not).
@@ -595,11 +624,26 @@ function deployRelease(config, options = {}, ctx = {}) {
     // heads:heads fetch, so preferring it would resolve a STALE sha after the remote
     // advanced. Keep it only as a last-ditch fallback. `git rev-parse` echoes the arg
     // on failure, so validate the 40-hex result rather than trusting the exit code.
-    const resolveSha = (ref) => capture(paths.root, `git --git-dir=${paths.repoGit} rev-parse ${ref}`, config, c);
-    st.sha = resolveSha(`refs/heads/${shQuote(branch)}`);
-    if (!/^[0-9a-f]{40}$/.test(st.sha)) st.sha = resolveSha(`${shQuote(config.remote)}/${shQuote(branch)}`);
-    if (!/^[0-9a-f]{40}$/.test(st.sha)) {
-      throw new Error(`Could not resolve ${config.remote}/${branch} (or refs/heads/${branch}) to a SHA in ${paths.repoGit} (got "${st.sha}")`);
+    if (R) {
+      // Deploy-by-SHA: detach to and verify the EXACT release auto-cut merged,
+      // never the branch tip -- a descendant landing on the remote between the
+      // merge and this fetch must never be silently followed instead.
+      st.sha = R;
+      const haveR = runInDir(paths.root, `git --git-dir=${paths.repoGit} cat-file -e ${shQuote(`${R}^{commit}`)}`, config, c, { tolerate: true });
+      if (!haveR.ok) {
+        throw new Error(
+          `Deploy aborted: fetched ${config.remote} into ${paths.repoGit} for auto-cut release ${R.slice(0, 12)}, `
+          + `but \`git cat-file -e ${R}^{commit}\` still fails -- the commit is not actually present there. `
+          + 'Refusing to materialize a release from a commit the bare repo does not have.',
+        );
+      }
+    } else {
+      const resolveSha = (ref) => capture(paths.root, `git --git-dir=${paths.repoGit} rev-parse ${ref}`, config, c);
+      st.sha = resolveSha(`refs/heads/${shQuote(branch)}`);
+      if (!/^[0-9a-f]{40}$/.test(st.sha)) st.sha = resolveSha(`${shQuote(config.remote)}/${shQuote(branch)}`);
+      if (!/^[0-9a-f]{40}$/.test(st.sha)) {
+        throw new Error(`Could not resolve ${config.remote}/${branch} (or refs/heads/${branch}) to a SHA in ${paths.repoGit} (got "${st.sha}")`);
+      }
     }
     const ts = capture(paths.root, 'date -u +%Y%m%dT%H%M%SZ', config, c);
     const releaseId = `${st.sha.slice(0, 12)}-${ts}`;
@@ -795,6 +839,18 @@ function deployRelease(config, options = {}, ctx = {}) {
     persistState(config, paths, { phase: 'done', current: `releases/${releaseId}`, previous: st.prevTarget, sha: st.sha, backupId: st.backupId, migrated: st.migrated, ts }, c);
     prune(config, paths, releaseId, c);
     steps.push('prune');
+
+    // See deploy.js's matching call for the full rationale: the resume window
+    // only closes once R has actually landed (activated + verified here), not
+    // at merge time. Best-effort so a pointer-clear failure never turns an
+    // otherwise-successful deploy into a failure.
+    if (autoCutResult.ran) {
+      try {
+        clearAutoCutPending({ projectRoot: options.projectRoot || process.cwd() }, c);
+      } catch (error) {
+        log.warning(`auto-cut: could not clear the pending-release pointer after a successful deploy: ${error.message}`);
+      }
+    }
 
     log.success(`Deployment completed successfully (release ${releaseId})`);
     return {

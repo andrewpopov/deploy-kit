@@ -79,6 +79,9 @@ const relConfig = (over: any = {}) => mergeConfig(DEFAULT_CONFIG, {
   appNames: ['app'],
   dbBoundApps: ['app'],
   branch: 'master',
+  // Keep auto-cut out of tests that aren't exercising it -- see
+  // lock.test.ts's lockConfig comment.
+  autoCut: false,
   ecosystemFile: 'shared/ecosystem.config.cjs',
   health: { attempts: 2, delaySeconds: 0 },
   hooks: {
@@ -1074,6 +1077,7 @@ describe('legacy path refuses a release-layout host', () => {
     const legacy = mergeConfig(DEFAULT_CONFIG, {
       host: 'app@pi', projectDir: '/srv/app', appNames: ['app'], dbBoundApps: ['app'], branch: 'master',
       hooks: { install: 'npm ci', migrate: 'run-migrate', build: 'npm run build' },
+      autoCut: false,
     });
     expect(() => kit.deploy(legacy, {}, ctx(runtime))).toThrow(/Refusing to run a legacy in-place deploy/);
     expect(calls.some((cmd) => cmd.includes('git pull'))).toBe(false);

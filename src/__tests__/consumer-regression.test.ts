@@ -451,7 +451,13 @@ function run(deployFn: Function, config: any, appNames: string[]) {
   let error: any = null;
   let result: any = null;
   try {
-    result = deployFn(config, {}, ctx({ execFileSync }));
+    // Auto-cut is a new, config-gated pipeline stage (invoked at the very top of
+    // deploy()/deployRelease()) that v0.9.4's deploy() never had. This comparison
+    // is specifically about the REST of the pipeline being byte-identical, so it
+    // must not go looking for a real release-kit.config.* at this repo's own cwd
+    // (deploy-kit dogfoods release-kit for its own releases) -- covered on its
+    // own by auto-cut.test.ts.
+    result = deployFn(config, { autoCut: false }, ctx({ execFileSync }));
   } catch (e) {
     error = e instanceof Error ? e.message : String(e);
   }

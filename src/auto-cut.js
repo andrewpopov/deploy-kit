@@ -68,10 +68,21 @@ function readPendingRelease(projectRoot, fsImpl) {
   return parsed;
 }
 
+// Atomic write (temp file + rename), mirroring release-kit's announced.ts
+// `recordAnnouncedVersion` exactly: a crash or short write mid-write must
+// never leave a truncated/corrupt pending-release.json, because the whole
+// point of this file is resuming an already-published release -- a corrupt
+// file fails closed on the very read that exists to make resuming possible.
 function writePendingRelease(projectRoot, fsImpl, data) {
   const dir = path.join(projectRoot, '.deploy-kit');
   fsImpl.mkdirSync(dir, { recursive: true });
-  fsImpl.writeFileSync(path.join(projectRoot, PENDING_RELEASE_PATH), `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+  const finalPath = path.join(projectRoot, PENDING_RELEASE_PATH);
+  const tmpPath = path.join(
+    dir,
+    `.${path.basename(finalPath)}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  );
+  fsImpl.writeFileSync(tmpPath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+  fsImpl.renameSync(tmpPath, finalPath);
 }
 
 function clearPendingRelease(projectRoot, fsImpl) {
@@ -111,6 +122,40 @@ function loadRkConfig(configPath, ctx) {
 
 function isoCompactTimestamp(nowMs) {
   return new Date(nowMs).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+}
+
+function defaultSleep(seconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, seconds * 1000);
+}
+
+const MERGE_POLL_ATTEMPTS = 10;
+const MERGE_POLL_DELAY_SECONDS = 3;
+
+// `gh pr merge`'s exit code is never proof of the merge OUTCOME, in either
+// direction: success can mean auto-merge was merely enabled/queued (branch
+// protection / required checks pending) rather than actually merged, and
+// failure can mean a transient network error after the merge already landed
+// server-side. So neither exit code is trusted -- this always polls the PR's
+// actual state via `gh pr view` (bounded attempts, small delay between, same
+// retry idiom as deploy.js's waitForHealth/DB-state reads) until it observes
+// state MERGED with a non-empty mergeCommit.oid, or exhausts the bound.
+function pollForMergedState(runtime, cwd, prNumber, { sleep = defaultSleep, attempts = MERGE_POLL_ATTEMPTS, delaySeconds = MERGE_POLL_DELAY_SECONDS, log } = {}) {
+  let lastState = '(unknown)';
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const res = runLocal(runtime, cwd, `gh pr view ${shQuote(String(prNumber))} --json state,mergeCommit -q "(.state)+\\"\\t\\"+(.mergeCommit.oid // \\"\\")"`, { allowFailure: true });
+    if (res.ok) {
+      const [state, sha] = res.output.trim().split('\t');
+      lastState = state || lastState;
+      if (state === 'MERGED' && sha) {
+        return { merged: true, sha, state };
+      }
+    }
+    if (log && attempt < attempts) {
+      log.info(`auto-cut: PR #${prNumber} not yet MERGED (state "${lastState}"); retry in ${delaySeconds}s (${attempt}/${attempts})`);
+    }
+    if (attempt < attempts) sleep(delaySeconds);
+  }
+  return { merged: false, sha: null, state: lastState };
 }
 
 // ---- preflight --------------------------------------------------------------
@@ -367,6 +412,16 @@ function autoCut(config, options = {}, ctx = {}) {
     return { ran: false };
   }
 
+  // The --branch override guard must run BEFORE the resume check below: a
+  // pending release was always cut against config.branch, never a --branch
+  // override, so resuming while an override is in play would silently merge/
+  // deploy that default-branch release's SHA onto the overridden branch --
+  // exactly the prohibition this guard exists to enforce. Checked before ANY
+  // preflight or mutation too, dry-run or not.
+  if (options.branch) {
+    throw new Error('auto-cut: refusing to run with a --branch override in play; auto-cut always targets config.branch on the remote default branch');
+  }
+
   // 10. Resume -- checked before ANY preflight or mutation, dry-run or not:
   // the release may already be published, so re-running must hand back the
   // SAME R, never cut (or deploy a descendant) again.
@@ -376,10 +431,6 @@ function autoCut(config, options = {}, ctx = {}) {
     return {
       ran: true, resumed: true, sha: pending.sha, version: pending.version, prNumber: pending.prNumber,
     };
-  }
-
-  if (options.branch) {
-    throw new Error('auto-cut: refusing to run with a --branch override in play; auto-cut always targets config.branch on the remote default branch');
   }
 
   // 3. Fail closed if release-kit itself isn't resolvable -- BEFORE the
@@ -485,33 +536,24 @@ function autoCut(config, options = {}, ctx = {}) {
     );
   }
 
-  // `gh pr merge` failing (a timeout, a transient network error) is NOT
-  // evidence the merge did not happen -- it may well have succeeded
-  // server-side. Never let a failed merge COMMAND stand in for a failed
-  // merge OUTCOME: always re-query the PR's actual state before concluding
-  // either way (spec step 10).
-  const mergeRes = runLocal(runtime, rootDir, `gh pr merge ${prNumber} --squash --delete-branch`, { allowFailure: true });
-  if (!mergeRes.ok) {
-    const stateRes = runLocal(runtime, rootDir, `gh pr view ${prNumber} --json state -q .state`, { allowFailure: true });
-    const state = stateRes.output.trim();
-    if (!stateRes.ok || state !== 'MERGED') {
-      throw new Error(
-        `auto-cut: \`gh pr merge\` for PR #${prNumber} failed and a re-query found it `
-        + `${state ? `in state "${state}"` : 'in an unknown state'} (not MERGED) -- aborting rather than `
-        + 'guessing whether the merge landed',
-      );
-    }
-    // The merge command failed but the PR is actually MERGED server-side --
-    // fall through to the normal path below, which re-queries the merge SHA
-    // itself, so a flaky `gh pr merge` never blocks step 9 from running.
+  // `gh pr merge`'s exit code -- success OR failure -- is NOT evidence of the
+  // merge OUTCOME: a success can mean auto-merge was merely enabled/queued
+  // (branch protection / required checks pending), not that the PR actually
+  // merged, and a failure (timeout, transient network error) can mean it
+  // succeeded server-side anyway. Never trust the exit code either way --
+  // always poll the PR's actual state before concluding anything (spec step
+  // 10).
+  runLocal(runtime, rootDir, `gh pr merge ${prNumber} --squash --delete-branch`, { allowFailure: true });
+  const mergeState = pollForMergedState(runtime, rootDir, prNumber, { sleep: ctx.sleep || defaultSleep, log });
+  if (!mergeState.merged) {
+    throw new Error(
+      `auto-cut: PR #${prNumber} did not reach state MERGED (observed "${mergeState.state}") within `
+      + `${MERGE_POLL_ATTEMPTS} poll attempt(s) -- aborting rather than guessing whether the merge landed`,
+    );
   }
 
   // 9. Resolve and persist R BEFORE anything else can fail.
-  const mergeShaRes = runLocal(runtime, rootDir, `gh pr view ${prNumber} --json mergeCommit -q .mergeCommit.oid`);
-  const mergedSha = mergeShaRes.output.trim();
-  if (!mergedSha) {
-    throw new Error(`auto-cut: PR #${prNumber} merged but the API returned no merge commit SHA -- resolve by hand`);
-  }
+  const mergedSha = mergeState.sha;
   writePendingRelease(projectRoot, fsImpl, {
     sha: mergedSha, version: newVersion, prNumber, at: new Date(now()).toISOString(),
   });
@@ -536,8 +578,22 @@ function clearAutoCutPending(options = {}, ctx = {}) {
   clearPendingRelease(projectRoot, fsImpl);
 }
 
+// Cheap, side-effect-free "would autoCut actually run" check, shared by
+// deploy.js/release.js call sites so they can decide -- BEFORE invoking
+// autoCut() -- whether local-mode's controller-checkout-is-the-target hazard
+// applies (see deploy.js's `localModeAutoCutGuard`). Mirrors autoCut()'s own
+// skip conditions (steps 1) exactly; kept in sync by hand since both live in
+// this file.
+function wouldAutoCutRun(config, options = {}, ctx = {}) {
+  if (options.autoCut === false || config.autoCut === false) return false;
+  const fsImpl = ctx.fs || nodeFs;
+  const projectRoot = options.projectRoot || process.cwd();
+  return findReleaseKitConfigPath(projectRoot, fsImpl) != null;
+}
+
 module.exports = {
   autoCut,
   clearAutoCutPending,
+  wouldAutoCutRun,
   PENDING_RELEASE_PATH,
 };

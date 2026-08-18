@@ -51,6 +51,11 @@ function makeRealRuntime(homeDir: string) {
 const lockConfig = (over: any = {}) => mergeConfig(DEFAULT_CONFIG, {
   mode: 'local', // runs via `sh -c` directly -- no ssh, no projectDir `cd`
   appNames: ['pkg82-locktest'],
+  // Auto-cut is opt-in via a release-kit.config.* at the project root; these
+  // tests exercise lock/rollback plumbing, not auto-cut, and must never let
+  // deploy() go looking for a real release-kit config at this repo's own
+  // cwd (deploy-kit dogfoods release-kit for its own releases).
+  autoCut: false,
   ...over,
 });
 
@@ -371,6 +376,7 @@ describeOnPosix('lock: false still records a prev-sha (PKG-82 Blocker 2 regressi
       projectDir: '/srv/pkg82-blocker2',
       appNames: [],
       lock: false,
+      autoCut: false,
     });
 
     deploy(config, { skipDeps: true, skipBuild: true, skipMigrate: true, stash: false }, {
