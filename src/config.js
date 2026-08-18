@@ -129,6 +129,23 @@ const DEFAULT_CONFIG = {
   //     checkTimeoutSeconds: 20,
   //   }
   monitor: null,
+  // Opt-in auto-cut-a-release-before-deploying (see auto-cut.js). null/false =
+  // disabled — every existing app is unaffected until it adds a
+  // release-kit.config.{js,cjs} AND opts in here. `false` (either here or via
+  // deploy()'s `options.autoCut`) always wins over a present release-kit
+  // config, so a consumer with the tooling installed can still deploy without
+  // cutting.
+  //   autoCut: {
+  //     manifestFiles: ['package.json', 'package-lock.json'],  // allowed to
+  //                                       // advance in the post-cut diff
+  //     notePaths: ['CHANGELOG.md'],     // relative paths/dirs the cut is
+  //                                       // allowed to write the release
+  //                                       // note/index into; defaults to the
+  //                                       // release-kit config's notesDir,
+  //                                       // which does NOT cover a
+  //                                       // changelogTarget file outside it
+  //   }
+  autoCut: null,
   // Optional post-health delivery event. The command runs on the target and
   // receives structured deployment JSON on stdin; failures are reported but do
   // not turn a healthy deployment into a rollback.
@@ -203,6 +220,7 @@ const KEY_TYPES = {
   verifyPins: 'boolean',
   layout: 'object?',
   monitor: 'object?',
+  autoCut: 'object?',
   deliveryEvent: 'object?',
   hooks: 'object',
 };
@@ -327,6 +345,9 @@ const MONITOR_DISK_TYPES = { minFreeKiB: 'number?', minFreeInodes: 'number?' };
 const MONITOR_BACKUP_TYPES = { id: 'string?', stampFile: 'string', maxAgeHours: 'number?' };
 const MONITOR_RESTART_STORM_TYPES = { maxDelta: 'number?' };
 const MONITOR_ALERT_TYPES = { command: 'string', run: 'string?' };
+
+// Documented shape of the opt-in `autoCut` block.
+const AUTO_CUT_TYPES = { manifestFiles: 'array', notePaths: 'array' };
 
 function validateDeployChecks(checks, key, source) {
   const problems = [];
@@ -569,9 +590,15 @@ function validateConfig(raw, { source = 'config' } = {}) {
       problems.push(`${source}: unknown key "${key}" (valid keys: ${validKeys.join(', ')})`);
       continue;
     }
+    // `autoCut: false` is a valid escape hatch (always wins over a present
+    // release-kit config), distinct from the object shape KEY_TYPES expects.
+    if (key === 'autoCut' && raw[key] === false) continue;
     if (!typeMatches(raw[key], KEY_TYPES[key])) {
       problems.push(`${source}: "${key}" must be ${KEY_TYPES[key].replace('?', ' or null')}`);
     }
+  }
+  if (raw.autoCut != null && raw.autoCut !== false && typeof raw.autoCut === 'object' && !Array.isArray(raw.autoCut)) {
+    problems.push(...validateBlock(raw.autoCut, AUTO_CUT_TYPES, source, 'autoCut'));
   }
   if (raw.mode != null && raw.mode !== 'ssh' && raw.mode !== 'local') {
     problems.push(`${source}: "mode" must be "ssh" or "local"`);

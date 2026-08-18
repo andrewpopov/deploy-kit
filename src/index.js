@@ -13,6 +13,7 @@ const verifyPinsMod = require('./verify-pins');
 const alertDiscordMod = require('./alert-discord');
 const announceDiscordMod = require('./announce-discord');
 const hostOperationsMod = require('./host-operations');
+const autoCutMod = require('./auto-cut');
 
 // Destructure into locals so module.exports uses shorthand keys — Node's
 // cjs-module-lexer only detects named exports for identifier/shorthand forms,
@@ -37,6 +38,7 @@ const {
   formatDiscordMessage: formatReleaseDiscordMessage, announceDiscord, DEFAULT_WEBHOOK_ENV: DEFAULT_RELEASE_WEBHOOK_ENV,
 } = announceDiscordMod;
 const { DEPLOY_ACTION, runHostOperations, runCairnOperations } = hostOperationsMod;
+const { autoCut, clearAutoCutPending, PENDING_RELEASE_PATH } = autoCutMod;
 
 module.exports = {
   // config
@@ -94,4 +96,8 @@ module.exports = {
   // Cairn host operation runner (deprecated wrapper — see host-operations.js)
   DEPLOY_ACTION,
   runCairnOperations,
+  // auto-cut (cut a release via PR before deploying — see auto-cut.js)
+  autoCut,
+  clearAutoCutPending,
+  PENDING_RELEASE_PATH,
 };

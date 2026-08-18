@@ -123,6 +123,9 @@ const baseConfig = mergeConfig(DEFAULT_CONFIG, {
   dbBoundApps: ['app'],
   branch: 'master',
   hooks: { install: 'npm ci', backup: 'npm run db:backup', migrate: 'npm run db:migrate', build: 'npm run build' },
+  // Keep auto-cut out of tests that aren't exercising it -- see lock.test.ts's
+  // lockConfig comment.
+  autoCut: false,
 });
 
 const ctxWith = (runtime: any) => ({ runtime, sleep: () => {} });
@@ -789,6 +792,7 @@ describeOnPosix('PKG-82 Bug 2: SIGINT/SIGTERM mid-deploy', () => {
         appNames: ['app'],
         dbBoundApps: ['app'],
         branch: 'master',
+        autoCut: false,
         hooks: {
           install: 'npm ci', backup: 'npm run db:backup',
           migrate: 'npm run db:migrate', build: 'npm run build',
@@ -1443,6 +1447,7 @@ describe('local mode deploy end-to-end', () => {
   const localCfg = mergeConfig(DEFAULT_CONFIG, {
     mode: 'local', projectDir: '/srv/app', branch: 'main', appNames: ['app'], dbBoundApps: ['app'],
     hooks: { install: 'pnpm i', migrate: 'pnpm db:migrate', build: 'pnpm build' },
+    autoCut: false,
   });
   it('skips the stash and wraps commands in sh -c', () => {
     const localCalls: Array<[string, string[]]> = [];

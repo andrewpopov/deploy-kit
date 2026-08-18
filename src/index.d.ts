@@ -116,6 +116,17 @@ export interface MonitorConfig {
   checkTimeoutSeconds?: number;
 }
 
+export interface AutoCutConfig {
+  /** Manifest files allowed to advance in the post-cut diff. Default
+   * `['package.json', 'package-lock.json']`. */
+  manifestFiles?: string[];
+  /** Relative paths/dirs the cut is allowed to write the release note/index
+   * into. Default: the release-kit config's `notesDir` — which does NOT
+   * cover a `changelogTarget` file living outside it (e.g. `CHANGELOG.md` at
+   * the repo root); set this explicitly for that case. */
+  notePaths?: string[];
+}
+
 export interface DeployConfig {
   host: string | null;
   projectDir: string | null;
@@ -161,6 +172,12 @@ export interface DeployConfig {
   layout?: ReleaseLayout | null;
   /** Opt-in fleet monitoring + alerting (SMH-116). Absent/null = disabled. */
   monitor?: MonitorConfig | null;
+  /** Opt-in: cut a release via PR on the local controller checkout before either
+   * deploy pipeline builds a candidate (see auto-cut.js). `false` (here or via
+   * `AutoCutOptions.autoCut`) always wins over a present release-kit config.
+   * Absent/null = disabled unless a release-kit.config.{js,cjs} is present AND
+   * the caller invokes `autoCut()`. */
+  autoCut?: AutoCutConfig | false | null;
   /** Optional target command that receives the post-health deployment JSON on stdin.
    * Under the release layout, also receives the resolved `shared/` directory as
    * DEPLOY_KIT_SHARED_DIR — the one path that survives the release-dir swap, so a
@@ -595,3 +612,55 @@ export function announceDiscord(options: {
   fetchImpl?: typeof fetch;
   log: Logger;
 }): Promise<0>;
+
+/** Relative path (from the project root) of the crash-recovery pointer
+ * auto-cut writes right after a merge and clears after the caller's
+ * deployment of the resulting SHA succeeds. The consumer project should
+ * gitignore it. */
+export const PENDING_RELEASE_PATH: string;
+
+export interface AutoCutOptions {
+  /** `--dry-run`: report what WOULD be cut, zero local git mutation, zero
+   * GitHub write. Auto-cut runs BEFORE `deploy()`'s own dry-run flag is
+   * plumbed in, so callers must pass this explicitly. */
+  dryRun?: boolean;
+  /** `false` always wins over a present release-kit config (skip auto-cut
+   * entirely for this run), overriding `config.autoCut`. */
+  autoCut?: boolean;
+  /** A `--branch` override in play — always aborts; auto-cut only ever
+   * targets `config.branch` on the remote's actual default branch. */
+  branch?: string;
+  /** The local controller checkout to operate in. Default `process.cwd()`. */
+  projectRoot?: string;
+}
+
+export type AutoCutResult =
+  | { ran: false }
+  | { ran: false; dryRun: true; fragmentCount: number }
+  | { ran: false; fragmentCount: 0 }
+  | { ran: true; resumed: true; sha: string; version: string; prNumber: number }
+  | { ran: true; sha: string; version: string; prNumber: number; fragmentCount: number };
+
+/** Cut a release via PR on the local controller checkout, before either
+ * deploy pipeline builds a candidate, and return the immutable merged SHA the
+ * caller should then deploy. See AUTOCUT-SPEC.md for the full flow. */
+export function autoCut(
+  config: DeployConfig,
+  options?: AutoCutOptions,
+  ctx?: DeployContext & {
+    fs?: unknown;
+    now?: () => number;
+    /** Resolve `@andrewpopov/release-kit` from the project root. Defaults to
+     * `require.resolve`; injectable for tests. */
+    resolve?: (name: string, options: { paths: string[] }) => string;
+    /** Load a resolved module path. Defaults to `require`; injectable for tests. */
+    requireModule?: (path: string) => unknown;
+  },
+): AutoCutResult;
+
+/** Clear the crash-recovery pointer `autoCut()` wrote — call this only after
+ * the caller's deployment of the returned SHA has actually succeeded. */
+export function clearAutoCutPending(
+  options?: { projectRoot?: string },
+  ctx?: { fs?: unknown },
+): void;
