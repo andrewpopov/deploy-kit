@@ -664,3 +664,38 @@ export function clearAutoCutPending(
   options?: { projectRoot?: string },
   ctx?: { fs?: unknown },
 ): void;
+
+/** The pending-release pointer as last written by `autoCut()` — `sha`,
+ * `version`, `prNumber`, `at`, whatever else `writePendingRelease` recorded. */
+export interface PendingRelease {
+  sha: string;
+  version?: string;
+  prNumber?: number;
+  at?: string;
+  [key: string]: unknown;
+}
+
+/** Result of `clearPendingReleasePointer()`. `existed: false` is the
+ * idempotent no-op case — nothing to clear, not an error. `corrupt: true`
+ * means the file existed but its contents could not be parsed as JSON;
+ * `pending` is then absent and `readError` names why. `cleared: false` with
+ * `existed: true` means the file could not be removed (see `error`). */
+export type ClearPendingReleaseResult =
+  | { existed: false; cleared: false }
+  | { existed: true; cleared: true; corrupt: false; pending: PendingRelease; readError?: undefined }
+  | { existed: true; cleared: true; corrupt: true; pending?: undefined; readError: string }
+  | { existed: true; cleared: false; corrupt: boolean; pending?: PendingRelease; error: string };
+
+/** Underlying logic for the `deploy-kit clear-pending-release` CLI verb:
+ * report what pending-release pointer is about to be discarded (version,
+ * SHA, PR number, timestamp), then discard it. Clearing does NOT unpublish,
+ * revert, or un-merge anything — the release named by the pointer stays
+ * merged and released. It only means the next deploy stops resuming onto
+ * that SHA and instead deploys current HEAD, cutting any pending fragments.
+ * Idempotent: no pending pointer is success (`existed: false`), not an
+ * error. Reuses `clearAutoCutPending`/`PENDING_RELEASE_PATH` rather than
+ * re-deriving the path or the removal logic. */
+export function clearPendingReleasePointer(
+  options?: { projectRoot?: string },
+  ctx?: { fs?: unknown },
+): ClearPendingReleaseResult;
