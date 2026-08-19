@@ -320,6 +320,38 @@ describe('auto-cut integration (real git + real release-kit, faked gh)', () => {
     expect(fs.existsSync(path.join(projectDir, PENDING_RELEASE_PATH))).toBe(true);
   }, 30_000);
 
+  it('cuts a release with TWO unreleased fragments: both consumed, both archived, fragmentCount is 2 -- regression for the archive-dir-collapse undercount (the wholly-new archive dir collapses into one untracked porcelain row regardless of how many fragments it holds)', () => {
+    const { originDir, projectDir, slug } = makeRealRepo();
+    cleanupDirs.push(originDir, projectDir);
+    withGhShim(originDir, slug);
+
+    // A second fragment alongside the fixture's `fixed-widget.md`, so the
+    // archive dir (`.changes/archive/1.0.1/`, wholly new -- first ever cut)
+    // collapses BOTH fragments into a single untracked porcelain row.
+    fs.writeFileSync(
+      path.join(projectDir, '.changes', 'unreleased', 'fixed-gizmo.md'),
+      ['---', 'kind: fixed', 'summary: Fix the gizmo', '---', '', 'The gizmo no longer explodes.', ''].join('\n'),
+      'utf8',
+    );
+    git(projectDir, ['add', '-A']);
+    git(projectDir, ['commit', '-q', '-m', 'add second fragment']);
+    git(projectDir, ['push', 'origin', 'master']);
+
+    const result = autoCut(autoCutConfig(), { projectRoot: projectDir }, {});
+
+    expect(result.ran).toBe(true);
+    expect(result.fragmentCount).toBe(2);
+
+    // Both fragments consumed from unreleased...
+    expect(fs.existsSync(path.join(projectDir, '.changes', 'unreleased', 'fixed-widget.md'))).toBe(false);
+    expect(fs.existsSync(path.join(projectDir, '.changes', 'unreleased', 'fixed-gizmo.md'))).toBe(false);
+    // ...and both landed in the archive dir.
+    expect(fs.existsSync(path.join(projectDir, '.changes', 'archive', '1.0.1', 'fixed-widget.md'))).toBe(true);
+    expect(fs.existsSync(path.join(projectDir, '.changes', 'archive', '1.0.1', 'fixed-gizmo.md'))).toBe(true);
+
+    expect(git(projectDir, ['status', '--porcelain=v2', '--', '.', `:!${PENDING_RELEASE_PATH}`])).toBe('');
+  }, 30_000);
+
   it('a failed cut (gh pr create fails after push) leaves the repo back on the original branch, tree clean, no release/cut-* branch left', () => {
     const { originDir, projectDir, slug } = makeRealRepo();
     cleanupDirs.push(originDir, projectDir);

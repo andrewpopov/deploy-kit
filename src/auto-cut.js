@@ -326,7 +326,28 @@ function parsePorcelainV2(output) {
 // exactly the expected set: the manifest, the observed fragment paths
 // (consumed), the archived copies, and the note/index path(s). Anything else
 // aborts naming the unexpected path. Never `git add -A`.
-function validateAndStageCutDiff(runtime, cwd, { rootDir, fragments, manifestFiles, notePaths, archiveDirRel }) {
+function countFragmentFilesOnDisk(fsImpl, absDir) {
+  let count = 0;
+  let entries;
+  try {
+    entries = fsImpl.readdirSync(absDir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    const entryPath = path.join(absDir, entry.name);
+    if (entry.isDirectory()) {
+      count += countFragmentFilesOnDisk(fsImpl, entryPath);
+    } else if (entry.isFile() && entry.name.endsWith('.md')) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function validateAndStageCutDiff(runtime, cwd, {
+  rootDir, fragments, manifestFiles, notePaths, archiveDirRel, cutRootDir, fsImpl = nodeFs,
+}) {
   const statusRes = runLocal(runtime, cwd, 'git status --porcelain=v2 --ignore-submodules=none');
   const rows = parsePorcelainV2(statusRes.output);
   if (rows.length === 0) {
@@ -368,7 +389,9 @@ function validateAndStageCutDiff(runtime, cwd, { rootDir, fragments, manifestFil
     }
     if (row.status === 'rename' && fragmentRelPaths.has(row.from) && matchesArchive(p)) {
       fragmentsConsumed += 1;
-      archivedCount += 1;
+      archivedCount += p.endsWith('/')
+        ? countFragmentFilesOnDisk(fsImpl, path.join(cutRootDir, p))
+        : 1;
       toStage.push(p);
       continue;
     }
@@ -380,7 +403,9 @@ function validateAndStageCutDiff(runtime, cwd, { rootDir, fragments, manifestFil
       continue;
     }
     if (matchesArchive(p)) {
-      archivedCount += 1;
+      archivedCount += p.endsWith('/')
+        ? countFragmentFilesOnDisk(fsImpl, path.join(cutRootDir, p))
+        : 1;
       toStage.push(p);
       continue;
     }
@@ -624,7 +649,7 @@ function autoCut(config, options = {}, ctx = {}) {
         : configuredNotePaths;
       const archiveDirRel = path.relative(rootDir, rkPaths.archiveDir).split(path.sep).join('/');
       const { toStage, noteChanged } = validateAndStageCutDiff(runtime, cutCwd, {
-        rootDir, fragments, manifestFiles, notePaths, archiveDirRel,
+        rootDir, fragments, manifestFiles, notePaths, archiveDirRel, cutRootDir, fsImpl,
       });
 
       let bumpedPkg;
