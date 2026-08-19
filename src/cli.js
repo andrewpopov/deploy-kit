@@ -12,6 +12,7 @@ const { alertDiscord, DEFAULT_WEBHOOK_ENV } = require('./alert-discord');
 const { announceDiscord, DEFAULT_WEBHOOK_ENV: DEFAULT_RELEASE_WEBHOOK_ENV } = require('./announce-discord');
 const { runHostOperations, runCairnOperations } = require('./host-operations');
 const { verifyPins, formatReport } = require('./verify-pins');
+const { clearPendingReleasePointer, PENDING_RELEASE_PATH } = require('./auto-cut');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
@@ -41,6 +42,7 @@ const COMMAND_FLAGS = {
   'run-host-operations': ['--action', '--api-url-env', '--api-key-env'],
   'run-cairn-operations': [],
   'verify-pins': ['--dir', '--json'],
+  'clear-pending-release': ['--dir', '--json'],
   deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut'],
   rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock'],
   monitor: ['--steal-lock', '--no-lock', '--local'],
@@ -145,6 +147,19 @@ Commands:
                                             old commit is already resolved in the
                                             lockfile, so a shipped fix can silently
                                             not land. --dir defaults to cwd.
+  clear-pending-release [--dir <path>]     discard the crash-recovery pointer
+    [--json]                               auto-cut writes to
+                                            .deploy-kit/pending-release.json, so the
+                                            next deploy stops resuming onto that SHA
+                                            and deploys current HEAD instead. Does NOT
+                                            unpublish/revert/un-merge the release the
+                                            pointer named — it stays merged and
+                                            released. Prints what it discards
+                                            (version/sha/PR/timestamp) first.
+                                            No-op (exit 0) if nothing is pending. --dir
+                                            defaults to cwd. Runs before config is
+                                            loaded, so it works even when the deploy
+                                            target/config is broken.
   alert-discord [--webhook-env NAME]       convenience alert.command: read bounded
     [--service NAME]                       monitor alert JSON on stdin, post it to
                                             a Discord webhook (env NAME, default
@@ -401,6 +416,47 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     for (const line of absentLines) log.info(line);
     if (result.ok) log.success(summaryLine); else log.error(summaryLine);
     return result.ok ? 0 : 1;
+  }
+
+  // clear-pending-release takes no positional args (only the generic
+  // `--dir`/`--json` flags), so it is safe to dispatch AFTER parseOptions.
+  // Dispatched here, before loadConfig, on purpose: an operator reaches for
+  // this verb precisely when a deploy is stuck, which is exactly the
+  // situation where .deploy-kit.config.json or the target may be broken or
+  // unreachable — clearing a local pointer must not depend on either.
+  if (command === 'clear-pending-release') {
+    const projectRoot = path.resolve(cwd, options.dir || '.');
+    let result;
+    try {
+      result = clearPendingReleasePointer({ projectRoot });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (options.json) console.log(JSON.stringify({ existed: true, cleared: false, error: message }, null, 2));
+      else log.error(`clear-pending-release: ${message}`);
+      return 1;
+    }
+    if (options.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return result.existed && !result.cleared ? 1 : 0;
+    }
+    if (!result.existed) {
+      log.success(`clear-pending-release: no pending release pointer at ${PENDING_RELEASE_PATH} — nothing to clear.`);
+      return 0;
+    }
+    if (result.corrupt) {
+      log.warning(`clear-pending-release: ${PENDING_RELEASE_PATH} exists but its contents could not be parsed (${result.readError || result.error}).`);
+    } else {
+      const { pending } = result;
+      log.info(`clear-pending-release: discarding pointer to version ${pending.version || '(unknown)'}, sha ${pending.sha}, PR #${pending.prNumber != null ? pending.prNumber : '(unknown)'}, recorded at ${pending.at || '(unknown)'}.`);
+    }
+    log.info('This does NOT unpublish, revert, or un-merge that release — it stays merged and released. '
+      + 'It only means the next deploy stops resuming onto that SHA and instead deploys current HEAD, cutting any pending fragments.');
+    if (!result.cleared) {
+      log.error(`clear-pending-release: could not remove ${PENDING_RELEASE_PATH}: ${result.error}`);
+      return 1;
+    }
+    log.success(`clear-pending-release: removed ${PENDING_RELEASE_PATH}.`);
+    return 0;
   }
 
   // --local is monitor-only (enforced above by COMMAND_FLAGS): forces mode:'local'

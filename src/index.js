@@ -38,7 +38,9 @@ const {
   formatDiscordMessage: formatReleaseDiscordMessage, announceDiscord, DEFAULT_WEBHOOK_ENV: DEFAULT_RELEASE_WEBHOOK_ENV,
 } = announceDiscordMod;
 const { DEPLOY_ACTION, runHostOperations, runCairnOperations } = hostOperationsMod;
-const { autoCut, clearAutoCutPending, PENDING_RELEASE_PATH } = autoCutMod;
+const {
+  autoCut, clearAutoCutPending, clearPendingReleasePointer, PENDING_RELEASE_PATH,
+} = autoCutMod;
 
 module.exports = {
   // config
@@ -99,5 +101,6 @@ module.exports = {
   // auto-cut (cut a release via PR before deploying — see auto-cut.js)
   autoCut,
   clearAutoCutPending,
+  clearPendingReleasePointer,
   PENDING_RELEASE_PATH,
 };

@@ -752,6 +752,54 @@ function clearAutoCutPending(options = {}, ctx = {}) {
   clearPendingRelease(projectRoot, fsImpl);
 }
 
+// Read the pending-release pointer WITHOUT throwing on a corrupt/unreadable
+// file -- distinct from readPendingRelease() above, which is used by
+// autoCut()'s own resume path and fails closed on purpose. An operator
+// running `clear-pending-release` by hand needs to see the corrupt case
+// reported, not have the whole verb blow up before it can offer to remove
+// the file.
+function inspectPendingRelease(options = {}, ctx = {}) {
+  const fsImpl = ctx.fs || nodeFs;
+  const projectRoot = options.projectRoot || process.cwd();
+  const file = path.join(projectRoot, PENDING_RELEASE_PATH);
+  if (!fsImpl.existsSync(file)) return { exists: false };
+  let raw;
+  try {
+    raw = fsImpl.readFileSync(file, 'utf8');
+  } catch (error) {
+    return { exists: true, corrupt: true, error: error.message };
+  }
+  try {
+    return { exists: true, corrupt: false, pending: JSON.parse(raw) };
+  } catch (error) {
+    return { exists: true, corrupt: true, error: error.message };
+  }
+}
+
+// The `deploy-kit clear-pending-release` verb's underlying logic: report what
+// is about to be discarded, then discard it. Idempotent -- no pending
+// pointer is success, not an error. Reuses inspectPendingRelease/
+// clearAutoCutPending rather than re-deriving the path or the removal logic,
+// so there is exactly one place that knows where PENDING_RELEASE_PATH lives.
+function clearPendingReleasePointer(options = {}, ctx = {}) {
+  const fsImpl = ctx.fs || nodeFs;
+  const projectRoot = options.projectRoot || process.cwd();
+  const info = inspectPendingRelease({ projectRoot }, { fs: fsImpl });
+  if (!info.exists) {
+    return { existed: false, cleared: false };
+  }
+  try {
+    clearAutoCutPending({ projectRoot }, { fs: fsImpl });
+  } catch (error) {
+    return {
+      existed: true, cleared: false, corrupt: !!info.corrupt, pending: info.pending, error: error.message,
+    };
+  }
+  return {
+    existed: true, cleared: true, corrupt: !!info.corrupt, pending: info.pending, readError: info.error,
+  };
+}
+
 // Cheap, side-effect-free "would autoCut actually run" check, shared by
 // deploy.js/release.js call sites so they can decide -- BEFORE invoking
 // autoCut() -- whether local-mode's controller-checkout-is-the-target hazard
@@ -768,6 +816,7 @@ function wouldAutoCutRun(config, options = {}, ctx = {}) {
 module.exports = {
   autoCut,
   clearAutoCutPending,
+  clearPendingReleasePointer,
   wouldAutoCutRun,
   PENDING_RELEASE_PATH,
 };
