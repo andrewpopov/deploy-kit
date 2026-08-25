@@ -137,11 +137,36 @@ function waitForHealth(config, ctx) {
   return true;
 }
 
+// Poll the running-SHA probe until the app reports the deployed SHA, or attempts
+// run out — the SAME attempts/delay policy waitForHealth uses (no separate
+// contract: the probe is health-adjacent, usually the same endpoint). A restart
+// is not instantaneous: right after `pm2 startOrRestart` the probe can briefly
+// answer with the PREVIOUS release's SHA (the old worker still holding the port
+// while PM2's scheduler respawns, or the app still serving startup state), so a
+// single sample raced exactly the transition it existed to observe and
+// false-negatived good deploys into rollbacks. Bounded and fail-closed: on
+// exhaustion `ok` is false and `running` is the LAST observed value (possibly
+// '' when the probe itself failed), so the caller's diagnostic names what the
+// app finally reported rather than just "mismatch".
+function waitForRunningSha(config, paths, sha, ctx) {
+  const { attempts, delaySeconds } = config.health;
+  const expected = sha.slice(0, 12);
+  let running = '';
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    running = capture(paths.root, config.layout.runningShaCommand, config, ctx);
+    if (running && running.slice(0, 12) === expected) return { ok: true, running };
+    if (attempt < attempts) ctx.sleep(delaySeconds);
+  }
+  return { ok: false, running };
+}
+
 // Full activation verification (Codex's five conditions). A deploy "succeeds" only
 // when ALL hold, so an old process answering 200 can't mask a failed flip.
 //   1. health endpoint(s) return 200
 //   2. every managed PID's /proc/<pid>/cwd resolves to the new release
-//   3. the running app reports the deployed SHA (if runningShaCommand is set)
+//   3. the running app reports the deployed SHA (if runningShaCommand is set —
+//      retried across the health window, but still only ever satisfied by
+//      actually observing the expected SHA)
 //   4. PM2 reports every app online
 //   5. restart counts stay flat across the settling window
 // Returns { ok, reason }.
@@ -172,9 +197,13 @@ function verifyActivation(config, paths, sha, releaseDir, ctx) {
   // SHA assertion only applies to a forward deploy (a known target SHA). Recovery
   // and rollback verify the PREVIOUS release with sha=null and skip this check.
   if (config.layout.runningShaCommand && sha) {
-    const running = capture(paths.root, config.layout.runningShaCommand, config, ctx);
-    if (!running || sha.slice(0, 12) !== running.slice(0, 12)) {
-      return { ok: false, reason: `running app reports SHA ${running || '<none>'}, expected ${sha.slice(0, 12)}` };
+    const { ok, running } = waitForRunningSha(config, paths, sha, ctx);
+    if (!ok) {
+      return {
+        ok: false,
+        reason: `running app reports SHA ${running || '<none>'}, expected ${sha.slice(0, 12)} after `
+          + `${config.health.attempts} attempt${config.health.attempts === 1 ? '' : 's'}`,
+      };
     }
   }
 

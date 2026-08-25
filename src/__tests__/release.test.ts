@@ -333,6 +333,112 @@ describe('release deploy — happy path', () => {
   });
 });
 
+// CAIRN-394: the running-SHA probe used to be sampled exactly ONCE after health
+// came up. A restart is not instantaneous — right after `pm2 startOrRestart` the
+// probe can briefly answer with the PREVIOUS release's SHA (the old worker still
+// holding the port while PM2's scheduler respawns, or the app still serving
+// startup state) — so the one-shot sample raced exactly the transition it
+// existed to observe and rolled good deploys back. The probe is now retried
+// under the SAME health attempts/delay policy, failing closed only when the
+// window is exhausted.
+describe('release deploy — running-SHA verification retries across a transient restart', () => {
+  const OLD_SHA = 'deadbeefdeadbeefdeadbeefdeadbeefdead'; // the previous build's SHA
+
+  // A probe that answers with the previous build's SHA for its first `staleFor`
+  // observations (the transient startup/scheduler window), then with the
+  // deployed SHA. Records every observation so a test can prove the sequence
+  // really flapped first — otherwise a "retry succeeded" assertion is vacuous.
+  // Intercepted probe calls are also pushed onto the inner runtime's `calls` so
+  // command-sequence assertions still see them.
+  const transientShaRuntime = (staleFor: number) => {
+    const rt = makeReleaseRuntime();
+    const observations: string[] = [];
+    const runtime = {
+      execFileSync: (f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        if (cmd.includes('get-running-sha')) {
+          rt.calls.push(cmd);
+          const value = observations.length < staleFor ? OLD_SHA : SHA;
+          observations.push(value);
+          return value;
+        }
+        return (rt.runtime.execFileSync as any)(f, args);
+      },
+    };
+    return { runtime, observations, calls: rt.calls, canonical: rt.cfg.canonical };
+  };
+
+  it('a SHA that converges mid-window verifies; the old one-shot sample would have failed', () => {
+    // New behavior: retry across the window → ok.
+    const { runtime, observations, canonical } = transientShaRuntime(2);
+    const cfg = relConfig({ health: { attempts: 3, delaySeconds: 0 } });
+    const v = release.verifyActivation(cfg, release.releasePaths(cfg), SHA, canonical, ctx(runtime));
+    expect(v.ok).toBe(true);
+    // The deploy really did flap first — the retry is what saved it.
+    expect(observations).toEqual([OLD_SHA, OLD_SHA, SHA]);
+
+    // OLD behavior, demonstrated directly: the same transient sequence under a
+    // one-attempt policy (exactly what the pre-CAIRN-394 single sample saw)
+    // fails the verification.
+    const oneShot = transientShaRuntime(2);
+    const oneShotCfg = relConfig({ health: { attempts: 1, delaySeconds: 0 } });
+    const v1 = release.verifyActivation(oneShotCfg, release.releasePaths(oneShotCfg), SHA, oneShot.canonical, ctx(oneShot.runtime));
+    expect(v1.ok).toBe(false);
+    expect(oneShot.observations).toEqual([OLD_SHA]);
+  });
+
+  it('a transient SHA flap no longer rolls a good deploy back (full pipeline)', () => {
+    const { runtime, observations, calls } = transientShaRuntime(1);
+    const result = release.deployRelease(relConfig({ health: { attempts: 3, delaySeconds: 0 } }), {}, ctx(runtime));
+    expect(result.healthy).toBe(true);
+    expect(result.steps).toContain('health');
+    expect(observations).toEqual([OLD_SHA, SHA]); // the flap really happened before verification passed
+    // No recovery ran: exactly the one forward restart, exactly the one forward
+    // flip of `current` (a verify failure would have flipped back and resumed
+    // the previous release, as the sibling mismatch tests assert).
+    expect(calls.filter((cmd) => cmd.includes('pm2 startOrRestart')).length).toBe(1);
+    expect(calls.filter((cmd) => /mv -Tf .*\/current/.test(cmd)).length).toBe(1);
+  });
+
+  it('exhausting the retry window fails closed, naming the last observed SHA, the expected SHA, and the attempt count', () => {
+    const rt = makeReleaseRuntime({ runningSha: OLD_SHA }); // never converges
+    const cfg = relConfig({ health: { attempts: 3, delaySeconds: 0 } });
+    const sleeps: number[] = [];
+    const v = release.verifyActivation(cfg, release.releasePaths(cfg), SHA, rt.cfg.canonical, { runtime: rt.runtime, sleep: (s: number) => sleeps.push(s) });
+    expect(v.ok).toBe(false);
+    expect(v.reason).toContain('deadbeefdeadbeef'); // the LAST observed SHA, not a bare "mismatch"
+    expect(v.reason).toContain('expected a1b2c3d4e5f6');
+    expect(v.reason).toContain('after 3 attempts');
+    // Bounded: the probe ran exactly `attempts` times (never an unbounded loop),
+    // sleeping the health delay between attempts.
+    expect(rt.calls.filter((cmd) => cmd.includes('get-running-sha')).length).toBe(3);
+    expect(sleeps).toEqual([0, 0]);
+  });
+
+  it('a probe that fails outright on the final attempt names <none> as the last observation and still fails closed', () => {
+    // First observation: the wrong SHA; then the probe command itself fails
+    // (connection refused while the app restarts → capture() sees ''). The
+    // diagnostic must name the LAST observation, not the earlier wrong one.
+    const rt = makeReleaseRuntime({ runningSha: OLD_SHA });
+    let probeCalls = 0;
+    const runtime = {
+      execFileSync: (f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        if (cmd.includes('get-running-sha')) {
+          probeCalls += 1;
+          return probeCalls === 1 ? OLD_SHA : '';
+        }
+        return (rt.runtime.execFileSync as any)(f, args);
+      },
+    };
+    const cfg = relConfig({ health: { attempts: 3, delaySeconds: 0 } });
+    const v = release.verifyActivation(cfg, release.releasePaths(cfg), SHA, rt.cfg.canonical, ctx(runtime));
+    expect(v.ok).toBe(false);
+    expect(v.reason).toContain('reports SHA <none>');
+    expect(v.reason).toContain('after 3 attempts');
+  });
+});
+
 describe('release deploy — post-deploy failure policy', () => {
   const failingCheck = (onFailure?: string) => ({
     name: 'public-smoke', command: 'run-smoke', ...(onFailure ? { onFailure } : {}),

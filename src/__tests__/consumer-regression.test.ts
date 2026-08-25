@@ -335,7 +335,51 @@ function applyIntentionalDeltas(oldSeq: string[], config: unknown): string[] {
     "export DEPLOY_KIT_BACKUP_ID='$1'; ",
   ));
 
+  // Delta 10 (CAIRN-394, release layout only): verifyActivation used to sample
+  // layout.runningShaCommand exactly ONCE after health came up. A restart is
+  // not instantaneous — right after `pm2 startOrRestart` the probe can briefly
+  // report the PREVIOUS release's SHA (the old worker still holding the port
+  // while PM2's scheduler respawns, or the app still serving startup state) —
+  // so the one-shot sample raced exactly the transition it existed to observe
+  // and rolled good deploys back. The probe is now retried under the SAME
+  // health attempts/delay policy, still failing closed unless the expected SHA
+  // is actually observed. These fixtures' universal runtime answers every
+  // curl with '200', which never matches the expected SHA, so the new kit
+  // polls exactly health.attempts (30) consecutive times before failing —
+  // expand the old run's single verify-time occurrence to match. Anchored to
+  // the line carrying this config's own runningShaCommand (it appears exactly
+  // once in either run: only the forward verification has a sha to compare;
+  // recovery re-verifies the previous release with sha=null and skips the
+  // probe). Non-release layouts and configs without a probe are untouched.
+  const runningShaCommand = (config as { layout?: { runningShaCommand?: string } } | null)?.layout?.runningShaCommand;
+  if (isReleaseLayout && runningShaCommand) {
+    const attempts = (config as { health?: { attempts?: number } }).health?.attempts ?? 1;
+    seq = seq.flatMap((cmd) => (
+      cmd.includes(runningShaCommand) ? Array.from({ length: attempts }, () => cmd) : [cmd]
+    ));
+  }
+
   return seq;
+}
+
+// Delta 10's twin for the thrown error (CAIRN-394): the exhausted-retry
+// diagnostic now also names how many attempts ran, so an operator reading
+// "reports SHA 200" knows it was polled across the whole health window rather
+// than sampled once (a stable-wrong answer, not a startup race). Anchored to
+// the exact one-shot reason prefix/suffix v0.9.4 emitted, only for a
+// release-layout config whose probe actually produced that failure.
+function applyIntentionalErrorDelta(oldError: string | null, config: unknown): string | null {
+  const runningShaCommand = (config as { layout?: { runningShaCommand?: string } } | null)?.layout?.runningShaCommand;
+  const isReleaseLayout = !!(config as { layout?: { type?: string } } | null)?.layout
+    && (config as { layout?: { type?: string } }).layout?.type === 'releases';
+  if (!oldError || !isReleaseLayout || !runningShaCommand || !oldError.includes('running app reports SHA')) {
+    return oldError;
+  }
+  const attempts = (config as { health?: { attempts?: number } }).health?.attempts ?? 1;
+  return oldError.replace(
+    /running app reports SHA (.*), expected ([0-9a-f]{12})$/,
+    (`running app reports SHA $1, expected $2 after ${attempts} attempt${attempts === 1 ? '' : 's'}`),
+  );
 }
 
 // --- The 7 real consumer configs, embedded verbatim. ---
@@ -475,7 +519,7 @@ describe('consumer regression: v0.9.4 command sequence is byte-identical (preRes
       const newRun = run(kit.deploy, config, appNames);
 
       expect(newRun.calls).toEqual(applyIntentionalDeltas(oldRun.calls, config));
-      expect(newRun.error).toEqual(oldRun.error);
+      expect(newRun.error).toEqual(applyIntentionalErrorDelta(oldRun.error, config));
 
       // Guard against this test silently going vacuous again (the release-id
       // fixture bug fixed above, where an invalid-hex readlink/ls-1 fixture made
