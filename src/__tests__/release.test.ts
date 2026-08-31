@@ -917,10 +917,129 @@ describe('release deploy — safety hardening (Codex review fixes)', () => {
     expect(() => release.rollbackRelease(relConfig(), {}, ctx(runtime))).toThrow(/restored the original release/);
   });
 
-  it('refuses to start when a previous deploy was interrupted mid-disruptive-phase', () => {
-    const { runtime, calls } = makeReleaseRuntime({ stateContent: '{"phase":"migrated","releaseId":"a1b2c3d4e5f6-20260710T010000Z","backupId":"backup-x"}' });
-    expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow(/interrupted mid-"migrated"/);
-    expect(calls.some((cmd) => cmd.includes('worktree add'))).toBe(false);
+  it('resumes the previous release after an interruption in the stopped phase', () => {
+    const previous = 'releases/00000000aaaa-20260709T090000Z';
+    const { runtime, calls } = makeReleaseRuntime({
+      canonical: `/srv/app/${previous}`,
+      currentLink: previous,
+      stateContent: JSON.stringify({
+        phase: 'stopped',
+        releaseId: 'a1b2c3d4e5f6-20260710T010000Z',
+        prevTarget: previous,
+        migrated: false,
+      }),
+      fail: ['stop-after-recovery'],
+    });
+    const config = relConfig({
+      preDeployChecks: [{ name: 'stop-after-recovery', command: 'stop-after-recovery' }],
+    });
+
+    expect(() => release.deployRelease(config, {}, ctx(runtime))).toThrow(/Pre-deploy check failed/);
+    const resume = calls.findIndex((cmd) => cmd.includes('pm2 startOrRestart'));
+    const nextDeploy = calls.findIndex((cmd) => cmd.includes('stop-after-recovery'));
+    expect(resume).toBeGreaterThanOrEqual(0);
+    expect(resume).toBeLessThan(nextDeploy);
+    expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('"phase":"recovered"'))).toBe(true);
+  });
+
+  it('restores the journaled backup after an interruption in the migrated phase', () => {
+    const previous = 'releases/00000000aaaa-20260709T090000Z';
+    const backupId = '/var/lib/app/backups/pre-migration.db.gpg';
+    const { runtime, calls } = makeReleaseRuntime({
+      canonical: `/srv/app/${previous}`,
+      currentLink: previous,
+      stateContent: JSON.stringify({
+        phase: 'migrated',
+        releaseId: 'a1b2c3d4e5f6-20260710T010000Z',
+        prevTarget: previous,
+        backupId,
+        migrated: true,
+      }),
+      fail: ['stop-after-recovery'],
+    });
+    const config = relConfig({
+      preDeployChecks: [{ name: 'stop-after-recovery', command: 'stop-after-recovery' }],
+    });
+
+    expect(() => release.deployRelease(config, {}, ctx(runtime))).toThrow(/Pre-deploy check failed/);
+    const stop = calls.findIndex((cmd) => cmd.includes('pm2 stop app'));
+    const restore = calls.findIndex((cmd) => cmd.includes(`DEPLOY_KIT_BACKUP_ID='${backupId}'`) && cmd.includes('run-restore'));
+    const resume = calls.findIndex((cmd) => cmd.includes('pm2 startOrRestart'));
+    expect(stop).toBeLessThan(restore);
+    expect(restore).toBeLessThan(resume);
+  });
+
+  it('inspects current and flips back before restoring an interrupted flipped phase', () => {
+    const previous = 'releases/00000000aaaa-20260709T090000Z';
+    const releaseId = 'a1b2c3d4e5f6-20260710T010000Z';
+    const backupId = '/var/lib/app/backups/pre-migration.db.gpg';
+    const { runtime, calls } = makeReleaseRuntime({
+      canonical: `/srv/app/${previous}`,
+      currentLink: `releases/${releaseId}`,
+      stateContent: JSON.stringify({
+        phase: 'flipped',
+        releaseId,
+        prevTarget: previous,
+        backupId,
+        migrated: true,
+        flipped: false,
+      }),
+      fail: ['stop-after-recovery'],
+    });
+    const config = relConfig({
+      preDeployChecks: [{ name: 'stop-after-recovery', command: 'stop-after-recovery' }],
+    });
+
+    expect(() => release.deployRelease(config, {}, ctx(runtime))).toThrow(/Pre-deploy check failed/);
+    const stop = calls.findIndex((cmd) => cmd.includes('pm2 stop app'));
+    const flipBack = calls.findIndex((cmd) => cmd.includes(`ln -s ${previous} /srv/app/.dk-swap.$$.current`));
+    const restore = calls.findIndex((cmd) => cmd.includes('run-restore'));
+    const resume = calls.findIndex((cmd) => cmd.includes('pm2 startOrRestart'));
+    expect(stop).toBeLessThan(flipBack);
+    expect(flipBack).toBeLessThan(restore);
+    expect(restore).toBeLessThan(resume);
+  });
+
+  it('recovers a flipped code-only deploy without requiring or restoring a DB backup', () => {
+    const previous = 'releases/00000000aaaa-20260709T090000Z';
+    const releaseId = 'a1b2c3d4e5f6-20260710T010000Z';
+    const { runtime, calls } = makeReleaseRuntime({
+      canonical: `/srv/app/${previous}`,
+      currentLink: `releases/${releaseId}`,
+      stateContent: JSON.stringify({
+        phase: 'flipped',
+        releaseId,
+        prevTarget: previous,
+        migrated: false,
+      }),
+      fail: ['stop-after-recovery'],
+    });
+    const config = relConfig({
+      preDeployChecks: [{ name: 'stop-after-recovery', command: 'stop-after-recovery' }],
+    });
+
+    expect(() => release.deployRelease(config, {}, ctx(runtime))).toThrow(/Pre-deploy check failed/);
+    expect(calls.some((cmd) => cmd.includes(`ln -s ${previous} /srv/app/.dk-swap.$$.current`))).toBe(true);
+    expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('pm2 startOrRestart'))).toBe(true);
+  });
+
+  it('fails closed when an interrupted migrated phase has no safe backup id', () => {
+    const previous = 'releases/00000000aaaa-20260709T090000Z';
+    const { runtime, calls } = makeReleaseRuntime({
+      currentLink: previous,
+      stateContent: JSON.stringify({
+        phase: 'migrated',
+        releaseId: 'a1b2c3d4e5f6-20260710T010000Z',
+        prevTarget: previous,
+        backupId: '../../unsafe',
+        migrated: true,
+      }),
+    });
+
+    expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow(/no safe restorable backup id/);
+    expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(false);
   });
 
   it('rejects a corrupt current pointer that tries to traverse out of releases/', () => {

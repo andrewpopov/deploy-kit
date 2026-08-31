@@ -189,6 +189,14 @@ the still-active target; a migration's DB restore still runs regardless (writers
 were already confirmed stopped, so it's a safe, traffic-independent data operation)
 but nothing is resumed (unreleased).
 
+The same phase recovery runs at the start of the next `deploy` after a hard
+process, SSH, or power interruption. Before any new release work begins,
+deploy-kit validates the journaled release/backup identifiers and the live
+`current` pointer, then resumes the previous release for `stopped`, restores the
+pre-migration backup for `migrated`, or derives whether an atomic flip landed and
+rolls it back for `flipped`. Any mismatch fails closed with `MANUAL RECOVERY
+REQUIRED`; post-deploy policy/rollback interruptions still require reconciliation.
+
 #### Post-deploy failure policy
 
 Every release-layout `postDeployChecks` entry must choose what happens when its
@@ -214,8 +222,10 @@ outcome. A configured `deliveryEvent.command` then receives a `failed` or
 `degraded` event with the failed check, attempted revision, active release or
 revision, recovery policy/outcome, and only the redacted backup leaf reference.
 A failed event sink is warned but cannot change the chosen recovery action; the
-journal remains the durable local record. A hard interruption during rollback is
-recognized on the next invocation and blocks a new deploy until reconciled.
+journal remains the durable local record. A hard interruption during post-deploy
+rollback is recognized on the next invocation and blocks a new deploy until
+reconciled; disruptive `stopped`, `migrated`, and `flipped` phases recover
+automatically as described above.
 
 **Flag semantics differ by layout** — the same flag can mean something
 different, or nothing, depending on which pipeline is running:
