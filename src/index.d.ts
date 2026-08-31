@@ -699,3 +699,83 @@ export function clearPendingReleasePointer(
   options?: { projectRoot?: string },
   ctx?: { fs?: unknown },
 ): ClearPendingReleaseResult;
+
+export const DEFAULT_GUARD_CONFIG: string;
+
+export interface TunnelRequiredRule {
+  path: string;
+  service: string;
+}
+
+export interface TunnelHostnameRule {
+  hostname: string;
+  service: string;
+  allowPath?: boolean;
+}
+
+export interface TunnelGuardPolicy {
+  configFile: string;
+  requiredRules: TunnelRequiredRule[];
+  requiredHostnameRules?: TunnelHostnameRule[];
+  forbiddenServiceIncludes?: string[];
+  requireAnchoredPaths?: boolean;
+  finalService?: string;
+}
+
+export type SecretPatternKind =
+  | 'basename-equals'
+  | 'basename-prefix'
+  | 'basename-suffix'
+  | 'path-segment'
+  | 'root-path';
+
+export interface SecretFilePattern {
+  name?: string;
+  kind: SecretPatternKind;
+  value: string;
+}
+
+export interface SecretGuardPolicy {
+  patterns: SecretFilePattern[];
+}
+
+export interface GuardConfig {
+  tunnel?: TunnelGuardPolicy;
+  secrets?: SecretGuardPolicy;
+}
+
+export interface GuardViolation {
+  file: string;
+  pattern: string;
+  reason: string;
+}
+
+export interface TunnelGuardResult {
+  ok: boolean;
+  errors: string[];
+  configPath: string;
+  checkedRules?: number;
+}
+
+export interface SecretGuardResult {
+  ok: boolean;
+  errors: string[];
+  violations: GuardViolation[];
+  checkedPatterns?: number;
+}
+
+export function loadGuardConfig(options: {
+  projectRoot: string;
+  configPath?: string;
+}): { config: GuardConfig; configPath: string };
+
+export function matchesEveryPath(rule: { path?: unknown }): boolean;
+export function verifyTunnelConfig(options: {
+  projectRoot: string;
+  policy: TunnelGuardPolicy;
+}): TunnelGuardResult;
+export function patternMatches(file: string, pattern: SecretFilePattern): boolean;
+export function verifyNoSecrets(options: {
+  projectRoot: string;
+  policy: SecretGuardPolicy;
+}): SecretGuardResult;

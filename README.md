@@ -379,6 +379,60 @@ Run it wherever you want the guarantee — a `verify` script, or as a
 ]
 ```
 
+### Repository guards (`verify-tunnel-config`, `verify-no-secrets`)
+
+These standalone commands let each application keep its own policy in a
+checked-in `deploy-kit.guards.json` while deploy-kit owns the verification
+mechanics. Neither command reads `.deploy-kit.config.json`.
+
+```json
+{
+  "tunnel": {
+    "configFile": "cloudflared-config.yml",
+    "requiredRules": [
+      { "path": "^/api(/.*)?$", "service": "http://127.0.0.1:3002" },
+      { "path": "^/health$", "service": "http://127.0.0.1:3002" }
+    ],
+    "requiredHostnameRules": [
+      {
+        "hostname": "ha.example.com",
+        "service": "http://127.0.0.1:8124",
+        "allowPath": false
+      }
+    ],
+    "forbiddenServiceIncludes": [":8123"],
+    "requireAnchoredPaths": true,
+    "finalService": "http_status:404"
+  },
+  "secrets": {
+    "patterns": [
+      { "name": ".env", "kind": "basename-equals", "value": ".env" },
+      { "name": ".env.bak*", "kind": "basename-prefix", "value": ".env.bak" },
+      { "name": "*.pem", "kind": "basename-suffix", "value": ".pem" },
+      { "name": ".gnupg/", "kind": "path-segment", "value": ".gnupg" },
+      { "name": "backups/", "kind": "root-path", "value": "backups" }
+    ]
+  }
+}
+```
+
+`verify-tunnel-config` checks that required paths exist, route to their exact
+service, and appear before the first catch-all; it also checks anchored path
+regexes, required full-host routes, forbidden direct origins, and the final
+fallback when configured. `verify-no-secrets` checks both tracked paths and
+untracked, unignored paths that `git add -A` could stage. It is deliberately a
+filename-policy guard, not a content secret scanner.
+
+```bash
+npx deploy-kit verify-tunnel-config
+npx deploy-kit verify-no-secrets
+```
+
+Use `--dir PATH`, `--guard-config PATH`, or `--json` when a repository needs a
+non-default root/config path or machine-readable output. Supported secret
+pattern kinds are `basename-equals`, `basename-prefix`, `basename-suffix`,
+`path-segment`, and `root-path`.
+
 ### Monitoring (`deploy-kit monitor`)
 
 Add a `monitor` block to turn on cron-driven ops monitoring + alerting. It runs the
@@ -524,6 +578,8 @@ npx deploy-kit clear-pending-release  # discard a stuck auto-cut pending-release
 | `init` | — | Write a `.deploy-kit.config.json` skeleton (never overwrites) + print the scripts block. |
 | `port-guard <port> <pm2-process-name>` | — | Exit 0 if `<port>` is free or held only by `<pm2-process-name>`'s pm2 process tree; exit 1 (naming the PID) if a foreign process holds it, or if neither `lsof` nor `ss` is available (fails closed). Meant to run ON the target as a `preRestartChecks` command — see below. |
 | `verify-pins` | `--dir PATH` `--json` | Assert that every `github:owner/repo#vX.Y.Z` dependency is actually **installed** at the version its pin claims. `npm install` does not re-resolve a `github:` tag, so bumping a pin can exit 0 while leaving the old code in `node_modules`. Exits 1 naming each mismatch and the exact re-install command that fixes it. Reports pins whose ref carries no assertable version (`#main`, a commit SHA) rather than silently skipping them. Standalone — reads no `.deploy-kit.config.json`. See below. |
+| `verify-tunnel-config` | `--dir PATH` `--guard-config PATH` `--json` | Verify Cloudflare ingress ordering, exact services, anchored path regexes, required host routes, forbidden origins, and final fallback against app-owned `deploy-kit.guards.json`. Standalone. |
+| `verify-no-secrets` | `--dir PATH` `--guard-config PATH` `--json` | Fail when an app-configured secret-shaped filename is tracked or is untracked and not ignored. Filename guard only; it does not scan contents. Standalone. |
 | `clear-pending-release` | `--dir PATH` `--json` | Discard the crash-recovery pointer at `.deploy-kit/pending-release.json` that auto-cut writes after merging a release PR. Prints the version/sha/PR/timestamp it is discarding, then removes the file. Does **not** unpublish, revert, or un-merge that release — it stays merged and released; the next deploy just stops resuming onto that SHA and deploys current HEAD instead, cutting any pending fragments. Idempotent — no pending pointer is a plain success, exit 0. Standalone, and dispatched before config is loaded — it works even when `.deploy-kit.config.json` or the deploy target is broken, which is exactly the situation an operator reaching for this is in. |
 | `alert-discord` | `--webhook-env NAME` `--service NAME` | Convenience `alert.command`: read bounded monitor alert JSON on stdin and POST a length-safe message to Discord (env var `NAME`, default `DISCORD_ALERT_WEBHOOK`). Invalid/empty input exits 0 so a poison batch cannot retry forever; an unset webhook or failed POST remains non-zero. Opt-in — the monitor stays policy-free. |
 | `announce-discord` | `--webhook-env NAME` `--service NAME` | Convenience `deliveryEvent.command`: read the post-deploy delivery event on stdin, POST a release announcement to a Discord webhook (env var `NAME`, default `DISCORD_RELEASE_WEBHOOK`). Always exits 0 — an unset env var, malformed stdin, or a failed/timed-out POST is a clear stderr warning, never a failure, since a broken announcement must never fail an already-succeeded deploy. Opt-in — deploy/release stay policy-free. |
