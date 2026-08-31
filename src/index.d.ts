@@ -771,6 +771,14 @@ export function loadGuardConfig(options: {
 }): { config: GuardConfig; configPath: string };
 
 export function matchesEveryPath(rule: { path?: unknown }): boolean;
+/** Cloudflare Tunnel ingress hostname matching: `ruleHostname` matches
+ * `hostname` exactly (case-insensitive, trailing dot significant), or — when
+ * it is a `*.example.com` wildcard — matches any one-or-more-label subdomain
+ * of `example.com` (case-sensitive), but never the apex `example.com` itself.
+ * `ruleHostname` must be a non-empty hostname/pattern; a hostless (catch-all)
+ * ingress rule is not represented here — callers check `!rule.hostname`
+ * separately. */
+export function hostnameMatches(ruleHostname: string, hostname: string): boolean;
 export function verifyTunnelConfig(options: {
   projectRoot: string;
   policy: TunnelGuardPolicy;

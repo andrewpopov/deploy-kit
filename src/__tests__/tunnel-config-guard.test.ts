@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { verifyTunnelConfig } from '../tunnel-config-guard';
+import { hostnameMatches, verifyTunnelConfig } from '../tunnel-config-guard';
 
 const roots: string[] = [];
 
@@ -246,5 +246,127 @@ describe('verifyTunnelConfig', () => {
     expect(() => verifyTunnelConfig({ projectRoot: root, policy: badPolicy })).toThrow(
       'each tunnel.requiredHostnameRules entry must define hostname and service strings',
     );
+  });
+
+  it('fails by shadowing when a `*.example.com` catch-all precedes the exact required API route', () => {
+    const root = rootWith(`ingress:
+  - hostname: '*.example.com'
+    service: http://127.0.0.1:5173
+  - hostname: app.example.com
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:3000
+  - hostname: ha.example.com
+    service: http://127.0.0.1:8124
+  - service: http_status:404
+`);
+
+    const result = verifyTunnelConfig({ projectRoot: root, policy });
+    expect(result.ok).toBe(false);
+    expect(result.errors).toContain('^/api(/.*)?$ is listed after a rule that matches every path');
+    expect(result.errors).toContain('^/health$ is listed after a rule that matches every path');
+  });
+
+  it('does not flag an unrelated `*.other.com` catch-all ahead of the required routes', () => {
+    const root = rootWith(`ingress:
+  - hostname: '*.other.com'
+    service: http://127.0.0.1:5173
+  - hostname: app.example.com
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:3000
+  - hostname: ha.example.com
+    service: http://127.0.0.1:8124
+  - service: http_status:404
+`);
+
+    expect(verifyTunnelConfig({ projectRoot: root, policy })).toMatchObject({
+      ok: true,
+      checkedRules: 3,
+      errors: [],
+    });
+  });
+
+  it('accepts a wildcard-hosted path rule as satisfying an exact-host required route (documented support)', () => {
+    // No requiredHostnameRules here on purpose: `*.example.com` also covers
+    // ha.example.com, which would otherwise collide with the base policy's
+    // separate ha.example.com requiredHostnameRules entry below.
+    const wildcardPolicy = {
+      configFile: 'cloudflared.yml',
+      requiredRules: policy.requiredRules,
+      forbiddenServiceIncludes: policy.forbiddenServiceIncludes,
+      finalService: policy.finalService,
+    };
+    const root = rootWith(`ingress:
+  - hostname: '*.example.com'
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:3000
+  - service: http_status:404
+`);
+
+    expect(verifyTunnelConfig({ projectRoot: root, policy: wildcardPolicy })).toMatchObject({
+      ok: true,
+      checkedRules: 2,
+      errors: [],
+    });
+  });
+
+  it('fails requiredHostnameRules when an earlier global catch-all shadows the exact-host rule', () => {
+    const root = rootWith(`ingress:
+  - service: http://127.0.0.1:9000
+  - hostname: app.example.com
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:3000
+  - hostname: ha.example.com
+    service: http://127.0.0.1:8124
+  - service: http_status:404
+`);
+
+    const result = verifyTunnelConfig({ projectRoot: root, policy });
+    expect(result.ok).toBe(false);
+    expect(result.errors).toContain('ha.example.com is shadowed by an earlier rule that matches every path');
+  });
+});
+
+describe('hostnameMatches', () => {
+  it('matches an exact hostname against itself', () => {
+    expect(hostnameMatches('app.example.com', 'app.example.com')).toBe(true);
+  });
+
+  it('matches one or more subdomain labels under a wildcard', () => {
+    expect(hostnameMatches('*.example.com', 'app.example.com')).toBe(true);
+    expect(hostnameMatches('*.example.com', 'deep.app.example.com')).toBe(true);
+  });
+
+  it('does not match the apex domain against its own wildcard', () => {
+    expect(hostnameMatches('*.example.com', 'example.com')).toBe(false);
+  });
+
+  it('does not match an unrelated suffix', () => {
+    expect(hostnameMatches('*.example.com', 'evilexample.com')).toBe(false);
+    expect(hostnameMatches('*.example.com', 'app.other.com')).toBe(false);
+  });
+
+  it('matches an exact hostname case-insensitively', () => {
+    expect(hostnameMatches('APP.EXAMPLE.COM', 'app.example.com')).toBe(true);
+  });
+
+  it('does not normalize a trailing dot', () => {
+    expect(hostnameMatches('APP.EXAMPLE.COM.', 'app.example.com')).toBe(false);
+  });
+
+  it('matches wildcard prefix and suffix case-sensitively', () => {
+    expect(hostnameMatches('*.Example.com', 'deep.example.com')).toBe(false);
+    expect(hostnameMatches('*.example.com', 'deep.example.com')).toBe(true);
   });
 });

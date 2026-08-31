@@ -45,7 +45,7 @@ const {
   autoCut, clearAutoCutPending, clearPendingReleasePointer, PENDING_RELEASE_PATH,
 } = autoCutMod;
 const { DEFAULT_GUARD_CONFIG, loadGuardConfig } = guardConfigMod;
-const { matchesEveryPath, verifyTunnelConfig } = tunnelConfigGuardMod;
+const { matchesEveryPath, hostnameMatches, verifyTunnelConfig } = tunnelConfigGuardMod;
 const { patternMatches, verifyNoSecrets } = secretFileGuardMod;
 
 module.exports = {
@@ -113,6 +113,7 @@ module.exports = {
   DEFAULT_GUARD_CONFIG,
   loadGuardConfig,
   matchesEveryPath,
+  hostnameMatches,
   verifyTunnelConfig,
   patternMatches,
   verifyNoSecrets,

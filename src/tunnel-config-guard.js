@@ -10,6 +10,43 @@ function matchesEveryPath(rule) {
   return !rule.path || MATCH_ALL_PATHS.has(String(rule.path));
 }
 
+// Cloudflare Tunnel ingress hostnames are DNS-like: an exact hostname matches
+// only itself, and a `*.example.com` wildcard matches one OR MORE subdomain
+// labels ending in `.example.com` (app.example.com, deep.app.example.com) but
+// never the apex `example.com` itself — verified against cloudflared 2026.6.1.
+// Exact matching is case-insensitive, but wildcard prefix/suffix matching is
+// case-SENSITIVE (`*.Example.com` does not match `deep.example.com`), and a
+// trailing dot is never normalized away (`app.example.com.` does not match a
+// request for `app.example.com`) — cloudflared does neither. `ruleHostname`
+// must be a non-empty hostname/pattern; a hostless (catch-all) rule is
+// handled separately by `ruleAppliesToHostname`.
+function hostnameMatches(ruleHostname, hostname) {
+  const rule = String(ruleHostname).trim();
+  const host = String(hostname).trim();
+  if (rule.startsWith('*.')) {
+    const suffix = rule.slice(2);
+    return host !== suffix && host.endsWith(`.${suffix}`);
+  }
+  return rule.toLowerCase() === host.toLowerCase();
+}
+
+// A rule with no hostname is cloudflared's global catch-all — it receives
+// every host's traffic regardless of what it names. A rule WITH a hostname
+// only applies to hosts its pattern (exact or wildcard) actually matches.
+function ruleAppliesToHostname(ruleHostname, hostname) {
+  return !ruleHostname || hostnameMatches(ruleHostname, hostname);
+}
+
+// The earliest ingress rule that would intercept EVERY path for `hostname` —
+// a global catch-all (no hostname), or an exact/wildcard-hosted rule scoped
+// to this hostname with no path restriction of its own. Anything required for
+// `hostname` listed after this index is unreachable.
+function findShadowingCatchAllIndex(ingress, hostname) {
+  return ingress.findIndex(
+    (rule) => matchesEveryPath(rule) && ruleAppliesToHostname(rule.hostname, hostname),
+  );
+}
+
 function validateTunnelPolicy(policy) {
   if (!policy || typeof policy !== 'object' || Array.isArray(policy)) {
     throw new Error('Guard config must define a `tunnel` object');
@@ -65,8 +102,12 @@ function verifyTunnelConfig({ projectRoot, policy }) {
   }
 
   for (const required of policy.requiredRules) {
+    // Only an explicitly-hosted rule (exact or wildcard match on this
+    // required hostname) can satisfy a host-scoped requiredRules entry — a
+    // hostless same-path rule may SHADOW it (handled below) but never
+    // satisfies it on its own.
     const index = ingress.findIndex(
-      (rule) => rule.hostname === required.hostname && rule.path === required.path,
+      (rule) => rule.hostname && hostnameMatches(rule.hostname, required.hostname) && rule.path === required.path,
     );
     if (index === -1) {
       errors.push(`no ingress rule for required hostname ${required.hostname} path ${required.path}`);
@@ -80,12 +121,11 @@ function verifyTunnelConfig({ projectRoot, policy }) {
     }
     // A pathless (catch-all) rule only shadows this required path if it would
     // actually receive the request first: either it has no hostname of its
-    // own (a global fallback, matching every host) or its hostname is this
-    // required rule's hostname. A catch-all scoped to a DIFFERENT host never
-    // sees this required path's traffic and must not be flagged.
-    const shadowingCatchAllIndex = ingress.findIndex(
-      (rule) => matchesEveryPath(rule) && (!rule.hostname || rule.hostname === required.hostname),
-    );
+    // own (a global fallback, matching every host) or its hostname matches
+    // this required rule's hostname (exact or wildcard). A catch-all scoped
+    // to an unrelated host never sees this required path's traffic and must
+    // not be flagged.
+    const shadowingCatchAllIndex = findShadowingCatchAllIndex(ingress, required.hostname);
     if (shadowingCatchAllIndex !== -1 && index > shadowingCatchAllIndex) {
       errors.push(`${required.path} is listed after a rule that matches every path`);
     }
@@ -100,15 +140,30 @@ function verifyTunnelConfig({ projectRoot, policy }) {
     ) {
       throw new Error('each tunnel.requiredHostnameRules entry must define hostname and service strings');
     }
-    const matches = ingress.filter((rule) => rule.hostname === required.hostname);
+    // Explicitly-hosted rules (exact or wildcard) that actually apply to this
+    // hostname — a hostless global catch-all is never itself "the" rule for a
+    // requiredHostnameRules entry, but it can still shadow one (checked below).
+    const matches = ingress.filter((rule) => rule.hostname && hostnameMatches(rule.hostname, required.hostname));
     if (matches.length !== 1) {
       errors.push(`${required.hostname} must have exactly one ingress rule`);
       continue;
     }
-    if (matches[0].service !== required.service) {
-      errors.push(`${required.hostname} must route to ${required.service}, found: ${matches[0].service}`);
+    const matched = matches[0];
+    const matchedIndex = ingress.indexOf(matched);
+    // An earlier rule that matches every path for this hostname (a global
+    // catch-all, or another wildcard/exact rule scoped to it with no path of
+    // its own) intercepts the host's traffic before `matched` ever sees it —
+    // so `matched`'s service/full-origin checks below would otherwise pass
+    // against a rule cloudflared never actually routes to.
+    const shadowingCatchAllIndex = findShadowingCatchAllIndex(ingress, required.hostname);
+    if (shadowingCatchAllIndex !== -1 && shadowingCatchAllIndex < matchedIndex) {
+      errors.push(`${required.hostname} is shadowed by an earlier rule that matches every path`);
+      continue;
     }
-    if (required.allowPath === false && matches[0].path) {
+    if (matched.service !== required.service) {
+      errors.push(`${required.hostname} must route to ${required.service}, found: ${matched.service}`);
+    }
+    if (required.allowPath === false && matched.path) {
       errors.push(`${required.hostname} must route the full origin without a path restriction`);
     }
   }
@@ -147,4 +202,4 @@ function verifyTunnelConfig({ projectRoot, policy }) {
   };
 }
 
-module.exports = { MATCH_ALL_PATHS, matchesEveryPath, verifyTunnelConfig };
+module.exports = { MATCH_ALL_PATHS, matchesEveryPath, hostnameMatches, verifyTunnelConfig };

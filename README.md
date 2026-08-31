@@ -421,11 +421,19 @@ exists, routes to its exact service, and appears before the first catch-all
 that could shadow it — a pathless rule only shadows a required path when the
 pathless rule itself has no hostname (a global fallback) or its hostname
 matches the required rule's; a same-path catch-all scoped to a *different*
-host never shadows it. It also checks anchored path regexes, required
-full-host routes, forbidden direct origins, and the final fallback when
-configured. `verify-no-secrets` checks both tracked paths and
-untracked, unignored paths that `git add -A` could stage. It is deliberately a
-filename-policy guard, not a content secret scanner.
+host never shadows it. Hostname matching mirrors cloudflared's own ingress
+rules: an exact hostname matches only itself, and a `*.example.com` wildcard
+matches any subdomain of `example.com` (one or more labels deep) but never
+the apex `example.com` — so a wildcard rule can both shadow an exact-host
+required route listed after it, and satisfy one listed before it. The same
+matching backs `requiredHostnameRules`, which also treats an earlier
+catch-all (global or wildcard) that would receive the hostname's traffic
+first as shadowing it rather than silently checking a rule that can never be
+reached. It also checks anchored path regexes, required full-host routes,
+forbidden direct origins, and the final fallback when configured.
+`verify-no-secrets` checks both tracked paths and untracked, unignored paths
+that `git add -A` could stage. It is deliberately a filename-policy guard,
+not a content secret scanner.
 
 ```bash
 npx deploy-kit verify-tunnel-config

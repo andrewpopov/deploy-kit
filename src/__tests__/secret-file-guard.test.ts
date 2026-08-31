@@ -165,6 +165,7 @@ describe('verifyNoSecrets', () => {
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]).toContain('cannot inspect git working tree');
     expect(result.errors[0]).toContain('produced more than');
-    expect(result.errors[0]).toContain('GIT_OUTPUT_MAX_BUFFER');
+    expect(result.errors[0]).toContain('fixed 64 MiB cap');
+    expect(result.errors[0]).toContain('--dir');
   });
 });

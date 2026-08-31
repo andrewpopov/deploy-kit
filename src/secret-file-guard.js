@@ -61,7 +61,7 @@ function runGit(execFileSync, projectRoot, args) {
     if (error && error.code === 'ENOBUFS') {
       throw new Error(
         `git ${args.join(' ')} produced more than ${GIT_OUTPUT_MAX_BUFFER} bytes of output — `
-        + 'narrow the check with --dir or raise GIT_OUTPUT_MAX_BUFFER in secret-file-guard.js',
+        + 'this is a fixed 64 MiB cap; narrow the check with --dir to scan a smaller project root',
       );
     }
     throw error;
