@@ -48,7 +48,7 @@ describe('verifyTunnelConfig', () => {
 
     expect(verifyTunnelConfig({ projectRoot: root, policy })).toMatchObject({
       ok: true,
-      checkedRules: 2,
+      checkedRules: 3,
       errors: [],
     });
   });

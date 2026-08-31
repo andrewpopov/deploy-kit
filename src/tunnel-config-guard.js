@@ -120,7 +120,7 @@ function verifyTunnelConfig({ projectRoot, policy }) {
     ok: errors.length === 0,
     errors,
     configPath,
-    checkedRules: policy.requiredRules.length,
+    checkedRules: policy.requiredRules.length + (policy.requiredHostnameRules?.length ?? 0),
   };
 }
 
