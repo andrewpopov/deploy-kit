@@ -431,6 +431,20 @@ is cloudflared's every-hostname fallback, not a DNS binding, so it can never
 by itself satisfy a host-scoped `requiredRules`/`requiredHostnameRules`
 entry — only its shadowing reach counts, exactly like a hostless rule.
 
+Beyond that catch-all check, `requiredRules` also rejects an earlier
+hostname-applicable path regex that isn't itself a catch-all but already
+matches the later required route's concrete path — because cloudflared
+stops at the first ingress rule that matches, a broader earlier pattern
+(e.g. `^/api(/.*)?$` ahead of `^/api/webhook$`) intercepts the request
+before the later, more specific rule is ever reached. This overlap check is
+deliberately conservative: it only fires when the required route's path is
+a plain anchored literal — no regex metacharacters beyond the `^…$`
+anchors — that safely reduces to one concrete request path, and the
+earlier rule's own pattern compiles as a valid regex. A required path that
+isn't reducible to a single literal (alternation, character classes,
+quantifiers) and a malformed earlier regex both back off without flagging
+anything, rather than guessing at regex equivalence.
+
 The same matching backs `requiredHostnameRules`. When more than one ingress
 declaration applies to a required hostname (e.g. an exact rule and a later
 `*.`-wildcard fallback both naming it), cloudflared stops at the first match

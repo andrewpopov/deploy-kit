@@ -180,54 +180,91 @@ describe('verifyTunnelConfig', () => {
     expect(result.errors).toContain('^/health$ is listed after a rule that matches every path');
   });
 
-  it('fails by name when an earlier same-host broader route shadows a required nested path', () => {
-    const nestedPolicy = {
-      configFile: 'cloudflared.yml',
-      requiredRules: [
-        { hostname: 'app.example.com', path: '^/api(/.*)?$', service: 'http://127.0.0.1:3000' },
-        { hostname: 'app.example.com', path: '^/api/webhook$', service: 'http://127.0.0.1:4000' },
-      ],
-    };
-    const root = rootWith(`ingress:
-  - hostname: app.example.com
-    path: ^/api(/.*)?$
-    service: http://127.0.0.1:3000
-  - hostname: app.example.com
-    path: ^/api/webhook$
+  describe('earlier hostname-applicable path-regex overlap for requiredRules', () => {
+    // Each row inserts one earlier ingress rule ahead of the required route
+    // (`^/api/webhook$` by default) and asserts whether it shadows it via
+    // findEarlierPathOverlapIndex's narrow, literal-only reasoning.
+    const overlapCases: Array<{
+      name: string;
+      earlierRule?: string;
+      requiredPath?: string;
+      expectOverlapPath: string | false;
+    }> = [
+      {
+        name: 'same-host earlier broader regex overlaps and is rejected (positive control)',
+        earlierRule: '  - hostname: app.example.com\n    path: ^/api(/.*)?$\n    service: http://127.0.0.1:3000\n',
+        expectOverlapPath: '^/api(/.*)?$',
+      },
+      {
+        name: 'same-host non-overlapping earlier route does not overlap (negative control)',
+        earlierRule: '  - hostname: app.example.com\n    path: ^/api/admin(/.*)?$\n    service: http://127.0.0.1:3000\n',
+        expectOverlapPath: false,
+      },
+      {
+        name: 'hostless earlier broader regex overlaps and is rejected',
+        earlierRule: '  - path: ^/api(/.*)?$\n    service: http://127.0.0.1:3000\n',
+        expectOverlapPath: '^/api(/.*)?$',
+      },
+      {
+        name: 'bare `*` earlier broader regex overlaps and is rejected',
+        earlierRule: "  - hostname: '*'\n    path: ^/api(/.*)?$\n    service: http://127.0.0.1:3000\n",
+        expectOverlapPath: '^/api(/.*)?$',
+      },
+      {
+        name: 'matching wildcard hostname earlier broader regex overlaps and is rejected',
+        earlierRule: "  - hostname: '*.example.com'\n    path: ^/api(/.*)?$\n    service: http://127.0.0.1:3000\n",
+        expectOverlapPath: '^/api(/.*)?$',
+      },
+      {
+        name: 'unrelated wildcard does not overlap for this hostname',
+        earlierRule: "  - hostname: '*.other.com'\n    path: ^/api(/.*)?$\n    service: http://127.0.0.1:3000\n",
+        expectOverlapPath: false,
+      },
+      {
+        name: 'different exact host does not overlap',
+        earlierRule: '  - hostname: other.example.com\n    path: ^/api(/.*)?$\n    service: http://127.0.0.1:3000\n',
+        expectOverlapPath: false,
+      },
+      {
+        name: 'malformed earlier regex does not throw and backs off',
+        earlierRule: '  - hostname: app.example.com\n    path: ^(/api$\n    service: http://127.0.0.1:3000\n',
+        expectOverlapPath: false,
+      },
+      {
+        name: 'non-literal required path backs off from overlap reasoning',
+        earlierRule: '  - hostname: app.example.com\n    path: ^/api(/.*)?$\n    service: http://127.0.0.1:3000\n',
+        requiredPath: '^/api/(webhook|hook)$',
+        expectOverlapPath: false,
+      },
+    ];
+
+    for (const testCase of overlapCases) {
+      it(`${testCase.expectOverlapPath ? 'rejects' : 'accepts'}: ${testCase.name}`, () => {
+        const requiredPath = testCase.requiredPath ?? '^/api/webhook$';
+        const nestedPolicy = {
+          configFile: 'cloudflared.yml',
+          requiredRules: [
+            { hostname: 'app.example.com', path: requiredPath, service: 'http://127.0.0.1:4000' },
+          ],
+        };
+        const root = rootWith(`ingress:
+${testCase.earlierRule ?? ''}  - hostname: app.example.com
+    path: ${requiredPath}
     service: http://127.0.0.1:4000
   - service: http_status:404
 `);
 
-    const result = verifyTunnelConfig({ projectRoot: root, policy: nestedPolicy });
-    expect(result.ok).toBe(false);
-    expect(result.errors).toContain(
-      '^/api/webhook$ is listed after an earlier rule (^/api(/.*)?$) whose path overlaps it',
-    );
-  });
-
-  it('does not flag a non-overlapping earlier same-host route ahead of a required nested path', () => {
-    const nestedPolicy = {
-      configFile: 'cloudflared.yml',
-      requiredRules: [
-        { hostname: 'app.example.com', path: '^/api/admin(/.*)?$', service: 'http://127.0.0.1:3000' },
-        { hostname: 'app.example.com', path: '^/api/webhook$', service: 'http://127.0.0.1:4000' },
-      ],
-    };
-    const root = rootWith(`ingress:
-  - hostname: app.example.com
-    path: ^/api/admin(/.*)?$
-    service: http://127.0.0.1:3000
-  - hostname: app.example.com
-    path: ^/api/webhook$
-    service: http://127.0.0.1:4000
-  - service: http_status:404
-`);
-
-    expect(verifyTunnelConfig({ projectRoot: root, policy: nestedPolicy })).toMatchObject({
-      ok: true,
-      checkedRules: 2,
-      errors: [],
-    });
+        const result = verifyTunnelConfig({ projectRoot: root, policy: nestedPolicy });
+        if (testCase.expectOverlapPath) {
+          expect(result.ok).toBe(false);
+          expect(result.errors).toContain(
+            `${requiredPath} is listed after an earlier rule (${testCase.expectOverlapPath}) whose path overlaps it`,
+          );
+        } else {
+          expect(result).toMatchObject({ ok: true, checkedRules: 1, errors: [] });
+        }
+      });
+    }
   });
 
   it('does not let a same-path rule on the WRONG host satisfy a host-scoped required rule', () => {
