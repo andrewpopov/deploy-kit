@@ -47,7 +47,7 @@ try {
   // 3. Require it as a consumer would and assert the public surface resolves.
   const smoke = `
     const t = require('${pkg.name}');
-    const expected = ['deploy', 'loadConfig', 'mergeConfig', 'runOnTarget', 'runScriptOnTarget', 'buildTargetCommand', 'startTunnel', 'makeLogger'];
+    const expected = ['deploy', 'loadConfig', 'mergeConfig', 'runOnTarget', 'runScriptOnTarget', 'buildTargetCommand', 'startTunnel', 'makeLogger', 'loadGuardConfig', 'verifyTunnelConfig', 'verifyNoSecrets'];
     const missing = expected.filter((k) => typeof t[k] !== 'function');
     if (missing.length) { throw new Error('missing exports: ' + missing.join(', ')); }
     console.log('[verify-pack] exports OK: ' + expected.join(', '));
@@ -60,7 +60,7 @@ try {
   //     even though CJS `require` sees it. Catches the ESM/CJS interop gap.
   const esmSmoke = `
     import * as ns from '${pkg.name}';
-    const named = ['deploy', 'loadConfig', 'runOnTarget', 'runScriptOnTarget', 'startTunnel'];
+    const named = ['deploy', 'loadConfig', 'runOnTarget', 'runScriptOnTarget', 'startTunnel', 'loadGuardConfig', 'verifyTunnelConfig', 'verifyNoSecrets'];
     const missing = named.filter((k) => typeof ns[k] !== 'function');
     if (missing.length) { throw new Error('missing ESM named exports: ' + missing.join(', ')); }
     console.log('[verify-pack] ESM named exports OK');

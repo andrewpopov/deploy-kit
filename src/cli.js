@@ -13,12 +13,15 @@ const { announceDiscord, DEFAULT_WEBHOOK_ENV: DEFAULT_RELEASE_WEBHOOK_ENV } = re
 const { runHostOperations, runCairnOperations } = require('./host-operations');
 const { verifyPins, formatReport } = require('./verify-pins');
 const { clearPendingReleasePointer, PENDING_RELEASE_PATH } = require('./auto-cut');
+const { DEFAULT_GUARD_CONFIG, loadGuardConfig } = require('./guard-config');
+const { verifyTunnelConfig } = require('./tunnel-config-guard');
+const { verifyNoSecrets } = require('./secret-file-guard');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
   '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
-  '--dir', '--json', '--local', '--branch', '--no-auto-cut',
+  '--dir', '--json', '--local', '--branch', '--no-auto-cut', '--guard-config',
 ];
 
 // Flags that take a following positional value. Kept in sync with the arity
@@ -28,6 +31,7 @@ const KNOWN_FLAGS = [
 // a used flag; parseOptions consumes it as --service's value).
 const VALUE_FLAGS = new Set([
   '--lines', '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env', '--dir', '--branch',
+  '--guard-config',
 ]);
 
 // The set of flags each command actually reads. KNOWN_FLAGS above is only
@@ -42,6 +46,8 @@ const COMMAND_FLAGS = {
   'run-host-operations': ['--action', '--api-url-env', '--api-key-env'],
   'run-cairn-operations': [],
   'verify-pins': ['--dir', '--json'],
+  'verify-tunnel-config': ['--dir', '--guard-config', '--json'],
+  'verify-no-secrets': ['--dir', '--guard-config', '--json'],
   'clear-pending-release': ['--dir', '--json'],
   deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut'],
   rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock'],
@@ -121,6 +127,7 @@ function parseOptions(args) {
     else if (a === '--api-key-env' && args[i + 1]) { options.apiKeyEnv = args[i + 1]; i += 1; }
     else if (a === '--dir' && args[i + 1]) { options.dir = args[i + 1]; i += 1; }
     else if (a === '--branch' && args[i + 1]) { options.branch = args[i + 1]; i += 1; }
+    else if (a === '--guard-config' && args[i + 1]) { options.guardConfig = args[i + 1]; i += 1; }
     else if (a === '--json') { options.json = true; }
     else if (a === '--local') { options.local = true; }
     else {
@@ -147,6 +154,11 @@ Commands:
                                             old commit is already resolved in the
                                             lockfile, so a shipped fix can silently
                                             not land. --dir defaults to cwd.
+  verify-tunnel-config [--dir <path>]      verify Cloudflare ingress against the
+    [--guard-config <path>] [--json]       app-owned tunnel policy in
+                                            deploy-kit.guards.json (default)
+  verify-no-secrets [--dir <path>]         fail when a configured secret-shaped
+    [--guard-config <path>] [--json]       filename is tracked or unignored
   clear-pending-release [--dir <path>]     discard the crash-recovery pointer
     [--json]                               auto-cut writes to
                                             .deploy-kit/pending-release.json, so the
@@ -416,6 +428,43 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     for (const line of absentLines) log.info(line);
     if (result.ok) log.success(summaryLine); else log.error(summaryLine);
     return result.ok ? 0 : 1;
+  }
+
+  if (command === 'verify-tunnel-config' || command === 'verify-no-secrets') {
+    const projectRoot = path.resolve(cwd, options.dir || '.');
+    let result;
+    try {
+      const { config: guardConfig } = loadGuardConfig({
+        projectRoot,
+        configPath: options.guardConfig || DEFAULT_GUARD_CONFIG,
+      });
+      result = command === 'verify-tunnel-config'
+        ? verifyTunnelConfig({ projectRoot, policy: guardConfig.tunnel })
+        : verifyNoSecrets({ projectRoot, policy: guardConfig.secrets });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (options.json) console.log(JSON.stringify({ ok: false, errors: [message] }, null, 2));
+      else log.error(`${command}: ${message}`);
+      return 1;
+    }
+    if (options.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return result.ok ? 0 : 1;
+    }
+    for (const error of result.errors ?? []) log.error(error);
+    for (const violation of result.violations ?? []) {
+      log.error(`${violation.file} (matches "${violation.pattern}", ${violation.reason})`);
+    }
+    if (result.ok) {
+      const count = command === 'verify-tunnel-config'
+        ? result.checkedRules
+        : result.checkedPatterns;
+      log.success(`${command}: ${count} configured rule(s) passed`);
+      return 0;
+    }
+    const count = (result.errors?.length ?? 0) + (result.violations?.length ?? 0);
+    log.error(`${command}: ${count} issue(s) found`);
+    return 1;
   }
 
   // clear-pending-release takes no positional args (only the generic

@@ -699,3 +699,96 @@ export function clearPendingReleasePointer(
   options?: { projectRoot?: string },
   ctx?: { fs?: unknown },
 ): ClearPendingReleaseResult;
+
+export const DEFAULT_GUARD_CONFIG: string;
+
+export interface TunnelRequiredRule {
+  hostname: string;
+  path: string;
+  service: string;
+}
+
+export interface TunnelHostnameRule {
+  hostname: string;
+  service: string;
+  allowPath?: boolean;
+}
+
+export interface TunnelGuardPolicy {
+  configFile: string;
+  requiredRules: TunnelRequiredRule[];
+  requiredHostnameRules?: TunnelHostnameRule[];
+  forbiddenServiceIncludes?: string[];
+  requireAnchoredPaths?: boolean;
+  finalService?: string;
+}
+
+export type SecretPatternKind =
+  | 'basename-equals'
+  | 'basename-prefix'
+  | 'basename-suffix'
+  | 'path-segment'
+  | 'root-path';
+
+export interface SecretFilePattern {
+  name?: string;
+  kind: SecretPatternKind;
+  value: string;
+}
+
+export interface SecretGuardPolicy {
+  patterns: SecretFilePattern[];
+}
+
+export interface GuardConfig {
+  tunnel?: TunnelGuardPolicy;
+  secrets?: SecretGuardPolicy;
+}
+
+export interface GuardViolation {
+  file: string;
+  pattern: string;
+  reason: string;
+}
+
+export interface TunnelGuardResult {
+  ok: boolean;
+  errors: string[];
+  configPath: string;
+  checkedRules?: number;
+}
+
+export interface SecretGuardResult {
+  ok: boolean;
+  errors: string[];
+  violations: GuardViolation[];
+  checkedPatterns?: number;
+}
+
+export function loadGuardConfig(options: {
+  projectRoot: string;
+  configPath?: string;
+}): { config: GuardConfig; configPath: string };
+
+export function matchesEveryPath(rule: { path?: unknown }): boolean;
+/** Cloudflare Tunnel ingress hostname matching: `ruleHostname` matches
+ * `hostname` exactly (case-insensitive, trailing dot significant), or — when
+ * it is a `*.example.com` wildcard — matches any one-or-more-label subdomain
+ * of `example.com` (case-sensitive), but never the apex `example.com` itself.
+ * `ruleHostname` must be a non-empty hostname/pattern; a hostless (catch-all)
+ * ingress rule is not represented here — callers check `!rule.hostname`
+ * separately. A bare `*` hostname always returns `false`: it is cloudflared's
+ * every-hostname wildcard, not a DNS binding, so it never counts as an
+ * explicit match — callers needing its every-host reach for shadow detection
+ * check `ruleHostname === '*'` separately, the same way they check
+ * `!rule.hostname`. */
+export function hostnameMatches(ruleHostname: string, hostname: string): boolean;
+export function verifyTunnelConfig(options: {
+  projectRoot: string;
+  policy: TunnelGuardPolicy;
+}): TunnelGuardResult;
+export function patternMatches(file: string, pattern: SecretFilePattern): boolean;
+export function verifyNoSecrets(
+  options: { projectRoot: string; policy: SecretGuardPolicy },
+  ctx?: { execFileSync?: (file: string, args: string[], options?: unknown) => unknown },
+): SecretGuardResult;

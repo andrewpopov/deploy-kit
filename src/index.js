@@ -14,6 +14,9 @@ const alertDiscordMod = require('./alert-discord');
 const announceDiscordMod = require('./announce-discord');
 const hostOperationsMod = require('./host-operations');
 const autoCutMod = require('./auto-cut');
+const guardConfigMod = require('./guard-config');
+const tunnelConfigGuardMod = require('./tunnel-config-guard');
+const secretFileGuardMod = require('./secret-file-guard');
 
 // Destructure into locals so module.exports uses shorthand keys — Node's
 // cjs-module-lexer only detects named exports for identifier/shorthand forms,
@@ -41,6 +44,9 @@ const { DEPLOY_ACTION, runHostOperations, runCairnOperations } = hostOperationsM
 const {
   autoCut, clearAutoCutPending, clearPendingReleasePointer, PENDING_RELEASE_PATH,
 } = autoCutMod;
+const { DEFAULT_GUARD_CONFIG, loadGuardConfig } = guardConfigMod;
+const { matchesEveryPath, hostnameMatches, verifyTunnelConfig } = tunnelConfigGuardMod;
+const { patternMatches, verifyNoSecrets } = secretFileGuardMod;
 
 module.exports = {
   // config
@@ -103,4 +109,12 @@ module.exports = {
   clearAutoCutPending,
   clearPendingReleasePointer,
   PENDING_RELEASE_PATH,
+  // configurable repository guards (SMH-156)
+  DEFAULT_GUARD_CONFIG,
+  loadGuardConfig,
+  matchesEveryPath,
+  hostnameMatches,
+  verifyTunnelConfig,
+  patternMatches,
+  verifyNoSecrets,
 };
