@@ -390,8 +390,8 @@ mechanics. Neither command reads `.deploy-kit.config.json`.
   "tunnel": {
     "configFile": "cloudflared-config.yml",
     "requiredRules": [
-      { "path": "^/api(/.*)?$", "service": "http://127.0.0.1:3002" },
-      { "path": "^/health$", "service": "http://127.0.0.1:3002" }
+      { "hostname": "app.example.com", "path": "^/api(/.*)?$", "service": "http://127.0.0.1:3002" },
+      { "hostname": "app.example.com", "path": "^/health$", "service": "http://127.0.0.1:3002" }
     ],
     "requiredHostnameRules": [
       {
@@ -416,10 +416,14 @@ mechanics. Neither command reads `.deploy-kit.config.json`.
 }
 ```
 
-`verify-tunnel-config` checks that required paths exist, route to their exact
-service, and appear before the first catch-all; it also checks anchored path
-regexes, required full-host routes, forbidden direct origins, and the final
-fallback when configured. `verify-no-secrets` checks both tracked paths and
+`verify-tunnel-config` checks that each required rule's `hostname`+`path`
+exists, routes to its exact service, and appears before the first catch-all
+that could shadow it — a pathless rule only shadows a required path when the
+pathless rule itself has no hostname (a global fallback) or its hostname
+matches the required rule's; a same-path catch-all scoped to a *different*
+host never shadows it. It also checks anchored path regexes, required
+full-host routes, forbidden direct origins, and the final fallback when
+configured. `verify-no-secrets` checks both tracked paths and
 untracked, unignored paths that `git add -A` could stage. It is deliberately a
 filename-policy guard, not a content secret scanner.
 

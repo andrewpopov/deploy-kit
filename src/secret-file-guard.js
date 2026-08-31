@@ -1,7 +1,8 @@
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync: nodeExecFileSync } = require('child_process');
 
 const PATTERN_KINDS = new Set([
   'basename-equals',
@@ -44,24 +45,68 @@ function patternMatches(file, pattern) {
   }
 }
 
-function gitLines(projectRoot, args) {
-  return execFileSync('git', args, { cwd: projectRoot, encoding: 'utf8' })
-    .split('\0')
-    .filter(Boolean);
+// 64 MiB — comfortably above Node's 1 MiB execFileSync default so a repo with
+// a very large tracked/untracked path list doesn't overflow, while still
+// bounded rather than unlimited.
+const GIT_OUTPUT_MAX_BUFFER = 64 * 1024 * 1024;
+
+function runGit(execFileSync, projectRoot, args) {
+  try {
+    return execFileSync('git', args, {
+      cwd: projectRoot,
+      encoding: 'utf8',
+      maxBuffer: GIT_OUTPUT_MAX_BUFFER,
+    });
+  } catch (error) {
+    if (error && error.code === 'ENOBUFS') {
+      throw new Error(
+        `git ${args.join(' ')} produced more than ${GIT_OUTPUT_MAX_BUFFER} bytes of output — `
+        + 'narrow the check with --dir or raise GIT_OUTPUT_MAX_BUFFER in secret-file-guard.js',
+      );
+    }
+    throw error;
+  }
 }
 
-function verifyNoSecrets({ projectRoot, policy }) {
+function gitLines(execFileSync, projectRoot, args) {
+  return runGit(execFileSync, projectRoot, args).split('\0').filter(Boolean);
+}
+
+// `git status` paths are always relative to the repository root, even when
+// run with cwd inside a subdirectory — unlike `git ls-files`, which resolves
+// paths relative to cwd. When `--dir` points at a nested project root (a
+// subdirectory of a larger repo), a raw status path both means something
+// different than the ls-files paths above and can name a file entirely
+// outside projectRoot. Re-root it onto projectRoot, or drop it if it falls
+// outside.
+function toProjectRelative(repoRootAbs, projectRootAbs, repoRelativePath) {
+  const relative = path.relative(projectRootAbs, path.join(repoRootAbs, repoRelativePath));
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
+  return relative.split(path.sep).join('/');
+}
+
+function verifyNoSecrets({ projectRoot, policy }, ctx = {}) {
+  const execFileSync = ctx.execFileSync || nodeExecFileSync;
   validateSecretPolicy(policy);
   let trackedFiles;
   let untrackedNotIgnored;
   try {
-    trackedFiles = gitLines(projectRoot, ['ls-files', '-z']);
+    trackedFiles = gitLines(execFileSync, projectRoot, ['ls-files', '-z']);
+    const repoRootAbs = runGit(execFileSync, projectRoot, ['rev-parse', '--show-toplevel']).trim();
+    const projectRootAbs = fs.realpathSync(path.resolve(projectRoot));
     untrackedNotIgnored = gitLines(
+      execFileSync,
       projectRoot,
-      ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
+      // `-- .` scopes the scan to cwd (projectRoot) instead of the whole
+      // repository — porcelain paths stay repo-root-relative regardless (see
+      // toProjectRelative below), so this only narrows which entries git
+      // considers, not how they're formatted.
+      ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.'],
     )
       .filter((entry) => entry.startsWith('?? '))
-      .map((entry) => entry.slice(3));
+      .map((entry) => entry.slice(3))
+      .map((repoRelativePath) => toProjectRelative(repoRootAbs, projectRootAbs, repoRelativePath))
+      .filter((file) => file !== null);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, violations: [], errors: [`cannot inspect git working tree: ${message}`] };

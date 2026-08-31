@@ -21,8 +21,14 @@ function validateTunnelPolicy(policy) {
     throw new Error('tunnel.requiredRules must be an array');
   }
   for (const [index, rule] of policy.requiredRules.entries()) {
-    if (!rule || typeof rule.path !== 'string' || typeof rule.service !== 'string') {
-      throw new Error(`tunnel.requiredRules[${index}] must define string path and service values`);
+    if (
+      !rule
+      || typeof rule.hostname !== 'string'
+      || !rule.hostname.trim()
+      || typeof rule.path !== 'string'
+      || typeof rule.service !== 'string'
+    ) {
+      throw new Error(`tunnel.requiredRules[${index}] must define string hostname, path, and service values`);
     }
   }
   if (policy.requiredHostnameRules != null && !Array.isArray(policy.requiredHostnameRules)) {
@@ -58,23 +64,40 @@ function verifyTunnelConfig({ projectRoot, policy }) {
     return { ok: false, errors: [`ingress rule ${malformed} is not a mapping`], configPath };
   }
 
-  const catchAllIndex = ingress.findIndex(matchesEveryPath);
   for (const required of policy.requiredRules) {
-    const index = ingress.findIndex((rule) => rule.path === required.path);
+    const index = ingress.findIndex(
+      (rule) => rule.hostname === required.hostname && rule.path === required.path,
+    );
     if (index === -1) {
-      errors.push(`no ingress rule for required path ${required.path}`);
+      errors.push(`no ingress rule for required hostname ${required.hostname} path ${required.path}`);
       continue;
     }
     if (ingress[index].service !== required.service) {
-      errors.push(`${required.path} must route to ${required.service}, found: ${ingress[index].service}`);
+      errors.push(
+        `${required.hostname} ${required.path} must route to ${required.service}, `
+        + `found: ${ingress[index].service}`,
+      );
     }
-    if (catchAllIndex !== -1 && index > catchAllIndex) {
+    // A pathless (catch-all) rule only shadows this required path if it would
+    // actually receive the request first: either it has no hostname of its
+    // own (a global fallback, matching every host) or its hostname is this
+    // required rule's hostname. A catch-all scoped to a DIFFERENT host never
+    // sees this required path's traffic and must not be flagged.
+    const shadowingCatchAllIndex = ingress.findIndex(
+      (rule) => matchesEveryPath(rule) && (!rule.hostname || rule.hostname === required.hostname),
+    );
+    if (shadowingCatchAllIndex !== -1 && index > shadowingCatchAllIndex) {
       errors.push(`${required.path} is listed after a rule that matches every path`);
     }
   }
 
   for (const required of policy.requiredHostnameRules ?? []) {
-    if (!required || typeof required.hostname !== 'string' || typeof required.service !== 'string') {
+    if (
+      !required
+      || typeof required.hostname !== 'string'
+      || !required.hostname.trim()
+      || typeof required.service !== 'string'
+    ) {
       throw new Error('each tunnel.requiredHostnameRules entry must define hostname and service strings');
     }
     const matches = ingress.filter((rule) => rule.hostname === required.hostname);

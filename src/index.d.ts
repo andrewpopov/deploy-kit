@@ -703,6 +703,7 @@ export function clearPendingReleasePointer(
 export const DEFAULT_GUARD_CONFIG: string;
 
 export interface TunnelRequiredRule {
+  hostname: string;
   path: string;
   service: string;
 }
@@ -775,7 +776,7 @@ export function verifyTunnelConfig(options: {
   policy: TunnelGuardPolicy;
 }): TunnelGuardResult;
 export function patternMatches(file: string, pattern: SecretFilePattern): boolean;
-export function verifyNoSecrets(options: {
-  projectRoot: string;
-  policy: SecretGuardPolicy;
-}): SecretGuardResult;
+export function verifyNoSecrets(
+  options: { projectRoot: string; policy: SecretGuardPolicy },
+  ctx?: { execFileSync?: (file: string, args: string[], options?: unknown) => unknown },
+): SecretGuardResult;

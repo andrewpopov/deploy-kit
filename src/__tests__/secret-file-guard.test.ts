@@ -83,4 +83,88 @@ describe('verifyNoSecrets', () => {
     expect(verifyNoSecrets({ projectRoot: root, policy }).violations[0].file)
       .toBe('private key.pem');
   });
+
+  it('normalizes tracked and untracked paths relative to a nested --dir project root', () => {
+    const repoRoot = makeRepo();
+    const projectRoot = join(repoRoot, 'apps', 'app-a');
+
+    // Tracked secret inside the nested project root: `git ls-files` already
+    // resolves relative to cwd, so this exercises the pre-existing behavior.
+    write(repoRoot, 'apps/app-a/tracked.pem');
+    execFileSync('git', ['add', 'apps/app-a/tracked.pem'], { cwd: repoRoot });
+    execFileSync('git', ['commit', '-q', '-m', 'tracked secret'], { cwd: repoRoot });
+
+    // Untracked secret inside the nested project root: `git status` paths are
+    // repo-root-relative regardless of cwd, so this must be re-rooted onto
+    // projectRoot to report `.env` (and to match `root-path` patterns).
+    write(repoRoot, 'apps/app-a/.env');
+    write(repoRoot, 'apps/app-a/backups/db.sqlite');
+    // Untracked secret OUTSIDE the nested project root, elsewhere in the same
+    // repo: must not be inspected at all.
+    write(repoRoot, 'apps/app-b/.env');
+
+    const result = verifyNoSecrets({ projectRoot, policy });
+
+    expect(result.ok).toBe(false);
+    const byFile = Object.fromEntries(result.violations.map((v) => [v.file, v]));
+    expect(byFile['tracked.pem']).toMatchObject({ reason: 'tracked by git' });
+    expect(byFile['.env']).toMatchObject({ reason: expect.stringContaining('git add -A') });
+    expect(byFile['backups/db.sqlite']).toMatchObject({ reason: expect.stringContaining('git add -A') });
+    expect(result.violations).toHaveLength(3);
+  });
+
+  it('detects an in-root untracked file whose name begins with two dots', () => {
+    // `..secret` is not an escape above projectRoot — it's an ordinary
+    // filename inside it — but a naive `relative.startsWith('..')` check
+    // would mistake it for one and silently drop it from consideration.
+    const root = makeRepo();
+    write(root, '..secret');
+    const dotdotPolicy = {
+      patterns: [{ name: 'dotdot-prefixed', kind: 'basename-prefix', value: '..' }],
+    };
+
+    const result = verifyNoSecrets({ projectRoot: root, policy: dotdotPolicy });
+    expect(result.ok).toBe(false);
+    expect(result.violations[0]).toMatchObject({
+      file: '..secret',
+      reason: expect.stringContaining('git add -A'),
+    });
+  });
+
+  it('scopes the `git status` scan to the project root with a pathspec, not the whole repo', () => {
+    const repoRoot = makeRepo();
+    const projectRoot = join(repoRoot, 'apps', 'app-a');
+    write(repoRoot, 'apps/app-a/.env');
+
+    let statusArgs: string[] | undefined;
+    const spyExecFileSync = (file: string, args: string[], options?: unknown) => {
+      if (args[0] === 'status') statusArgs = args;
+      return execFileSync(file, args, options as never);
+    };
+
+    verifyNoSecrets({ projectRoot, policy }, { execFileSync: spyExecFileSync });
+
+    expect(statusArgs).toBeDefined();
+    expect(statusArgs!.slice(-2)).toEqual(['--', '.']);
+  });
+
+  it('reports an actionable error instead of a raw ENOBUFS when git output overflows the buffer', () => {
+    const root = makeRepo();
+
+    const fakeExecFileSync = (file: string, args: string[], options?: unknown) => {
+      if (args[0] === 'status') {
+        const error = Object.assign(new Error('spawnSync git ENOBUFS'), { code: 'ENOBUFS' });
+        throw error;
+      }
+      return execFileSync(file, args, options as never);
+    };
+
+    const result = verifyNoSecrets({ projectRoot: root, policy }, { execFileSync: fakeExecFileSync });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain('cannot inspect git working tree');
+    expect(result.errors[0]).toContain('produced more than');
+    expect(result.errors[0]).toContain('GIT_OUTPUT_MAX_BUFFER');
+  });
 });

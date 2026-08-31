@@ -25,7 +25,7 @@ function makeProject() {
   writeFileSync(join(root, 'deploy-kit.guards.json'), JSON.stringify({
     tunnel: {
       configFile: 'cloudflared.yml',
-      requiredRules: [{ path: '^/api(/.*)?$', service: 'http://127.0.0.1:3000' }],
+      requiredRules: [{ hostname: 'app.example.com', path: '^/api(/.*)?$', service: 'http://127.0.0.1:3000' }],
       finalService: 'http_status:404',
     },
     secrets: {
