@@ -63,6 +63,45 @@ function findShadowingCatchAllIndex(ingress, hostname) {
   );
 }
 
+// A required path counts as "safely reducible" only when it is a plain
+// anchored literal — `^/api/webhook$` — with no regex metacharacters beyond
+// the anchors. Anything else (alternation, character classes, quantifiers)
+// returns null so the overlap check below backs off rather than guessing
+// what the pattern means.
+const LITERAL_REQUIRED_PATH_PATTERN = /^\^(\/[A-Za-z0-9/_-]*)\$$/;
+
+function literalRequiredPath(requiredPath) {
+  const match = LITERAL_REQUIRED_PATH_PATTERN.exec(String(requiredPath));
+  return match ? match[1] : null;
+}
+
+function compilePathRegexSafely(pattern) {
+  try {
+    return new RegExp(String(pattern));
+  } catch {
+    return null;
+  }
+}
+
+// An earlier, hostname-applicable ingress rule whose path regex matches the
+// required rule's literal route (e.g. `^/api(/.*)?$` matching the literal
+// `/api/webhook`) intercepts the request before cloudflared ever reaches the
+// later exact declaration. This is deliberately narrow: it only fires when
+// the required path reduces to a single safe literal and the earlier rule's
+// pattern compiles, so it never attempts general regex-overlap reasoning.
+function findEarlierPathOverlapIndex(ingress, required, exactIndex) {
+  const literal = literalRequiredPath(required.path);
+  if (literal === null) return -1;
+  for (let index = 0; index < exactIndex; index += 1) {
+    const rule = ingress[index];
+    if (matchesEveryPath(rule) || !rule.path) continue;
+    if (!ruleAppliesToHostname(rule.hostname, required.hostname)) continue;
+    const regex = compilePathRegexSafely(rule.path);
+    if (regex && regex.test(literal)) return index;
+  }
+  return -1;
+}
+
 function validateTunnelPolicy(policy) {
   if (!policy || typeof policy !== 'object' || Array.isArray(policy)) {
     throw new Error('Guard config must define a `tunnel` object');
@@ -144,6 +183,14 @@ function verifyTunnelConfig({ projectRoot, policy }) {
     const shadowingCatchAllIndex = findShadowingCatchAllIndex(ingress, required.hostname);
     if (shadowingCatchAllIndex !== -1 && index > shadowingCatchAllIndex) {
       errors.push(`${required.path} is listed after a rule that matches every path`);
+    } else {
+      const overlapIndex = findEarlierPathOverlapIndex(ingress, required, index);
+      if (overlapIndex !== -1) {
+        errors.push(
+          `${required.path} is listed after an earlier rule (${ingress[overlapIndex].path}) `
+          + `whose path overlaps it`,
+        );
+      }
     }
   }
 

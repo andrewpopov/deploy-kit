@@ -180,6 +180,56 @@ describe('verifyTunnelConfig', () => {
     expect(result.errors).toContain('^/health$ is listed after a rule that matches every path');
   });
 
+  it('fails by name when an earlier same-host broader route shadows a required nested path', () => {
+    const nestedPolicy = {
+      configFile: 'cloudflared.yml',
+      requiredRules: [
+        { hostname: 'app.example.com', path: '^/api(/.*)?$', service: 'http://127.0.0.1:3000' },
+        { hostname: 'app.example.com', path: '^/api/webhook$', service: 'http://127.0.0.1:4000' },
+      ],
+    };
+    const root = rootWith(`ingress:
+  - hostname: app.example.com
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/api/webhook$
+    service: http://127.0.0.1:4000
+  - service: http_status:404
+`);
+
+    const result = verifyTunnelConfig({ projectRoot: root, policy: nestedPolicy });
+    expect(result.ok).toBe(false);
+    expect(result.errors).toContain(
+      '^/api/webhook$ is listed after an earlier rule (^/api(/.*)?$) whose path overlaps it',
+    );
+  });
+
+  it('does not flag a non-overlapping earlier same-host route ahead of a required nested path', () => {
+    const nestedPolicy = {
+      configFile: 'cloudflared.yml',
+      requiredRules: [
+        { hostname: 'app.example.com', path: '^/api/admin(/.*)?$', service: 'http://127.0.0.1:3000' },
+        { hostname: 'app.example.com', path: '^/api/webhook$', service: 'http://127.0.0.1:4000' },
+      ],
+    };
+    const root = rootWith(`ingress:
+  - hostname: app.example.com
+    path: ^/api/admin(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/api/webhook$
+    service: http://127.0.0.1:4000
+  - service: http_status:404
+`);
+
+    expect(verifyTunnelConfig({ projectRoot: root, policy: nestedPolicy })).toMatchObject({
+      ok: true,
+      checkedRules: 2,
+      errors: [],
+    });
+  });
+
   it('does not let a same-path rule on the WRONG host satisfy a host-scoped required rule', () => {
     // The wrong-host duplicate is listed first, so a path-only match would
     // find it before ever reaching the correct-host rule below it.
