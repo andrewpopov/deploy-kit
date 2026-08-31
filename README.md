@@ -438,8 +438,8 @@ stops at the first ingress rule that matches, a broader earlier pattern
 (e.g. `^/api(/.*)?$` ahead of `^/api/webhook$`) intercepts the request
 before the later, more specific rule is ever reached. This overlap check is
 deliberately conservative: it only fires when the required route's path is
-a plain anchored literal — no regex metacharacters beyond the `^…$`
-anchors — that safely reduces to one concrete request path, and the
+an anchored, slash-prefixed literal made only of letters, digits, `/`, `_`,
+and `-` between the `^…$` anchors, so it safely reduces to one concrete request path, and the
 earlier rule's own pattern compiles as a valid regex. A required path that
 isn't reducible to a single literal (alternation, character classes,
 quantifiers) and a malformed earlier regex both back off without flagging
