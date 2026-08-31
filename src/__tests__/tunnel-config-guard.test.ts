@@ -336,6 +336,251 @@ describe('verifyTunnelConfig', () => {
     expect(result.ok).toBe(false);
     expect(result.errors).toContain('ha.example.com is shadowed by an earlier rule that matches every path');
   });
+
+  it('fails by shadowing when a bare `*` catch-all precedes a required route', () => {
+    const root = rootWith(`ingress:
+  - hostname: '*'
+    path: ^.*$
+    service: http://127.0.0.1:5173
+  - hostname: app.example.com
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:3000
+  - hostname: ha.example.com
+    service: http://127.0.0.1:8124
+  - service: http_status:404
+`);
+
+    const result = verifyTunnelConfig({ projectRoot: root, policy });
+    expect(result.ok).toBe(false);
+    expect(result.errors).toContain('^/api(/.*)?$ is listed after a rule that matches every path');
+    expect(result.errors).toContain('^/health$ is listed after a rule that matches every path');
+  });
+
+  it('does not shadow when a bare `*` rule has a non-catch-all path ahead of the required routes', () => {
+    const root = rootWith(`ingress:
+  - hostname: '*'
+    path: ^/only-this$
+    service: http://127.0.0.1:5173
+  - hostname: app.example.com
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:3000
+  - hostname: ha.example.com
+    service: http://127.0.0.1:8124
+  - service: http_status:404
+`);
+
+    expect(verifyTunnelConfig({ projectRoot: root, policy })).toMatchObject({
+      ok: true,
+      checkedRules: 3,
+      errors: [],
+    });
+  });
+
+  it('does not shadow when a bare `*` catch-all is listed after the required routes', () => {
+    const root = rootWith(`ingress:
+  - hostname: app.example.com
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:3000
+  - hostname: ha.example.com
+    service: http://127.0.0.1:8124
+  - hostname: '*'
+    path: ^.*$
+    service: http://127.0.0.1:5173
+  - service: http_status:404
+`);
+
+    expect(verifyTunnelConfig({ projectRoot: root, policy })).toMatchObject({
+      ok: true,
+      checkedRules: 3,
+      errors: [],
+    });
+  });
+
+  it('does not let a bare `*` rule satisfy a host-scoped requiredRules entry', () => {
+    const root = rootWith(`ingress:
+  - hostname: '*'
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:3000
+  - hostname: ha.example.com
+    service: http://127.0.0.1:8124
+  - service: http_status:404
+`);
+
+    const result = verifyTunnelConfig({ projectRoot: root, policy });
+    expect(result.ok).toBe(false);
+    expect(result.errors).toContain(
+      'no ingress rule for required hostname app.example.com path ^/api(/.*)?$',
+    );
+  });
+
+  it('does not let a bare `*` rule satisfy a requiredHostnameRules entry', () => {
+    const root = rootWith(`ingress:
+  - hostname: app.example.com
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:3000
+  - hostname: '*'
+    path: ^/other$
+    service: http://127.0.0.1:8124
+  - service: http_status:404
+`);
+
+    const result = verifyTunnelConfig({ projectRoot: root, policy });
+    expect(result.ok).toBe(false);
+    expect(result.errors).toContain('ha.example.com must have an ingress rule');
+  });
+
+  it('passes requiredHostnameRules when an exact rule precedes a later matching wildcard fallback', () => {
+    const wildcardPolicy = {
+      configFile: 'cloudflared.yml',
+      requiredRules: policy.requiredRules,
+      requiredHostnameRules: policy.requiredHostnameRules,
+      finalService: policy.finalService,
+    };
+    const root = rootWith(`ingress:
+  - hostname: app.example.com
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:3000
+  - hostname: ha.example.com
+    service: http://127.0.0.1:8124
+  - hostname: '*.example.com'
+    service: http://127.0.0.1:9999
+  - service: http_status:404
+`);
+
+    expect(verifyTunnelConfig({ projectRoot: root, policy: wildcardPolicy })).toMatchObject({
+      ok: true,
+      checkedRules: 3,
+      errors: [],
+    });
+  });
+
+  it('fails by name when a wildcard fallback precedes the exact rule and is the effective (wrong-service) rule', () => {
+    const wildcardPolicy = {
+      configFile: 'cloudflared.yml',
+      requiredRules: policy.requiredRules,
+      requiredHostnameRules: policy.requiredHostnameRules,
+      finalService: policy.finalService,
+    };
+    const root = rootWith(`ingress:
+  - hostname: app.example.com
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:3000
+  - hostname: '*.example.com'
+    service: http://127.0.0.1:9999
+  - hostname: ha.example.com
+    service: http://127.0.0.1:8124
+  - service: http_status:404
+`);
+
+    const result = verifyTunnelConfig({ projectRoot: root, policy: wildcardPolicy });
+    expect(result.ok).toBe(false);
+    expect(result.errors).toContain('ha.example.com must route to http://127.0.0.1:8124, found: http://127.0.0.1:9999');
+  });
+
+  it('passes requiredHostnameRules when the effective wildcard-first rule itself meets policy', () => {
+    const wildcardPolicy = {
+      configFile: 'cloudflared.yml',
+      requiredRules: policy.requiredRules,
+      requiredHostnameRules: policy.requiredHostnameRules,
+      finalService: policy.finalService,
+    };
+    const root = rootWith(`ingress:
+  - hostname: app.example.com
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:3000
+  - hostname: '*.example.com'
+    service: http://127.0.0.1:8124
+  - hostname: ha.example.com
+    service: http://127.0.0.1:9999
+  - service: http_status:404
+`);
+
+    expect(verifyTunnelConfig({ projectRoot: root, policy: wildcardPolicy })).toMatchObject({
+      ok: true,
+      checkedRules: 3,
+      errors: [],
+    });
+  });
+
+  for (const [name, path] of [
+    ['^(.*)$', '^(.*)$'],
+    ['^.+$', '^.+$'],
+    ['^(.+)$', '^(.+)$'],
+  ]) {
+    it(`fails by shadowing when a catch-all rule spelled \`${name}\` precedes a required route`, () => {
+      const root = rootWith(`ingress:
+  - hostname: app.example.com
+    path: ${path}
+    service: http://127.0.0.1:5173
+  - hostname: app.example.com
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:3000
+  - hostname: ha.example.com
+    service: http://127.0.0.1:8124
+  - service: http_status:404
+`);
+
+      const result = verifyTunnelConfig({ projectRoot: root, policy });
+      expect(result.ok).toBe(false);
+      expect(result.errors).toContain('^/api(/.*)?$ is listed after a rule that matches every path');
+      expect(result.errors).toContain('^/health$ is listed after a rule that matches every path');
+    });
+  }
+
+  for (const [name, path] of [
+    ['^.+/foo$', '^.+/foo$'],
+    ['^(.+)\\.html$', '^(.+)\\.html$'],
+  ]) {
+    it(`does not treat the similar but non-universal path \`${name}\` as a catch-all`, () => {
+      const root = rootWith(`ingress:
+  - hostname: app.example.com
+    path: ${path}
+    service: http://127.0.0.1:5173
+  - hostname: app.example.com
+    path: ^/api(/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: app.example.com
+    path: ^/health$
+    service: http://127.0.0.1:3000
+  - hostname: ha.example.com
+    service: http://127.0.0.1:8124
+  - service: http_status:404
+`);
+
+      expect(verifyTunnelConfig({ projectRoot: root, policy })).toMatchObject({
+        ok: true,
+        checkedRules: 3,
+        errors: [],
+      });
+    });
+  }
 });
 
 describe('hostnameMatches', () => {
@@ -368,5 +613,10 @@ describe('hostnameMatches', () => {
   it('matches wildcard prefix and suffix case-sensitively', () => {
     expect(hostnameMatches('*.Example.com', 'deep.example.com')).toBe(false);
     expect(hostnameMatches('*.example.com', 'deep.example.com')).toBe(true);
+  });
+
+  it('treats a bare `*` hostname as never an explicit match, even against itself', () => {
+    expect(hostnameMatches('*', 'app.example.com')).toBe(false);
+    expect(hostnameMatches('*', '*')).toBe(false);
   });
 });

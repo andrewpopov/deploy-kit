@@ -4,7 +4,12 @@ const fs = require('fs');
 const path = require('path');
 const { load: loadYaml } = require('js-yaml');
 
-const MATCH_ALL_PATHS = new Set(['.*', '^.*$', '/*', '^/.*$']);
+// A finite, documented set of regex spellings that cloudflared treats as
+// "every request path" — not an attempt at general regex-equivalence
+// detection. `^.+$` and `^(.+)$` belong here alongside the `.*` spellings
+// because an HTTP request path is never empty (it is at minimum `/`), so
+// `.+` is exactly as permissive as `.*` in this position.
+const MATCH_ALL_PATHS = new Set(['.*', '^.*$', '^(.*)$', '/*', '^/.*$', '^.+$', '^(.+)$']);
 
 function matchesEveryPath(rule) {
   return !rule.path || MATCH_ALL_PATHS.has(String(rule.path));
@@ -20,8 +25,18 @@ function matchesEveryPath(rule) {
 // request for `app.example.com`) — cloudflared does neither. `ruleHostname`
 // must be a non-empty hostname/pattern; a hostless (catch-all) rule is
 // handled separately by `ruleAppliesToHostname`.
+//
+// A bare `*` hostname is cloudflared's every-hostname wildcard, not a DNS
+// pattern — it never counts as an explicit hostname *binding*, so it
+// deliberately returns false here even though it matches every host in
+// practice. That means a bare-`*` rule can never satisfy a host-scoped
+// `requiredRules`/`requiredHostnameRules` entry (policy requires an exact
+// hostname or a leading `*.`-suffix binding); its every-host reach is
+// instead handled, like a hostless rule, by `ruleAppliesToHostname` for
+// shadow detection.
 function hostnameMatches(ruleHostname, hostname) {
   const rule = String(ruleHostname).trim();
+  if (rule === '*') return false;
   const host = String(hostname).trim();
   if (rule.startsWith('*.')) {
     const suffix = rule.slice(2);
@@ -30,11 +45,12 @@ function hostnameMatches(ruleHostname, hostname) {
   return rule.toLowerCase() === host.toLowerCase();
 }
 
-// A rule with no hostname is cloudflared's global catch-all — it receives
-// every host's traffic regardless of what it names. A rule WITH a hostname
-// only applies to hosts its pattern (exact or wildcard) actually matches.
+// A rule with no hostname, or a bare `*` hostname, is cloudflared's global
+// catch-all — it receives every host's traffic regardless of what it names.
+// A rule WITH a specific hostname only applies to hosts its pattern (exact
+// or wildcard) actually matches.
 function ruleAppliesToHostname(ruleHostname, hostname) {
-  return !ruleHostname || hostnameMatches(ruleHostname, hostname);
+  return !ruleHostname || ruleHostname === '*' || hostnameMatches(ruleHostname, hostname);
 }
 
 // The earliest ingress rule that would intercept EVERY path for `hostname` —
@@ -141,11 +157,16 @@ function verifyTunnelConfig({ projectRoot, policy }) {
       throw new Error('each tunnel.requiredHostnameRules entry must define hostname and service strings');
     }
     // Explicitly-hosted rules (exact or wildcard) that actually apply to this
-    // hostname — a hostless global catch-all is never itself "the" rule for a
-    // requiredHostnameRules entry, but it can still shadow one (checked below).
+    // hostname — a hostless or bare-`*` global catch-all is never itself "the"
+    // rule for a requiredHostnameRules entry, but it can still shadow one
+    // (checked below). cloudflared evaluates ingress top-to-bottom and stops
+    // at the first match, so when more than one declaration applies to this
+    // hostname (e.g. an exact rule and a `*.`-wildcard fallback both naming
+    // it) the FIRST one by ingress order is the one actually in effect —
+    // later declarations are unreachable and irrelevant, not a policy error.
     const matches = ingress.filter((rule) => rule.hostname && hostnameMatches(rule.hostname, required.hostname));
-    if (matches.length !== 1) {
-      errors.push(`${required.hostname} must have exactly one ingress rule`);
+    if (matches.length === 0) {
+      errors.push(`${required.hostname} must have an ingress rule`);
       continue;
     }
     const matched = matches[0];

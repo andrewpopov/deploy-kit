@@ -777,7 +777,11 @@ export function matchesEveryPath(rule: { path?: unknown }): boolean;
  * of `example.com` (case-sensitive), but never the apex `example.com` itself.
  * `ruleHostname` must be a non-empty hostname/pattern; a hostless (catch-all)
  * ingress rule is not represented here — callers check `!rule.hostname`
- * separately. */
+ * separately. A bare `*` hostname always returns `false`: it is cloudflared's
+ * every-hostname wildcard, not a DNS binding, so it never counts as an
+ * explicit match — callers needing its every-host reach for shadow detection
+ * check `ruleHostname === '*'` separately, the same way they check
+ * `!rule.hostname`. */
 export function hostnameMatches(ruleHostname: string, hostname: string): boolean;
 export function verifyTunnelConfig(options: {
   projectRoot: string;

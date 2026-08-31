@@ -418,19 +418,37 @@ mechanics. Neither command reads `.deploy-kit.config.json`.
 
 `verify-tunnel-config` checks that each required rule's `hostname`+`path`
 exists, routes to its exact service, and appears before the first catch-all
-that could shadow it — a pathless rule only shadows a required path when the
-pathless rule itself has no hostname (a global fallback) or its hostname
-matches the required rule's; a same-path catch-all scoped to a *different*
-host never shadows it. Hostname matching mirrors cloudflared's own ingress
-rules: an exact hostname matches only itself, and a `*.example.com` wildcard
-matches any subdomain of `example.com` (one or more labels deep) but never
-the apex `example.com` — so a wildcard rule can both shadow an exact-host
-required route listed after it, and satisfy one listed before it. The same
-matching backs `requiredHostnameRules`, which also treats an earlier
-catch-all (global or wildcard) that would receive the hostname's traffic
-first as shadowing it rather than silently checking a rule that can never be
+that could shadow it — an every-path rule only shadows a required path when
+the rule itself has no hostname (a global fallback, including a bare `*`
+hostname) or its hostname matches the required rule's; an every-path rule
+scoped to a *different* host never shadows it. Hostname matching
+mirrors cloudflared's own ingress rules: an exact hostname matches only
+itself, and a `*.example.com` wildcard matches any subdomain of
+`example.com` (one or more labels deep) but never the apex `example.com` —
+so a wildcard rule can both shadow an exact-host required route listed after
+it, and satisfy one listed before it. A bare `*` hostname is different: it
+is cloudflared's every-hostname fallback, not a DNS binding, so it can never
+by itself satisfy a host-scoped `requiredRules`/`requiredHostnameRules`
+entry — only its shadowing reach counts, exactly like a hostless rule.
+
+The same matching backs `requiredHostnameRules`. When more than one ingress
+declaration applies to a required hostname (e.g. an exact rule and a later
+`*.`-wildcard fallback both naming it), cloudflared stops at the first match
+it evaluates top-to-bottom, so the guard checks that *first* declaration
+against policy rather than requiring there be exactly one — a wildcard rule
+listed ahead of the exact one is the effective rule and is judged on its own
+service/path, not the exact rule below it. An earlier catch-all (global,
+bare-`*`, or wildcard) that would receive the hostname's traffic first still
+shadows the entry rather than silently checking a rule that can never be
 reached. It also checks anchored path regexes, required full-host routes,
 forbidden direct origins, and the final fallback when configured.
+
+"Matches every path" is a finite, documented set of regex spellings
+(`.*`, `^.*$`, `^(.*)$`, `/*`, `^/.*$`, `^.+$`, `^(.+)$`) — not general
+regex-equivalence detection. The `.+` spellings are included because an
+HTTP request path is never empty, so `.+` is exactly as permissive as `.*`
+in this position; a similar-looking but non-universal pattern (e.g. one with
+a literal suffix) is never misidentified as a catch-all.
 `verify-no-secrets` checks both tracked paths and untracked, unignored paths
 that `git add -A` could stage. It is deliberately a filename-policy guard,
 not a content secret scanner.
