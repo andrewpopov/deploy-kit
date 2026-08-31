@@ -917,10 +917,194 @@ describe('release deploy — safety hardening (Codex review fixes)', () => {
     expect(() => release.rollbackRelease(relConfig(), {}, ctx(runtime))).toThrow(/restored the original release/);
   });
 
-  it('refuses to start when a previous deploy was interrupted mid-disruptive-phase', () => {
-    const { runtime, calls } = makeReleaseRuntime({ stateContent: '{"phase":"migrated","releaseId":"a1b2c3d4e5f6-20260710T010000Z","backupId":"backup-x"}' });
-    expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow(/interrupted mid-"migrated"/);
-    expect(calls.some((cmd) => cmd.includes('worktree add'))).toBe(false);
+  it('resumes the previous release after an interruption in the stopped phase', () => {
+    const previous = 'releases/00000000aaaa-20260709T090000Z';
+    const { runtime, calls } = makeReleaseRuntime({
+      canonical: `/srv/app/${previous}`,
+      currentLink: previous,
+      stateContent: JSON.stringify({
+        phase: 'stopped',
+        releaseId: 'a1b2c3d4e5f6-20260710T010000Z',
+        prevTarget: previous,
+        migrated: false,
+      }),
+      fail: ['stop-after-recovery'],
+    });
+    const config = relConfig({
+      preDeployChecks: [{ name: 'stop-after-recovery', command: 'stop-after-recovery' }],
+    });
+
+    expect(() => release.deployRelease(config, {}, ctx(runtime))).toThrow(/Pre-deploy check failed/);
+    const resume = calls.findIndex((cmd) => cmd.includes('pm2 startOrRestart'));
+    const nextDeploy = calls.findIndex((cmd) => cmd.includes('stop-after-recovery'));
+    expect(resume).toBeGreaterThanOrEqual(0);
+    expect(resume).toBeLessThan(nextDeploy);
+    expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('"phase":"recovered"'))).toBe(true);
+  });
+
+  // A stale migrated/flipped journal must fail closed before ANY new deploy work
+  // begins, not just before the disruptive DB/symlink/PM2 ops above -- otherwise
+  // a "no mutation" assertion could pass while the pipeline had already fetched
+  // and materialized a new candidate release. `preDeployChecks` runs early
+  // (right after the interrupted-recovery gate); configuring a named sentinel
+  // there and asserting it never ran proves the pipeline never got past the
+  // fail-closed throw, alongside the fetch/materialize commands it would reach next.
+  const NEW_WORK_SENTINEL = { name: 'no-new-deploy-work', command: 'no-new-deploy-work' };
+  const assertNoNewDeployWorkStarted = (calls: string[]) => {
+    expect(calls.some((cmd) => cmd.includes('no-new-deploy-work'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('fetch --prune'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('worktree add --detach'))).toBe(false);
+  };
+
+  // A "migrated" journal means a backup was taken and writers were stopped for
+  // the migration, though they may since have been resumed externally after the
+  // interruption. deploy-kit cannot prove no writes have landed since that backup — a service
+  // manager (e.g. PM2 resurrect replaying a previously saved dump) or an operator
+  // may have already brought the old app back online. So this phase fails closed
+  // on the NEXT deploy rather than auto-restoring: no backup restore, no symlink
+  // rewrite, no PM2 stop/restart, no new release work.
+  it('fails closed on an interrupted migrated phase (no auto-restore, no mutation)', () => {
+    const previous = 'releases/00000000aaaa-20260709T090000Z';
+    const backupId = '/var/lib/app/backups/pre-migration.db.gpg';
+    const { runtime, calls } = makeReleaseRuntime({
+      canonical: `/srv/app/${previous}`,
+      currentLink: previous,
+      stateContent: JSON.stringify({
+        phase: 'migrated',
+        releaseId: 'a1b2c3d4e5f6-20260710T010000Z',
+        prevTarget: previous,
+        backupId,
+        migrated: true,
+      }),
+    });
+    const config = relConfig({ preDeployChecks: [NEW_WORK_SENTINEL] });
+
+    expect(() => release.deployRelease(config, {}, ctx(runtime)))
+      .toThrow(/MANUAL RECOVERY REQUIRED.*cannot prove no writes occurred after the pre-migration backup/s);
+    expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('pm2 stop'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('pm2 startOrRestart'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('ln -s'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('mv -Tf'))).toBe(false);
+    assertNoNewDeployWorkStarted(calls);
+  });
+
+  it('fails closed on an interrupted flipped phase where the flip already landed (no auto-restore, no mutation)', () => {
+    const previous = 'releases/00000000aaaa-20260709T090000Z';
+    const releaseId = 'a1b2c3d4e5f6-20260710T010000Z';
+    const backupId = '/var/lib/app/backups/pre-migration.db.gpg';
+    const { runtime, calls } = makeReleaseRuntime({
+      canonical: `/srv/app/releases/${releaseId}`,
+      currentLink: `releases/${releaseId}`,
+      stateContent: JSON.stringify({
+        phase: 'flipped',
+        releaseId,
+        prevTarget: previous,
+        backupId,
+        migrated: true,
+        flipped: true,
+      }),
+    });
+    const config = relConfig({ preDeployChecks: [NEW_WORK_SENTINEL] });
+
+    expect(() => release.deployRelease(config, {}, ctx(runtime)))
+      .toThrow(/MANUAL RECOVERY REQUIRED.*cannot prove no writes occurred after the pre-migration backup/s);
+    expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('pm2 stop'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('pm2 startOrRestart'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('ln -s'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('mv -Tf'))).toBe(false);
+    assertNoNewDeployWorkStarted(calls);
+  });
+
+  // A code-only "flipped" journal (no migrate hook, migrated:false) has no
+  // pre-migration backup and no post-backup writes to worry about. It still
+  // fails closed per the all-flipped policy above, but for a different reason:
+  // deploy-kit cannot trust the on-disk `current`/`previous` pointers against
+  // whatever process is actually running without re-deriving that state by hand.
+  it('fails closed on an interrupted flipped phase with no DB backup (code-only deploy)', () => {
+    const previous = 'releases/00000000aaaa-20260709T090000Z';
+    const releaseId = 'a1b2c3d4e5f6-20260710T010000Z';
+    const { runtime, calls } = makeReleaseRuntime({
+      canonical: `/srv/app/releases/${releaseId}`,
+      currentLink: `releases/${releaseId}`,
+      stateContent: JSON.stringify({
+        phase: 'flipped',
+        releaseId,
+        prevTarget: previous,
+        migrated: false,
+      }),
+    });
+    const config = relConfig({ preDeployChecks: [NEW_WORK_SENTINEL] });
+
+    expect(() => release.deployRelease(config, {}, ctx(runtime)))
+      .toThrow(/MANUAL RECOVERY REQUIRED/);
+    expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('pm2 stop'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('pm2 startOrRestart'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('ln -s'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('mv -Tf'))).toBe(false);
+    assertNoNewDeployWorkStarted(calls);
+  });
+
+  // The atomic `mv -Tf` swap never landed (the process died before or during it),
+  // so `current` still reads as the previous release even though the journal says
+  // "flipped". deploy-kit must not treat that as evidence the flip is safely
+  // undone — the journal is migrated:true, so it still cannot prove no writes have
+  // landed since the pre-migration backup (a service manager or operator may have
+  // brought the old app back online), so this still fails closed rather than being
+  // special-cased as "effectively stopped".
+  it('fails closed on the atomic-flip-not-landed case: phase flipped but live current still equals previous', () => {
+    const previous = 'releases/00000000aaaa-20260709T090000Z';
+    const releaseId = 'a1b2c3d4e5f6-20260710T010000Z';
+    const backupId = '/var/lib/app/backups/pre-migration.db.gpg';
+    const { runtime, calls } = makeReleaseRuntime({
+      canonical: `/srv/app/${previous}`,
+      currentLink: previous,
+      stateContent: JSON.stringify({
+        phase: 'flipped',
+        releaseId,
+        prevTarget: previous,
+        backupId,
+        migrated: true,
+        flipped: false,
+      }),
+    });
+    const config = relConfig({ preDeployChecks: [NEW_WORK_SENTINEL] });
+
+    expect(() => release.deployRelease(config, {}, ctx(runtime)))
+      .toThrow(/MANUAL RECOVERY REQUIRED.*cannot prove no writes occurred after the pre-migration backup/s);
+    expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('pm2 stop'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('pm2 startOrRestart'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('ln -s'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('mv -Tf'))).toBe(false);
+    assertNoNewDeployWorkStarted(calls);
+  });
+
+  // A "stopped" journal implies current was never touched. If the live pointer is
+  // neither the recorded previous nor the candidate release, the on-host state
+  // disagrees with the journal in a way deploy-kit cannot reconcile automatically.
+  it('fails closed on an impossible pointer: stopped journal but current matches neither previous nor candidate', () => {
+    const previous = 'releases/00000000aaaa-20260709T090000Z';
+    const releaseId = 'a1b2c3d4e5f6-20260710T010000Z';
+    const { runtime, calls } = makeReleaseRuntime({
+      currentLink: 'releases/00000000cccc-20260708T090000Z', // neither previous nor the candidate
+      stateContent: JSON.stringify({
+        phase: 'stopped',
+        releaseId,
+        prevTarget: previous,
+        migrated: false,
+      }),
+    });
+
+    expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow(/MANUAL RECOVERY REQUIRED/);
+    expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('pm2 stop'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('pm2 startOrRestart'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('ln -s'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('mv -Tf'))).toBe(false);
   });
 
   it('rejects a corrupt current pointer that tries to traverse out of releases/', () => {

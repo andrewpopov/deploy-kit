@@ -189,6 +189,31 @@ the still-active target; a migration's DB restore still runs regardless (writers
 were already confirmed stopped, so it's a safe, traffic-independent data operation)
 but nothing is resumed (unreleased).
 
+A hard process, SSH, or power interruption is checked at the start of the next
+`deploy`, before any new release work begins — but only a `stopped` journal is
+recovered automatically: the journal is written the moment the stop phase
+begins, so it only proves no migration or symlink flip had begun — not that
+writers were actually confirmed stopped. Either way resuming the untouched
+previous release is safe, so deploy-kit validates the journaled release id
+and the live `current` pointer, then resumes the previous release and
+re-verifies it. An interrupted
+`migrated` or `flipped` journal fails closed with `MANUAL RECOVERY REQUIRED`
+instead of being auto-restored, for two different reasons. Once the
+pre-migration backup has been taken (a `migrated` journal, or `flipped` with
+`migrated: true`), deploy-kit has no reliable way to prove no writes have
+landed since that backup — a service manager (e.g. PM2 resurrect replaying a
+previously saved dump) or an operator may have already brought the old app
+back online before the next deploy runs. A code-only `flipped` journal (no
+backup, `migrated: false`) has no post-backup writes to worry about, but it
+still fails closed because deploy-kit cannot trust the on-disk
+`current`/`previous` pointers against whatever process is actually running
+without re-deriving that state by hand. Either way, deploy-kit does not stop
+apps, restore the backup, rewrite the `current`/`previous` symlinks, or restart
+PM2; the operator must reconcile the database/schema and the `current` pointer
+by hand, then set `"phase":"done"` in `.deploy-kit-state.json` (or remove it)
+before deploying again. Post-deploy policy/rollback interruptions likewise
+require manual reconciliation.
+
 #### Post-deploy failure policy
 
 Every release-layout `postDeployChecks` entry must choose what happens when its
@@ -214,8 +239,10 @@ outcome. A configured `deliveryEvent.command` then receives a `failed` or
 `degraded` event with the failed check, attempted revision, active release or
 revision, recovery policy/outcome, and only the redacted backup leaf reference.
 A failed event sink is warned but cannot change the chosen recovery action; the
-journal remains the durable local record. A hard interruption during rollback is
-recognized on the next invocation and blocks a new deploy until reconciled.
+journal remains the durable local record. A hard interruption during post-deploy
+rollback is recognized on the next invocation and blocks a new deploy until
+reconciled — same as an interrupted `migrated`/`flipped` journal (see above);
+only an interrupted `stopped` journal recovers automatically.
 
 **Flag semantics differ by layout** — the same flag can mean something
 different, or nothing, depending on which pipeline is running:

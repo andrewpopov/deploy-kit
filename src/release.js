@@ -297,25 +297,60 @@ function preflight(config, paths, ctx) {
   }
 }
 
-// Refuse to start a new deploy if the on-host journal shows a PREVIOUS deploy was
-// interrupted mid-disruptive-phase and never recovered (a hard process/SSH/power
-// loss). Turns "silently manual" into "loud, refuse until resolved" — full
-// auto-resume of an interrupted deploy is a tracked follow-up.
-function assertNoInterruptedDeploy(config, paths, ctx) {
+// Read a previous deploy's durable recovery journal. Only "stopped" is safe to
+// recover automatically: the journal is written the moment the stop phase BEGINS
+// (before stopWritersConfirmed() runs — see the disruptive-window call site), so
+// it proves only that no migration or symlink flip had begun, not that writers
+// were actually confirmed paused. Either way resuming the untouched previous
+// release is safe: recoverInterruptedDeploy() re-verifies it comes back healthy,
+// and if it was never actually stopped, `pm2 startOrRestart` is a no-op restart
+// of the same still-running previous release. "migrated" and "flipped" journals
+// are fail-closed, for two different reasons. A "migrated"
+// journal (or migrated:true) means a backup was taken and writers were stopped for
+// the migration — this same process never got as far as `pm2 startOrRestart`, but
+// writers may since have been resumed externally after the interruption. A hard
+// interruption at that point leaves the door open for a service manager (e.g.
+// PM2 resurrect replaying a previously saved dump) or an operator to bring the old
+// app back online and accept writes before the next deploy runs, so deploy-kit
+// cannot prove the backup is still an accurate snapshot. A code-only "flipped"
+// journal has no pre-migration backup and no post-backup writes to worry about,
+// but it still fails closed because the on-disk `current`/`previous` pointers and
+// the actually-running process can't be trusted across process invocations without
+// re-deriving them. Post-deploy policy transitions remain manual for a related
+// reason: resuming them requires an operator decision or delivery-event context
+// that may not be present.
+function readInterruptedDeploy(config, paths, ctx) {
   // Same pre-existing-state read as preflight() above — readOnly so a dry run
   // reports the real interrupted-deploy status of the host instead of always
   // reading empty.
   const raw = capture(paths.root, `cat ${paths.stateFile} 2>/dev/null || true`, config, ctx, { readOnly: true });
-  if (!raw) return;
+  if (!raw) return null;
   let state;
-  try { state = JSON.parse(raw); } catch { return; } // unreadable → best-effort, don't block
-  if (state && ['stopped', 'migrated', 'flipped', 'post-deploy-failed', 'post-deploy-rollback'].includes(state.phase)) {
+  try { state = JSON.parse(raw); } catch { return null; } // unreadable → best-effort, don't block
+  if (!state) return null;
+  if (state.phase === 'stopped') return state;
+  if (['migrated', 'flipped'].includes(state.phase)) {
+    const reason = (state.migrated === true || state.phase === 'migrated')
+      ? 'deploy-kit cannot prove no writes occurred after the pre-migration backup — a service manager '
+        + '(e.g. PM2 resurrect) or an operator may have already brought the old app back online'
+      : 'deploy-kit cannot trust the on-disk `current`/`previous` pointers against whatever process is '
+        + 'actually running without re-deriving that state by hand';
+    throw new Error(
+      `MANUAL RECOVERY REQUIRED — a previous deploy was interrupted mid-"${state.phase}" (release `
+      + `${state.releaseId || '?'}, backup ${state.backupId || 'none'}). ${reason}, so it will not `
+      + 'auto-restore the backup, rewrite the `current`/`previous` symlinks, stop apps, or restart PM2. '
+      + 'Reconcile the database/schema and the `current` pointer by hand, then set "phase":"done" in '
+      + `${paths.stateFile} (or remove it) before deploying again.`,
+    );
+  }
+  if (['post-deploy-failed', 'post-deploy-rollback'].includes(state.phase)) {
     throw new Error(
       `A previous deploy was interrupted mid-"${state.phase}" (release ${state.releaseId || '?'}, backup `
       + `${state.backupId || 'none'}). Resolve it by hand — verify the DB/schema and the running release — then `
       + `set "phase":"done" in ${paths.stateFile} (or remove it) before deploying again.`,
     );
   }
+  return null;
 }
 
 // The full artifact-first release deploy. See the failure-phase table in the ticket:
@@ -328,7 +363,7 @@ function deployRelease(config, options = {}, ctx = {}) {
   const paths = releasePaths(config);
 
   // Populated inside the try block below, AFTER lock acquisition and target
-  // preflight (preflight(), assertNoInterruptedDeploy(), pre-deploy checks)
+  // preflight (preflight(), interrupted recovery, pre-deploy checks)
   // -- see the auto-cut call site further down for why it must not run any
   // earlier.
   let autoCutResult = { ran: false };
@@ -370,11 +405,13 @@ function deployRelease(config, options = {}, ctx = {}) {
 
   const steps = [];
   // Mutable state the recovery machine reads. phase names match the failure table.
-  const st = {
+  const freshState = () => ({
     phase: 'preflight', dbAppsPaused: false, flipped: false, prevTarget: null,
     releaseDir: null, releaseId: null, sha: null, branch: null, backupId: null,
     migrated: false, failedCheck: null, failurePolicy: null, recoveryOutcome: null,
-  };
+  });
+  const st = freshState();
+  let recoveringInterrupted = false;
 
   // Durably journal the disruptive-phase state BEFORE each irreversible op, so a
   // process/SSH/power loss leaves an on-host record of whether the DB was migrated
@@ -574,6 +611,47 @@ function deployRelease(config, options = {}, ctx = {}) {
     }
   };
 
+  const recoverInterruptedDeploy = () => {
+    // readInterruptedDeploy() above already fails closed (throws) for a
+    // migrated/flipped/post-deploy-* journal, so the only phase that can reach
+    // this point is "stopped" — the stop phase had begun but no migration or
+    // symlink flip had, so resuming and re-verifying the untouched previous
+    // release is safe whether the stop itself completed or not.
+    const saved = readInterruptedDeploy(config, paths, c);
+    if (!saved) return;
+
+    const phase = saved.phase;
+    const releaseId = typeof saved.releaseId === 'string' ? saved.releaseId : '';
+    const prevTarget = typeof saved.prevTarget === 'string' ? saved.prevTarget : '';
+    if (!RELEASE_ID_RE.test(releaseId)) {
+      throw new Error(`MANUAL RECOVERY REQUIRED — interrupted ${phase} journal has an unsafe or missing releaseId.`);
+    }
+    assertSafeTarget(prevTarget, 'interrupted deploy previous');
+
+    // A "stopped" journal implies current was never touched — it must still
+    // point at the previous release. Anything else (still on the candidate,
+    // or some third, unrelated value) is an impossible/untrustworthy state.
+    const current = readPointers(config, paths, c).current;
+    assertSafeTarget(current, 'current during interrupted recovery');
+    if (current !== prevTarget) {
+      throw new Error(
+        `MANUAL RECOVERY REQUIRED — interrupted ${phase} journal says the flip had not started, but current `
+        + `points to ${current} instead of ${prevTarget}.`,
+      );
+    }
+
+    Object.assign(st, freshState(), {
+      phase, releaseId, releaseDir: `${paths.releasesDir}/${releaseId}`, prevTarget,
+    });
+
+    log.warning(`Recovering interrupted deploy ${releaseId} from phase "${phase}" before starting a new release`);
+    recoveringInterrupted = true;
+    recover(new Error(`previous deploy interrupted during ${phase}`));
+    recoveringInterrupted = false;
+    steps.push(`recover-interrupted:${phase}`);
+    Object.assign(st, freshState());
+  };
+
   // DO NOT DELETE THIS AS DEAD CODE -- see the fuller note in deploy.js. This
   // pipeline is synchronous too, so a mid-deploy signal is never dispatched
   // before `finally` removes these listeners; the body below is unreachable in
@@ -597,7 +675,7 @@ function deployRelease(config, options = {}, ctx = {}) {
   process.on('SIGTERM', sigHandlers.SIGTERM);
   try {
     preflight(config, paths, c);
-    assertNoInterruptedDeploy(config, paths, c);
+    recoverInterruptedDeploy();
     for (const check of config.preDeployChecks) {
       st.phase = 'preflight';
       const res = runInDir(paths.root, check.command, config, c, { tolerate: true });
@@ -605,8 +683,8 @@ function deployRelease(config, options = {}, ctx = {}) {
     }
 
     // Auto-cut, on the LOCAL controller checkout, runs here -- AFTER the lock
-    // is held and after target preflight (preflight(), assertNoInterruptedDeploy(),
-    // pre-deploy checks) have already rejected an un-deployable target, but
+    // is held and after target preflight, interrupted recovery, and pre-deploy
+    // checks have already rejected an un-deployable target, but
     // still BEFORE the materialize phase below fetches/resolves anything.
     // Running it any earlier (e.g. before the `--no-stash`-combination and
     // postDeployChecks[].onFailure option validation above) would mutate
@@ -887,6 +965,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       ...(deliveryEvent ? { deliveryEvent } : {}),
     };
   } catch (err) {
+    if (recoveringInterrupted) throw err;
     recover(err);
     throw err;
   } finally {
