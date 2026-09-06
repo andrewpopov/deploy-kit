@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.26.0
+
+- Add configurable Cloudflare ingress and secret-filename repository guards
+  Applications can now run `deploy-kit verify-tunnel-config` and
+  `deploy-kit verify-no-secrets` from their local gate, with app-owned policy in
+  `deploy-kit.guards.json` and optional JSON output for automation.
+  
+  `verify-tunnel-config` matches ingress hostnames the way cloudflared itself
+  does: an exact hostname matches only itself, and a `*.example.com` wildcard
+  matches any subdomain of `example.com` (never the apex). That matching is
+  shared by required-path lookup, catch-all shadow detection, and
+  `requiredHostnameRules`, so a wildcard rule is correctly treated as both a
+  potential shadower and a valid, documented way to satisfy an exact-host
+  requirement.
+  
+  `requiredRules` also rejects an earlier hostname-applicable, non-catch-all
+  path regex that already matches a later required route's concrete path —
+  cloudflared stops at the first ingress rule that matches, so a broader
+  earlier pattern (e.g. `^/api(/.*)?$` ahead of `^/api/webhook$`) shadows the
+  more specific rule below it even though neither is a catch-all. This check
+  is deliberately conservative: it only fires when the required path is an
+  anchored, slash-prefixed literal made only of letters, digits, `/`, `_`, and
+  `-` that safely reduces to one concrete request path,
+  and the earlier rule's pattern compiles as valid regex — a malformed
+  earlier regex or a non-literal required path both back off without
+  guessing at regex equivalence.
+- Automatically resume an interrupted "stopped"-phase release deploy from the durable host journal
+  Release-layout deploys now resume the previous release from a journaled
+  `stopped` phase before beginning new work. That journal is written the moment
+  the stop phase begins, so it only proves no migration or symlink flip had
+  started — not that writers were actually confirmed stopped. Either way,
+  resuming the unchanged previous release is safe: deploy-kit validates the
+  journaled release id and the live `current` pointer, then resumes and
+  re-verifies the previous release.
+  
+  An interrupted `migrated` or `flipped` journal is NOT auto-recovered, for two
+  different reasons. Once the pre-migration backup has been taken (`migrated`,
+  or `flipped` with `migrated: true`), deploy-kit cannot prove no writes landed
+  after that snapshot — a service manager (e.g. PM2 resurrect) or an operator may
+  have already brought the old app back online. A code-only `flipped` journal
+  (no backup) has no post-backup writes to worry about, but still fails closed
+  because the on-disk `current`/`previous` pointers can't be trusted against
+  whatever is actually running without re-deriving that state by hand. Either
+  way it fails closed with `MANUAL RECOVERY REQUIRED` instead of restoring the
+  backup, rewriting the `current`/`previous` symlinks, stopping apps, or
+  restarting PM2. The operator reconciles the database/schema and the `current`
+  pointer by hand, then marks the journal `done` (or removes it) before
+  deploying again.
+
 ## 0.25.1
 
 - Release-layout activation now retries the running-revision probe across transient startup races instead of rolling back a healthy deployment after one stale response.
