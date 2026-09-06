@@ -1,6 +1,6 @@
 {
   "name": "@andrewpopov/deploy-kit",
-  "version": "0.25.1",
+  "version": "0.26.0",
   "description": "Hook-driven SSH/local deploy pipeline + remote PM2 ops CLI + Cloudflare tunnel launcher",
   "author": "Andrew Popov",
   "main": "src/index.js",
@@ -27,7 +27,7 @@
   "license": "MIT",
   "scripts": {
     "lint": "eslint .",
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers=2",
     "verify:pack": "node scripts/verify-pack.mjs",
     "verify:types": "tsc --noEmit -p tsconfig.types.json",
     "verify": "npm run lint && npm run verify:types && npm test && npm run verify:pack && npm run verify:bins && npm run release:check",
