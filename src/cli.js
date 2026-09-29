@@ -16,12 +16,13 @@ const { clearPendingReleasePointer, PENDING_RELEASE_PATH } = require('./auto-cut
 const { DEFAULT_GUARD_CONFIG, loadGuardConfig } = require('./guard-config');
 const { verifyTunnelConfig } = require('./tunnel-config-guard');
 const { verifyNoSecrets } = require('./secret-file-guard');
+const { assertShaOptions } = require('./sha-options');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
   '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
-  '--dir', '--json', '--local', '--branch', '--no-auto-cut', '--guard-config',
+  '--dir', '--json', '--local', '--branch', '--no-auto-cut', '--guard-config', '--sha',
 ];
 
 // Flags that take a following positional value. Kept in sync with the arity
@@ -31,7 +32,7 @@ const KNOWN_FLAGS = [
 // a used flag; parseOptions consumes it as --service's value).
 const VALUE_FLAGS = new Set([
   '--lines', '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env', '--dir', '--branch',
-  '--guard-config',
+  '--guard-config', '--sha',
 ]);
 
 // The set of flags each command actually reads. KNOWN_FLAGS above is only
@@ -49,7 +50,7 @@ const COMMAND_FLAGS = {
   'verify-tunnel-config': ['--dir', '--guard-config', '--json'],
   'verify-no-secrets': ['--dir', '--guard-config', '--json'],
   'clear-pending-release': ['--dir', '--json'],
-  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut'],
+  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut', '--sha'],
   rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock'],
   monitor: ['--steal-lock', '--no-lock', '--local'],
   status: [],
@@ -127,6 +128,13 @@ function parseOptions(args) {
     else if (a === '--api-key-env' && args[i + 1]) { options.apiKeyEnv = args[i + 1]; i += 1; }
     else if (a === '--dir' && args[i + 1]) { options.dir = args[i + 1]; i += 1; }
     else if (a === '--branch' && args[i + 1]) { options.branch = args[i + 1]; i += 1; }
+    else if (a === '--sha' && args[i + 1]) {
+      // Format-checked by the SAME helper deploy()/deployRelease() call --
+      // one regex, not two that can drift (PKG-164 review finding 6).
+      assertShaOptions({ sha: args[i + 1] });
+      options.sha = args[i + 1];
+      i += 1;
+    }
     else if (a === '--guard-config' && args[i + 1]) { options.guardConfig = args[i + 1]; i += 1; }
     else if (a === '--json') { options.json = true; }
     else if (a === '--local') { options.local = true; }
@@ -192,11 +200,25 @@ Commands:
                                             takes no flags
   deploy [--skip-build|--skip-deps|--skip-migrate|--skip-pin-check]
          [--no-stash] [--dry-run] [--steal-lock] [--no-lock] [--branch NAME]
+         [--sha <40-hex-sha>] [--no-auto-cut]
                                             --skip-pin-check disables the post-install
                                             check that the installed tree matches what
                                             package.json pins. It is the escape hatch for
                                             a target you knowingly cannot fix right now —
                                             not a way to make a red deploy green.
+                                            --sha deploys EXACTLY that commit (must be a
+                                            full 40-char lowercase hex SHA, already merged
+                                            onto the deploy branch, and not behind the
+                                            target's current HEAD -- use "deploy-kit
+                                            rollback" to go backward) instead of the
+                                            branch tip a plain pull would resolve.
+                                            Mutually exclusive with --branch. Rejected
+                                            whenever a release-kit config is present and
+                                            auto-cut isn't disabled -- regardless of
+                                            whether there is anything to cut -- pass
+                                            --no-auto-cut alongside --sha to deploy an
+                                            explicit commit on a repo that also has
+                                            auto-cut enabled.
   rollback [--skip-build|--skip-deps] [--dry-run] [--steal-lock] [--no-lock]
                                             (NOT --skip-migrate or --no-stash — rollback
                                             never reads them)
@@ -215,23 +237,41 @@ Commands:
 // but executes none of them — including calls marked readOnly. Captured values
 // are symbolic yet internally consistent, so release-layout planning reaches
 // every phase without needing SSH, a migrated host, PM2, or a real repository.
-function dryRunContext(config) {
-  const sha = 'd'.repeat(40);
+function dryRunContext(config, options = {}) {
+  // `--sha` names the EXACT commit this run must plan against -- every SHA
+  // the planner fabricates below (HEAD after the worktree add/merge, a
+  // configured `runningShaCommand`, the resolved remote/heads rev-parse) must
+  // be THIS one, or the release layout's own `builtSha !== st.sha` validation
+  // (release.js) fails a `--sha --dry-run` on fabricated data that was never
+  // internally consistent with the SHA the operator actually asked to plan.
+  // Without `--sha`, unchanged: the fixed placeholder 'd'.repeat(40).
+  const sha = options.sha || 'd'.repeat(40);
   const timestamp = '20990101T000000Z';
   const releaseId = `${sha.slice(0, 12)}-${timestamp}`;
   const candidateDir = `${config.projectDir}/releases/${releaseId}`;
   const currentTarget = 'releases/111111111111-20981231T000000Z';
   const previousTarget = 'releases/222222222222-20981230T000000Z';
   let appsStopped = false;
+  // Tracks the target's planned HEAD across a `--sha`/auto-cut fast-forward
+  // (`git merge --ff-only 'R'`) -- deploy.js reads `git rev-parse HEAD` right
+  // after that merge and asserts it equals R exactly. Only `--sha` can ever
+  // reach this under `--dry-run` (auto-cut's own dry-run branch returns
+  // before producing an R for this planner to model at all), so this only
+  // needs to track ONE fast-forward per run, never a chain of them.
+  let headSha = sha;
   const plannedOutput = (rendered) => {
     if (rendered.includes('.deploy-kit-layout')) return '{"layout":"releases","version":1}';
     if (rendered.includes('.deploy-kit-state.json') && rendered.includes('cat ')) return '';
     if (rendered.includes('mv --version')) return 'mv (GNU coreutils) 9.0';
     if (rendered.includes('df -kP')) return '99999999';
     if (rendered.includes('rev-parse --abbrev-ref')) return config.branch || 'master';
+    // Only reached under `--sha --dry-run` (auto-cut's own dry-run branch
+    // returns before ever producing an R for this planner to model) -- the
+    // target is symbolically "on the deploy branch" for planning purposes.
+    if (rendered.includes('symbolic-ref -q --short HEAD')) return config.branch || 'master';
     if (rendered.includes('rev-parse refs/heads/') || rendered.includes(`rev-parse '${config.remote}'/`)) return sha;
     if (rendered.includes('date -u +%Y%m%dT%H%M%SZ')) return timestamp;
-    if (rendered.includes('git rev-parse HEAD')) return sha;
+    if (rendered.includes('git rev-parse HEAD')) return headSha;
     if (rendered.includes(`readlink ${config.projectDir}/current`)) return currentTarget;
     if (rendered.includes(`readlink ${config.projectDir}/previous`)) return previousTarget;
     if (rendered.includes('readlink -f /proc/')) return candidateDir;
@@ -256,6 +296,8 @@ function dryRunContext(config) {
     log.step(`[dry-run] ${rendered}`);
     if (rendered.includes('pm2 stop ')) appsStopped = true;
     if (/pm2 (startOrRestart|start|restart) /.test(rendered)) appsStopped = false;
+    const mergeMatch = rendered.match(/git merge --ff-only '([0-9a-f]{7,64})'/);
+    if (mergeMatch) headSha = mergeMatch[1];
     return plannedOutput(rendered);
   };
   return {
@@ -339,6 +381,20 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   if (flagError) {
     log.error(flagError);
     return 1;
+  }
+
+  // --sha names an exact commit; --branch names an override branch tip. Both
+  // together is ambiguous about what the operator actually wants deployed --
+  // reject before any side effect, same as every other rejection above. The
+  // SAME helper deploy()/deployRelease() call at their own entry point, so
+  // there is one exclusivity rule, not two (PKG-164 review finding 6).
+  if (command === 'deploy') {
+    try {
+      assertShaOptions(options);
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
   }
 
   // Surface the resolved version: a stale node_modules (manifest pinned newer
@@ -536,7 +592,7 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
         // (see auto-cut.js), which is wrong for anything invoking the CLI
         // programmatically (or under test) from a different working directory
         // than `cwd`.
-        deploy(config, { ...options, projectRoot: cwd }, options.dryRun ? dryRunContext(config) : {});
+        deploy(config, { ...options, projectRoot: cwd }, options.dryRun ? dryRunContext(config, options) : {});
         return 0;
       } catch (error) {
         log.error(error instanceof Error ? error.message : String(error));

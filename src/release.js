@@ -9,6 +9,7 @@ const { buildPinCheckProgram, PIN_CHECK_COMMAND } = require('./pin-gate');
 const { parsePm2List } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
 const { clearAutoCutPending } = require('./auto-cut');
+const { assertShaOptions } = require('./sha-options');
 
 // Bump when the on-host layout changes shape. The host migration writes this
 // version into .deploy-kit-layout; a release deploy refuses a host whose marker
@@ -357,6 +358,11 @@ function readInterruptedDeploy(config, paths, ctx) {
 // every phase records enough state that recover() can restore a known-good running
 // release, and the ONLY disruptive window is stop → backup → migrate → flip.
 function deployRelease(config, options = {}, ctx = {}) {
+  // `--sha`'s format and its exclusivity with `--branch` -- checked here too,
+  // before ANYTHING else: `deployRelease()` is itself exported and callable
+  // directly (not just via deploy()'s layout delegation), so the CLI's
+  // parse-time checks are not the only way in (PKG-164 review finding 6).
+  assertShaOptions(options);
   const log = ctx.log || defaultLog;
   const sleep = ctx.sleep || defaultSleep;
   const c = { ...ctx, log, sleep, runtime: ctx.runtime };
@@ -699,7 +705,18 @@ function deployRelease(config, options = {}, ctx = {}) {
     R = autoCutResult.ran ? autoCutResult.sha : null;
     if (R) {
       log.info(`auto-cut: deploying release ${autoCutResult.version} (${R.slice(0, 12)}, PR #${autoCutResult.prNumber})`);
+    } else if (options.sha) {
+      // `--sha`: an operator-supplied exact commit, taking over from the
+      // branch tip exactly the way auto-cut's `R` does below -- see the
+      // matching comment in deploy.js for why runAutoCutPreflight above has
+      // already thrown if auto-cut is configured and would actually run.
+      R = options.sha;
+      log.info(`--sha: deploying ${R.slice(0, 12)} exactly`);
     }
+    // See the matching comment in deploy.js -- strict either/or provenance,
+    // never a guess.
+    const rFromAutoCut = R != null && autoCutResult.ran;
+    const rLabel = rFromAutoCut ? 'auto-cut release' : 'the --sha commit';
 
     const pointers = readPointers(config, paths, c);
     // A present current pointer must always be a valid release target (a corrupt
@@ -739,9 +756,27 @@ function deployRelease(config, options = {}, ctx = {}) {
       const haveR = runInDir(paths.root, `git --git-dir=${paths.repoGit} cat-file -e ${shQuote(`${R}^{commit}`)}`, config, c, { tolerate: true });
       if (!haveR.ok) {
         throw new Error(
-          `Deploy aborted: fetched ${config.remote} into ${paths.repoGit} for auto-cut release ${R.slice(0, 12)}, `
+          `Deploy aborted: fetched ${config.remote} into ${paths.repoGit} for ${rLabel} ${R.slice(0, 12)}, `
           + `but \`git cat-file -e ${R}^{commit}\` still fails -- the commit is not actually present there. `
           + 'Refusing to materialize a release from a commit the bare repo does not have.',
+        );
+      }
+      // Merged-only guard: R must be an ancestor of the deploy branch's own
+      // tip. `refs/heads/<branch>` was already force-updated by the fetch
+      // above, so no extra fetch is needed here. Auto-cut's R always
+      // satisfies this by construction -- this only ever fires for a
+      // manually-supplied `--sha` naming a commit that is unmerged, on a
+      // different branch, or simply doesn't exist on the remote.
+      const mergedRes = runInDir(
+        paths.root,
+        `git --git-dir=${paths.repoGit} merge-base --is-ancestor ${shQuote(R)} refs/heads/${shQuote(branch)}`,
+        config, c, { tolerate: true },
+      );
+      if (!mergedRes.ok) {
+        throw new Error(
+          `Deploy aborted: release ${R.slice(0, 12)} is NOT an ancestor of refs/heads/${branch} in ${paths.repoGit} `
+          + `-- refusing to deploy a commit that is not merged onto "${branch}". Merge it first, or check --sha `
+          + 'for a typo.',
         );
       }
     } else {

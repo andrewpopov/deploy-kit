@@ -13,6 +13,7 @@ const { resolveBranch } = require('./branch');
 const { onlineAppNames } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
 const { clearAutoCutPending } = require('./auto-cut');
+const { assertShaOptions } = require('./sha-options');
 
 function defaultSleep(seconds) {
   const ms = seconds * 1000;
@@ -153,6 +154,11 @@ function gate(step, config, ctx, { onFail, capture = false } = {}) {
 //   install → BACKUP(gate) → stop db-bound apps (release SQLite lock) →
 //   migrate(gate, restart on fail) → build → restart apps → health(gate)
 function deploy(config, options = {}, ctx = {}) {
+  // `--sha`'s format and its exclusivity with `--branch` -- checked here,
+  // before ANYTHING else (including the release-layout delegation below),
+  // because `deploy()` is itself an exported, programmatic entry point: the
+  // CLI's parse-time checks are not the only way in (PKG-164 review finding 6).
+  assertShaOptions(options);
   // Artifact-first release layout (SMH-112) is a separate pipeline. Lazy-require to
   // avoid a top-level cycle (release.js pulls shared helpers, not this module).
   if (config.layout && config.layout.type === 'releases') {
@@ -307,8 +313,25 @@ function deploy(config, options = {}, ctx = {}) {
     R = autoCutResult.ran ? autoCutResult.sha : null;
     if (R) {
       log.info(`auto-cut: deploying release ${autoCutResult.version} (${R.slice(0, 12)}, PR #${autoCutResult.prNumber})`);
+    } else if (options.sha) {
+      // `--sha`: an operator-supplied exact commit, taking over from the
+      // branch tip exactly the way auto-cut's `R` does below -- runAutoCutPreflight
+      // above has already thrown if auto-cut is configured and would actually
+      // run (see auto-cut.js's own `options.sha` guard), so reaching here means
+      // either auto-cut isn't configured at all or `--no-auto-cut` disabled it.
+      R = options.sha;
+      log.info(`--sha: deploying ${R.slice(0, 12)} exactly`);
     }
 
+    // Every message below that names R must say where R actually came from --
+    // auto-cut's own guard already refuses to let both apply to the same run
+    // (see auto-cut.js), so this is a strict either/or, never a guess.
+    // `--no-auto-cut` is only ever a meaningful escape hatch when auto-cut is
+    // what produced R; suggesting it on a `--sha` failure would send an
+    // operator chasing a flag that was never in play.
+    const rFromAutoCut = R != null && autoCutResult.ran;
+    const rLabel = rFromAutoCut ? 'auto-cut release' : 'the --sha commit';
+    const autoCutHint = rFromAutoCut ? ' or pass --no-auto-cut' : '';
     // Auto-cut produced an immutable release `R` that this deploy must bring
     // the target to EXACTLY -- never the branch tip, and never silently follow
     // whatever `git pull` would otherwise resolve. Assert the target is in a
@@ -322,17 +345,16 @@ function deploy(config, options = {}, ctx = {}) {
       const currentBranch = (headStateRes.output || '').trim();
       if (!headStateRes.ok || !currentBranch) {
         throw new Error(
-          `Deploy aborted: auto-cut produced release ${R.slice(0, 12)}, but the target checkout at `
-          + `${config.projectDir} has a detached HEAD. auto-cut requires the target to be on branch `
-          + `"${branch}" so it can be fast-forwarded to the release; check out "${branch}" on the target, `
-          + 'or pass --no-auto-cut.',
+          `Deploy aborted: ${rLabel} is ${R.slice(0, 12)}, but the target checkout at `
+          + `${config.projectDir} has a detached HEAD. Deploying to an exact commit requires the target to be `
+          + `on branch "${branch}" so it can be fast-forwarded there; check out "${branch}" on the target${autoCutHint}.`,
         );
       }
       if (currentBranch !== branch) {
         throw new Error(
-          `Deploy aborted: auto-cut produced release ${R.slice(0, 12)}, but the target checkout at `
+          `Deploy aborted: ${rLabel} is ${R.slice(0, 12)}, but the target checkout at `
           + `${config.projectDir} is on branch "${currentBranch}", expected "${branch}". Check out `
-          + `"${branch}" on the target, or pass --no-auto-cut.`,
+          + `"${branch}" on the target${autoCutHint}.`,
         );
       }
     }
@@ -342,26 +364,31 @@ function deploy(config, options = {}, ctx = {}) {
       // that would break the tunnel and lose the key mid-deploy.
       run('Stashing local tracked changes', `git stash push -m "deploy-kit $(date -u +%FT%TZ)" || true`, { tolerate: true });
       steps.push('stash');
-      // Only under the auto-cut (`R`) path: the stash above is TOLERATED (its
-      // `|| true` makes `res.ok` true even when the stash itself failed), so a
-      // green step is not proof the working tree actually went clean --
-      // exactly the kind of unproven "should be fine" state the rest of this
-      // block refuses to build on. Untracked-but-ignored files are fine (same
-      // as the stash's own "tracked-only" contract above); a leftover
-      // TRACKED or staged change is not.
-      if (R) {
-        const postStashStatus = runOnTarget('git status --porcelain=v2 --ignore-submodules=none', config, { runtime, capture: true });
-        const trackedOrStaged = (postStashStatus.output || '')
-          .split('\n')
-          .filter((line) => line.startsWith('1') || line.startsWith('2') || line.startsWith('u'));
-        if (!postStashStatus.ok || trackedOrStaged.length) {
-          throw new Error(
-            `Deploy aborted: auto-cut release ${R.slice(0, 12)} requires a clean target checkout after `
-            + `stashing, but \`git status\` still reports tracked/staged change(s) at ${config.projectDir}: `
-            + `${trackedOrStaged.map((l) => l.trim()).join(', ') || '(status command itself failed)'}. `
-            + 'Resolve by hand on the target, then retry.',
-          );
-        }
+    }
+    // Clean-tree check runs whenever R is set, REGARDLESS of `stash` (PKG-164
+    // review finding 5) -- `stash` defaults to false in local mode and
+    // `--no-stash` disables it explicitly either way, so gating this check on
+    // `if (stash)` let a tracked local edit ship alongside R silently: every
+    // HEAD-equals-R assertion below only proves the COMMIT is right, never
+    // that the working tree matches it. When `stash` DID run, this also
+    // proves the (tolerated, `|| true`) stash actually left the tree clean --
+    // untracked-but-ignored files are fine (same as the stash's own
+    // "tracked-only" contract above); a leftover TRACKED or staged change is
+    // not.
+    if (R) {
+      const postStashStatus = runOnTarget('git status --porcelain=v2 --ignore-submodules=none', config, { runtime, capture: true });
+      const trackedOrStaged = (postStashStatus.output || '')
+        .split('\n')
+        .filter((line) => line.startsWith('1') || line.startsWith('2') || line.startsWith('u'));
+      if (!postStashStatus.ok || trackedOrStaged.length) {
+        throw new Error(
+          `Deploy aborted: deploying ${rLabel} ${R.slice(0, 12)} requires a clean target checkout, but `
+          + `\`git status\` still reports tracked/staged change(s) at ${config.projectDir}: `
+          + `${trackedOrStaged.map((l) => l.trim()).join(', ') || '(status command itself failed)'}. `
+          + (stash
+            ? 'Resolve by hand on the target, then retry.'
+            : 'Resolve by hand on the target (or drop --no-stash to let deploy-kit stash them), then retry.'),
+        );
       }
     }
 
@@ -423,13 +450,49 @@ function deploy(config, options = {}, ctx = {}) {
       // never the branch tip a plain `git pull` would resolve (a descendant
       // landing on the remote between the merge and this line must never be
       // silently followed).
-      run(`Fetching auto-cut release ${R.slice(0, 12)}`, `git fetch ${shQuote(config.remote)} ${shQuote(R)}`);
+      run(`Fetching ${rLabel} ${R.slice(0, 12)}`, `git fetch ${shQuote(config.remote)} ${shQuote(R)}`);
       const haveR = runOnTarget(`git cat-file -e ${shQuote(`${R}^{commit}`)}`, config, { runtime });
       if (!haveR.ok) {
         throw new Error(
-          `Deploy aborted: fetched ${config.remote} for auto-cut release ${R.slice(0, 12)}, but \`git cat-file `
+          `Deploy aborted: fetched ${config.remote} for ${rLabel} ${R.slice(0, 12)}, but \`git cat-file `
           + `-e ${R}^{commit}\` still fails on the target at ${config.projectDir} -- the commit is not actually `
           + 'present there. Refusing to merge to a commit the target does not have.',
+        );
+      }
+
+      // Merged-only guard: R must be an ancestor of the deploy branch's own
+      // tip. Auto-cut's R always satisfies this by construction (it comes
+      // from a squash-merged PR onto config.branch) -- this only ever fires
+      // for a manually-supplied `--sha` naming a commit that is unmerged, on
+      // a different branch, or simply doesn't exist on the remote.
+      // An EXPLICIT refspec, not a plain `git fetch <remote> <branch>` -- the
+      // plain form only updates `refs/remotes/<remote>/<branch>` if the
+      // target's configured `remote.<name>.fetch` happens to map heads there
+      // (the ordinary clone default, but not guaranteed). A non-default or
+      // narrowed fetch refspec leaves that tracking ref stale or entirely
+      // missing, so the rev-parse right below would read a wrong or absent
+      // SHA -- and this fires on the auto-cut path too, AFTER the release PR
+      // is already merged. The explicit destination makes this one fetch
+      // authoritative regardless of what's configured (same idiom release.js
+      // uses for its own heads:heads mirror fetch).
+      run(
+        `Fetching ${branch} to verify release ${R.slice(0, 12)} is merged`,
+        `git fetch ${shQuote(config.remote)} ${shQuote(`+refs/heads/${branch}:refs/remotes/${config.remote}/${branch}`)}`,
+      );
+      const branchTipRes = runOnTarget(`git rev-parse ${shQuote(config.remote)}/${shQuote(branch)}`, config, { runtime, capture: true });
+      const branchTip = (branchTipRes.output || '').trim();
+      if (!branchTipRes.ok || !branchTip) {
+        throw new Error(
+          `Deploy aborted: could not resolve ${config.remote}/${branch} to a SHA at ${config.projectDir} after `
+          + `fetching "${branch}", to verify release ${R.slice(0, 12)} is merged.`,
+        );
+      }
+      const mergedRes = runOnTarget(`git merge-base --is-ancestor ${shQuote(R)} ${shQuote(branchTip)}`, config, { runtime });
+      if (!mergedRes.ok) {
+        throw new Error(
+          `Deploy aborted: release ${R.slice(0, 12)} is NOT an ancestor of ${config.remote}/${branch} `
+          + `(${branchTip.slice(0, 12)}) at ${config.projectDir} -- refusing to deploy a commit that is not `
+          + `merged onto "${branch}". Merge it first, or check --sha for a typo.`,
         );
       }
 
@@ -439,13 +502,13 @@ function deploy(config, options = {}, ctx = {}) {
       if (!ancestorRes.ok) {
         throw new Error(
           `Deploy aborted: target HEAD (${preMergeHead.slice(0, 12)}) at ${config.projectDir} is NOT an `
-          + `ancestor of auto-cut release ${R.slice(0, 12)} -- the target may already be ahead of ${R.slice(0, 12)} `
+          + `ancestor of ${rLabel} ${R.slice(0, 12)} -- the target may already be ahead of ${R.slice(0, 12)} `
           + 'or have diverged onto unrelated history. Refusing to downgrade or force-merge a target that is '
           + 'already ahead of the release; investigate by hand.',
         );
       }
 
-      run(`Merging to auto-cut release ${R.slice(0, 12)} (--ff-only)`, `git merge --ff-only ${shQuote(R)}`);
+      run(`Merging to ${rLabel} ${R.slice(0, 12)} (--ff-only)`, `git merge --ff-only ${shQuote(R)}`);
       steps.push(`merge:${R}`);
 
       // HEAD-equals-R assertion #1 of 2: right after the fast-forward, before
@@ -454,7 +517,7 @@ function deploy(config, options = {}, ctx = {}) {
       const headAfterMerge = (headAfterMergeRes.output || '').trim();
       if (headAfterMerge !== R) {
         throw new Error(
-          `Deploy aborted: expected HEAD to equal auto-cut release ${R.slice(0, 12)} immediately after the `
+          `Deploy aborted: expected HEAD to equal ${rLabel} ${R.slice(0, 12)} immediately after the `
           + `fast-forward merge, but HEAD at ${config.projectDir} is ${headAfterMerge.slice(0, 12) || '(empty)'} `
           + '-- something mutated HEAD mid-deploy (a hook, or a concurrent process on the target). Aborting '
           + 'rather than proceeding on the wrong commit.',
@@ -660,7 +723,7 @@ function deploy(config, options = {}, ctx = {}) {
         // (safeStep): resume any dbBoundApps we paused before aborting.
         resumeDbApps();
         throw new Error(
-          `Deploy aborted: expected HEAD to still equal auto-cut release ${R.slice(0, 12)} immediately before `
+          `Deploy aborted: expected HEAD to still equal ${rLabel} ${R.slice(0, 12)} immediately before `
           + `activation, but HEAD at ${config.projectDir} is ${headBeforeActivate.slice(0, 12) || '(empty)'} `
           + '-- something mutated HEAD mid-deploy (a hook, or a concurrent process on the target, or a '
           + 'pre-restart check). Aborting rather than restarting onto the wrong commit.',
