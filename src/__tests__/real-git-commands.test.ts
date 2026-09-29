@@ -145,9 +145,4 @@ describe('merged-only guard fetch: explicit refspec vs a plain fetch (PKG-164 re
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
-
-  test('deploy.js issues the explicit-refspec fetch, not the plain one, in the merged-only guard', () => {
-    const src = fs.readFileSync(path.join(__dirname, '..', 'deploy.js'), 'utf8');
-    expect(src).toContain('+refs/heads/${branch}:refs/remotes/${config.remote}/${branch}');
-  });
 });

@@ -15,3 +15,8 @@ auto-cut isn't disabled — regardless of whether there is anything to cut —
 pass `--no-auto-cut` alongside it to deploy an explicit commit on a repo that
 also has auto-cut enabled. `--dry-run --sha <commit>` prints the SHA deploy
 path instead of the branch-pull path.
+
+Also, whenever a deploy targets an exact commit (`--sha`, or an auto-cut
+release), the tracked-changes check now runs even when stashing is off
+(local mode or `--no-stash`). Such a deploy aborts on a dirty tracked tree
+instead of building the commit together with the leftover edit.
