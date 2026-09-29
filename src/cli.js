@@ -16,6 +16,7 @@ const { clearPendingReleasePointer, PENDING_RELEASE_PATH } = require('./auto-cut
 const { DEFAULT_GUARD_CONFIG, loadGuardConfig } = require('./guard-config');
 const { verifyTunnelConfig } = require('./tunnel-config-guard');
 const { verifyNoSecrets } = require('./secret-file-guard');
+const { assertShaOptions } = require('./sha-options');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
@@ -99,14 +100,6 @@ function validateCommandFlags(command, args) {
 
 const PORT_RE = /^[0-9]+$/;
 
-// `--sha` must be the FULL, unabbreviated 40-char hex SHA-1 -- an abbreviated
-// SHA is exactly the ambiguity this flag exists to remove (a short prefix can
-// become ambiguous, or resolve to a different object, as the repo grows).
-// Uppercase hex is valid git object-id syntax but never what `git rev-parse`
-// itself emits, so rejecting it here catches a copy-paste from a source that
-// normalizes case, rather than silently accepting it.
-const FULL_SHA_RE = /^[0-9a-f]{40}$/;
-
 // Reject anything we do not recognise. Silently ignoring an unknown flag is
 // dangerous precisely for the flag an operator reaches for when being careful:
 // a typo'd `--dry-rn`, or `--dry-run` passed to a version that predates it,
@@ -136,15 +129,10 @@ function parseOptions(args) {
     else if (a === '--dir' && args[i + 1]) { options.dir = args[i + 1]; i += 1; }
     else if (a === '--branch' && args[i + 1]) { options.branch = args[i + 1]; i += 1; }
     else if (a === '--sha' && args[i + 1]) {
-      const value = args[i + 1];
-      if (!FULL_SHA_RE.test(value)) {
-        throw new Error(
-          `Invalid --sha "${value}": must be exactly 40 lowercase hex characters (a full, unabbreviated git `
-          + 'commit SHA-1). Abbreviated, uppercase, or non-hex values are rejected -- ambiguity here is exactly '
-          + 'what --sha exists to remove.',
-        );
-      }
-      options.sha = value;
+      // Format-checked by the SAME helper deploy()/deployRelease() call --
+      // one regex, not two that can drift (PKG-164 review finding 6).
+      assertShaOptions({ sha: args[i + 1] });
+      options.sha = args[i + 1];
       i += 1;
     }
     else if (a === '--guard-config' && args[i + 1]) { options.guardConfig = args[i + 1]; i += 1; }
@@ -219,11 +207,15 @@ Commands:
                                             a target you knowingly cannot fix right now —
                                             not a way to make a red deploy green.
                                             --sha deploys EXACTLY that commit (must be a
-                                            full 40-char lowercase hex SHA, and already
-                                            merged onto the deploy branch) instead of the
+                                            full 40-char lowercase hex SHA, already merged
+                                            onto the deploy branch, and not behind the
+                                            target's current HEAD -- use "deploy-kit
+                                            rollback" to go backward) instead of the
                                             branch tip a plain pull would resolve.
-                                            Mutually exclusive with --branch. Aborts if
-                                            auto-cut is configured and would run — pass
+                                            Mutually exclusive with --branch. Rejected
+                                            whenever a release-kit config is present and
+                                            auto-cut isn't disabled -- regardless of
+                                            whether there is anything to cut -- pass
                                             --no-auto-cut alongside --sha to deploy an
                                             explicit commit on a repo that also has
                                             auto-cut enabled.
@@ -245,8 +237,15 @@ Commands:
 // but executes none of them — including calls marked readOnly. Captured values
 // are symbolic yet internally consistent, so release-layout planning reaches
 // every phase without needing SSH, a migrated host, PM2, or a real repository.
-function dryRunContext(config) {
-  const sha = 'd'.repeat(40);
+function dryRunContext(config, options = {}) {
+  // `--sha` names the EXACT commit this run must plan against -- every SHA
+  // the planner fabricates below (HEAD after the worktree add/merge, a
+  // configured `runningShaCommand`, the resolved remote/heads rev-parse) must
+  // be THIS one, or the release layout's own `builtSha !== st.sha` validation
+  // (release.js) fails a `--sha --dry-run` on fabricated data that was never
+  // internally consistent with the SHA the operator actually asked to plan.
+  // Without `--sha`, unchanged: the fixed placeholder 'd'.repeat(40).
+  const sha = options.sha || 'd'.repeat(40);
   const timestamp = '20990101T000000Z';
   const releaseId = `${sha.slice(0, 12)}-${timestamp}`;
   const candidateDir = `${config.projectDir}/releases/${releaseId}`;
@@ -386,10 +385,16 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
 
   // --sha names an exact commit; --branch names an override branch tip. Both
   // together is ambiguous about what the operator actually wants deployed --
-  // reject before any side effect, same as every other rejection above.
-  if (command === 'deploy' && options.sha && options.branch) {
-    log.error('deploy: --sha and --branch are mutually exclusive -- pass at most one');
-    return 1;
+  // reject before any side effect, same as every other rejection above. The
+  // SAME helper deploy()/deployRelease() call at their own entry point, so
+  // there is one exclusivity rule, not two (PKG-164 review finding 6).
+  if (command === 'deploy') {
+    try {
+      assertShaOptions(options);
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
   }
 
   // Surface the resolved version: a stale node_modules (manifest pinned newer
@@ -587,7 +592,7 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
         // (see auto-cut.js), which is wrong for anything invoking the CLI
         // programmatically (or under test) from a different working directory
         // than `cwd`.
-        deploy(config, { ...options, projectRoot: cwd }, options.dryRun ? dryRunContext(config) : {});
+        deploy(config, { ...options, projectRoot: cwd }, options.dryRun ? dryRunContext(config, options) : {});
         return 0;
       } catch (error) {
         log.error(error instanceof Error ? error.message : String(error));

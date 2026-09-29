@@ -196,14 +196,18 @@ export interface DeployOptions {
   buildBeforeMigrate?: boolean;
   /** `--skip-pin-check`. Overrides the config's `verifyPins`. */
   verifyPins?: boolean;
-  /** `--branch`: override `config.branch` for this run. Rejected outright if
-   * auto-cut is configured and would run — see `AutoCutOptions.branch`. */
+  /** `--branch`: override `config.branch` for this run. Rejected outright
+   * whenever a release-kit config is present and auto-cut isn't disabled
+   * (`autoCut: false` / `--no-auto-cut`) — regardless of whether there is
+   * anything to cut. See `AutoCutOptions.branch`. */
   branch?: string;
   /** `--sha`: deploy EXACTLY this commit (a full 40-char lowercase hex
    * SHA-1) instead of the branch tip a plain pull would resolve. Must already
    * be an ancestor of the deploy branch's tip — deploy() aborts otherwise.
-   * Mutually exclusive with `branch`. Rejected outright if auto-cut is
-   * configured and would run — see `AutoCutOptions.sha`. */
+   * Mutually exclusive with `branch`. Rejected outright whenever a
+   * release-kit config is present and auto-cut isn't disabled (`autoCut:
+   * false` / `--no-auto-cut`) — regardless of whether there is anything to
+   * cut. See `AutoCutOptions.sha`. */
   sha?: string;
   /** `--no-auto-cut` (`false`). See `AutoCutOptions.autoCut`. */
   autoCut?: boolean;
@@ -638,11 +642,14 @@ export interface AutoCutOptions {
   /** `false` always wins over a present release-kit config (skip auto-cut
    * entirely for this run), overriding `config.autoCut`. */
   autoCut?: boolean;
-  /** A `--branch` override in play — always aborts; auto-cut only ever
-   * targets `config.branch` on the remote's actual default branch. */
+  /** A `--branch` override in play — rejected whenever a release-kit config
+   * is present and auto-cut isn't disabled (`autoCut: false`), regardless of
+   * whether there is anything to cut; auto-cut only ever targets
+   * `config.branch` on the remote's actual default branch. */
   branch?: string;
-  /** A `--sha` override in play — always aborts, same as `branch` above; an
-   * operator supplying `--sha` wants exactly that commit deployed, never a
+  /** A `--sha` override in play — rejected the same way `branch` above is:
+   * whenever a release-kit config is present and auto-cut isn't disabled.
+   * An operator supplying `--sha` wants exactly that commit deployed, never a
    * fresh release auto-cut would cut and merge on top of it. Pass
    * `autoCut: false` alongside `sha` to deploy an explicit commit on a repo
    * that also has auto-cut enabled. */

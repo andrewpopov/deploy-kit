@@ -83,3 +83,71 @@ describe('remote push URL -> owner/repo', () => {
     expect(src).toContain('[:/]([^/\\s:]+)\\/([^/\\s]+?)(?:\\.git)?$');
   });
 });
+
+/**
+ * PKG-164 review finding 2: deploy.js's merged-only guard fetches the deploy
+ * branch with a PLAIN `git fetch <remote> <branch>` and then trusts whatever
+ * `git rev-parse <remote>/<branch>` reads back. That silently reads a STALE
+ * tracking ref (not an error -- `fetch` still exits 0) whenever the target's
+ * configured `remote.<name>.fetch` refspec doesn't map heads to
+ * `refs/remotes/<remote>/*` the ordinary-clone way. An explicit destination
+ * refspec (`+refs/heads/<branch>:refs/remotes/<remote>/<branch>`) is
+ * authoritative regardless of what's configured -- this proves both halves
+ * against a REAL git, on a REAL stale-refspec target, not a fake runtime that
+ * would accept either command string as equally valid.
+ */
+describe('merged-only guard fetch: explicit refspec vs a plain fetch (PKG-164 review finding 2)', () => {
+  function makeStaleRefspecTarget() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deploy-kit-realgit-refspec-'));
+    const originDir = path.join(root, 'origin');
+    const targetDir = path.join(root, 'target');
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'test',
+      GIT_AUTHOR_EMAIL: 'test@example.invalid',
+      GIT_COMMITTER_NAME: 'test',
+      GIT_COMMITTER_EMAIL: 'test@example.invalid',
+    };
+    execFileSync('git', ['init', '-q', '-b', 'master', originDir], { encoding: 'utf8' });
+    execFileSync('git', ['-C', originDir, 'commit', '-q', '--allow-empty', '-m', 'init'], { encoding: 'utf8', env });
+    execFileSync('git', ['clone', '-q', originDir, targetDir], { encoding: 'utf8' });
+    // Break the fetch refspec the way a target with a non-default clone/mirror
+    // setup would have -- a plain `fetch origin master` afterward still exits
+    // 0, but no longer touches refs/remotes/origin/master at all.
+    execFileSync('git', ['-C', targetDir, 'config', '--unset-all', 'remote.origin.fetch'], { encoding: 'utf8' });
+    execFileSync('git', ['-C', targetDir, 'config', 'remote.origin.fetch',
+      '+refs/heads/nonexistent/*:refs/remotes/origin/nonexistent/*'], { encoding: 'utf8' });
+    // Advance origin's master AFTER the target's stale tracking ref was set up
+    // -- the exact "release PR already merged" ordering the finding describes.
+    execFileSync('git', ['-C', originDir, 'commit', '-q', '--allow-empty', '-m', 'second'], { encoding: 'utf8', env });
+    const newSha = execFileSync('git', ['-C', originDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    return { root, targetDir, newSha };
+  }
+
+  test('a plain `git fetch <remote> <branch>` leaves origin/master STALE under a non-default refspec', () => {
+    const { root, targetDir, newSha } = makeStaleRefspecTarget();
+    try {
+      execFileSync('sh', ['-c', "git fetch 'origin' 'master'"], { cwd: targetDir, encoding: 'utf8' });
+      const tip = execFileSync('sh', ['-c', "git rev-parse 'origin'/'master'"], { cwd: targetDir, encoding: 'utf8' }).trim();
+      expect(tip).not.toBe(newSha); // stale -- exactly the bug this finding fixes
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('the explicit refspec fetch deploy.js now issues resolves the CURRENT tip, real git, real stale refspec', () => {
+    const { root, targetDir, newSha } = makeStaleRefspecTarget();
+    try {
+      execFileSync('sh', ['-c', "git fetch 'origin' '+refs/heads/master:refs/remotes/origin/master'"], { cwd: targetDir, encoding: 'utf8' });
+      const tip = execFileSync('sh', ['-c', "git rev-parse 'origin'/'master'"], { cwd: targetDir, encoding: 'utf8' }).trim();
+      expect(tip).toBe(newSha);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('deploy.js issues the explicit-refspec fetch, not the plain one, in the merged-only guard', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'deploy.js'), 'utf8');
+    expect(src).toContain('+refs/heads/${branch}:refs/remotes/${config.remote}/${branch}');
+  });
+});

@@ -257,6 +257,28 @@ describe('PKG-164: deploy --sha', () => {
     });
   });
 
+  it('PKG-164 review finding 1: release layout --dry-run --sha exits 0 and shows the SHA path (not the classic pull path)', () => {
+    withConfig({
+      host: 'nobody@unreachable.invalid', projectDir: '/srv/plan-only', mode: 'ssh', branch: 'main',
+      appNames: ['plan-app'], dbBoundApps: ['plan-app'], ecosystemFile: 'shared/ecosystem.config.cjs',
+      layout: {
+        type: 'releases', sharedPaths: ['.env'],
+        releaseChecks: [{ name: 'entrypoint', command: 'test -f dist/server.js' }],
+        runningShaCommand: 'read-running-sha',
+      },
+      hooks: { install: 'install-deps', backup: 'backup-db', migrate: 'migrate-db', build: 'build-app', restore: 'restore-db' },
+    }, (dir) => {
+      const cap = captureLog();
+      const code = cli.run(['deploy', '--sha', FULL_SHA, '--dry-run'], { cwd: dir, env: {} });
+      const out = cap.out();
+      cap.restore();
+      expect(code).toBe(0);
+      expect(out).toContain(`worktree add --detach /srv/plan-only/releases/${FULL_SHA.slice(0, 12)}`);
+      expect(out).toContain(FULL_SHA);
+      expect(out).not.toMatch(/Candidate SHA .* != resolved/);
+    });
+  });
+
   it('rejects --sha without a value instead of deploying the branch tip', () => {
     expect(() => cli.parseOptions(['--sha'])).toThrow(/Unknown argument: --sha/);
   });

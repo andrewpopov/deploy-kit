@@ -167,8 +167,9 @@ function makeTargetHandler(over: TargetOverrides = {}) {
     if (cmd === 'git symbolic-ref -q --short HEAD') return `${currentBranch}\n`;
     if (cmd.startsWith('git fetch') && cmd.includes(MERGE_SHA)) return '';
     // Merged-only guard's own branch-tip fetch/resolve, separate from the
-    // fetch of R itself above.
-    if (cmd === `git fetch '${REMOTE}' '${BRANCH}'`) return '';
+    // fetch of R itself above -- an explicit refspec, not a plain
+    // `fetch <remote> <branch>` (PKG-164 review finding 2).
+    if (cmd === `git fetch '${REMOTE}' '+refs/heads/${BRANCH}:refs/remotes/${REMOTE}/${BRANCH}'`) return '';
     if (cmd === `git rev-parse '${REMOTE}'/'${BRANCH}'`) return `${BASE_TIP}\n`;
     if (cmd.startsWith('git cat-file -e')) {
       if (!rExists) { const e: any = new Error('no commit'); e.stdout = ''; e.status = 1; throw e; }
@@ -264,6 +265,14 @@ describe('deploy() + auto-cut: deploy-by-SHA', () => {
     expect(calls.some((c) => c.includes(`git merge --ff-only '${MERGE_SHA}'`))).toBe(true);
     // Never a plain branch-tip pull once R is in play.
     expect(calls.some((c) => c.includes('git pull --ff-only'))).toBe(false);
+  });
+
+  it('PKG-164: the merged-only guard runs and PASSES on the auto-cut R path too (classic layout)', () => {
+    const { ctx, calls } = makeCombinedRuntime();
+    const result = deploy(legacyConfig(), { projectRoot: ROOT }, ctx);
+    expect(result.healthy).toBe(true);
+    expect(calls.some((c) => c.includes(`git fetch 'origin' '+refs/heads/${BRANCH}:refs/remotes/${REMOTE}/${BRANCH}'`))).toBe(true);
+    expect(calls.some((c) => c.includes(`git merge-base --is-ancestor '${MERGE_SHA}' '${BASE_TIP}'`))).toBe(true);
   });
 
   it('aborts by name when the target checkout has a detached HEAD', () => {
@@ -445,6 +454,45 @@ describe('deploy() + --sha (PKG-164): deploy-by-SHA without auto-cut', () => {
     expect(() => deploy(legacyConfig({ autoCut: false }), { sha: MERGE_SHA, projectRoot: ROOT }, ctx))
       .toThrow(/is NOT an ancestor of origin\/master/);
   });
+
+  it('PKG-164 review finding 6: deploy() validates --sha itself, before any runOnTarget (not just via the CLI)', () => {
+    const { ctx, calls } = makeCombinedRuntime();
+    expect(() => deploy(legacyConfig({ autoCut: false }), { sha: 'not-a-real-sha', projectRoot: ROOT }, ctx))
+      .toThrow(/Invalid --sha ".*must be exactly 40 lowercase hex/);
+    // Zero target/local commands ran at all -- the validation is the very
+    // first thing deploy() does, before acquireLock or anything else.
+    expect(calls.length).toBe(0);
+  });
+
+  it('PKG-164 review finding 6: deploy() rejects --sha + --branch together too, not just the CLI', () => {
+    const { ctx, calls } = makeCombinedRuntime();
+    expect(() => deploy(legacyConfig({ autoCut: false }), { sha: MERGE_SHA, branch: 'feature/x', projectRoot: ROOT }, ctx))
+      .toThrow(/--sha and --branch are mutually exclusive/);
+    expect(calls.length).toBe(0);
+  });
+
+  it('PKG-164 review finding 5: --no-stash --sha with a dirty tracked file aborts before the merge', () => {
+    const { ctx, calls } = makeCombinedRuntime({ postStashDirty: true });
+    expect(() => deploy(legacyConfig({ autoCut: false }), { sha: MERGE_SHA, stash: false, projectRoot: ROOT }, ctx))
+      .toThrow(/still reports tracked\/staged change\(s\)/);
+    // Never reached the merge -- the clean-tree check must run BEFORE it,
+    // even with no stash step to have skipped in the first place.
+    expect(calls.some((c) => c.includes(`git merge --ff-only '${MERGE_SHA}'`))).toBe(false);
+  });
+
+  it('PKG-164 review finding 4: a --sha-path error never mentions auto-cut, and never suggests --no-auto-cut', () => {
+    const { ctx } = makeCombinedRuntime({ currentBranch: '' }); // detached HEAD on the target
+    let message = '';
+    try {
+      deploy(legacyConfig({ autoCut: false }), { sha: MERGE_SHA, projectRoot: ROOT }, ctx);
+    } catch (error: any) {
+      message = error.message;
+    }
+    expect(message).toMatch(/detached HEAD/);
+    expect(message).toMatch(/the --sha commit/);
+    expect(message).not.toMatch(/auto-cut/);
+    expect(message).not.toMatch(/--no-auto-cut/);
+  });
 });
 
 describe('deployRelease() + auto-cut: deploy-by-SHA', () => {
@@ -494,6 +542,59 @@ describe('deployRelease() + auto-cut: deploy-by-SHA', () => {
     };
     expect(() => release.deployRelease(config, { projectRoot: ROOT }, ctx))
       .toThrow(/git cat-file -e .* still fails -- the commit is not actually present/);
+  });
+
+  it('PKG-164: the merged-only guard runs and PASSES on the auto-cut R path (release layout)', () => {
+    const fs = makeFakeFs({
+      '/repo/release-kit.config.js': 'module.exports = {}',
+      '/repo/package.json': JSON.stringify({ name: 'demo', version: '1.1.0', scripts: { 'release:cut': 'release-kit cut' } }),
+    });
+    const autoCutLocal = makeAutoCutLocal(fs);
+    const rk = fakeReleaseKit();
+    const calls: string[] = [];
+    const execFileSync = (_file: string, args: string[]) => {
+      const raw = args[args.length - 1];
+      calls.push(raw);
+      const targetPrefix = 'cd /srv/app && ';
+      if (!raw.startsWith(targetPrefix)) return autoCutLocal(raw);
+      const cmd = raw.slice(targetPrefix.length);
+      // Unlike the test above, R IS present on the target (a real auto-cut
+      // release always is, by construction) -- cat-file succeeds, and the
+      // merged-only guard's own merge-base --is-ancestor falls through to
+      // the generic '' (success) default below, same as every other
+      // unmatched command in this fixture.
+      if (cmd.includes('.deploy-kit-layout')) return '{"layout":"releases","version":1}';
+      if (cmd.includes('cat') && cmd.includes('deploy-kit-state.json')) return '';
+      if (cmd.includes('mv --version')) return 'mv (GNU coreutils) 9.1';
+      if (cmd.includes('df -kP') || cmd.includes('df -Pk')) return '99999999';
+      return '';
+    };
+    const config = mergeConfig(DEFAULT_CONFIG, {
+      host: 'app@pi', projectDir: '/srv/app', appNames: ['app'], dbBoundApps: [], branch: BRANCH, remote: REMOTE,
+      ecosystemFile: 'shared/ecosystem.config.cjs',
+      hooks: { install: 'npm ci', build: 'npm run build' },
+      autoCut: { notePaths: ['CHANGELOG.md'] },
+      layout: { type: 'releases', keepReleases: 4, sharedPaths: [], releaseChecks: [], runningShaCommand: 'get-running-sha' },
+    });
+    const ctx = {
+      fs,
+      now: () => Date.parse('2026-08-17T12:00:00Z'),
+      resolve: () => '/repo/node_modules/@andrewpopov/release-kit/index.js',
+      requireModule: (p: string) => (p === '/repo/release-kit.config.js' ? { productName: 'demo' } : rk),
+      log: {
+        info: () => {}, warning: () => {}, error: () => {}, success: () => {}, step: () => {}, header: () => {},
+      },
+      sleep: () => {},
+      runtime: { execFileSync },
+    };
+    // This fixture doesn't model the whole rest of the release pipeline (pm2,
+    // health, etc.), so it may still fail LATER -- that's fine; the point is
+    // ONLY that the merged-only guard itself did not abort, and execution
+    // reached materialize (the step right after it).
+    try { release.deployRelease(config, { projectRoot: ROOT }, ctx); } catch { /* later phase, not this guard */ }
+    expect(calls.some((c) => c.includes('cat-file -e') && c.includes(MERGE_SHA))).toBe(true);
+    expect(calls.some((c) => c.includes('merge-base --is-ancestor') && c.includes(MERGE_SHA) && c.includes(`refs/heads/'${BRANCH}'`))).toBe(true);
+    expect(calls.some((c) => c.includes('worktree add --detach') && c.includes(MERGE_SHA))).toBe(true);
   });
 
   it('runs auto-cut only after the --no-stash option-combination validation: an invalid combination produces zero auto-cut GitHub mutation', () => {
