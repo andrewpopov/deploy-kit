@@ -307,6 +307,14 @@ function deploy(config, options = {}, ctx = {}) {
     R = autoCutResult.ran ? autoCutResult.sha : null;
     if (R) {
       log.info(`auto-cut: deploying release ${autoCutResult.version} (${R.slice(0, 12)}, PR #${autoCutResult.prNumber})`);
+    } else if (options.sha) {
+      // `--sha`: an operator-supplied exact commit, taking over from the
+      // branch tip exactly the way auto-cut's `R` does below -- runAutoCutPreflight
+      // above has already thrown if auto-cut is configured and would actually
+      // run (see auto-cut.js's own `options.sha` guard), so reaching here means
+      // either auto-cut isn't configured at all or `--no-auto-cut` disabled it.
+      R = options.sha;
+      log.info(`--sha: deploying ${R.slice(0, 12)} exactly`);
     }
 
     // Auto-cut produced an immutable release `R` that this deploy must bring
@@ -430,6 +438,29 @@ function deploy(config, options = {}, ctx = {}) {
           `Deploy aborted: fetched ${config.remote} for auto-cut release ${R.slice(0, 12)}, but \`git cat-file `
           + `-e ${R}^{commit}\` still fails on the target at ${config.projectDir} -- the commit is not actually `
           + 'present there. Refusing to merge to a commit the target does not have.',
+        );
+      }
+
+      // Merged-only guard: R must be an ancestor of the deploy branch's own
+      // tip. Auto-cut's R always satisfies this by construction (it comes
+      // from a squash-merged PR onto config.branch) -- this only ever fires
+      // for a manually-supplied `--sha` naming a commit that is unmerged, on
+      // a different branch, or simply doesn't exist on the remote.
+      run(`Fetching ${branch} to verify release ${R.slice(0, 12)} is merged`, `git fetch ${shQuote(config.remote)} ${shQuote(branch)}`);
+      const branchTipRes = runOnTarget(`git rev-parse ${shQuote(config.remote)}/${shQuote(branch)}`, config, { runtime, capture: true });
+      const branchTip = (branchTipRes.output || '').trim();
+      if (!branchTipRes.ok || !branchTip) {
+        throw new Error(
+          `Deploy aborted: could not resolve ${config.remote}/${branch} to a SHA at ${config.projectDir} after `
+          + `fetching "${branch}", to verify release ${R.slice(0, 12)} is merged.`,
+        );
+      }
+      const mergedRes = runOnTarget(`git merge-base --is-ancestor ${shQuote(R)} ${shQuote(branchTip)}`, config, { runtime });
+      if (!mergedRes.ok) {
+        throw new Error(
+          `Deploy aborted: release ${R.slice(0, 12)} is NOT an ancestor of ${config.remote}/${branch} `
+          + `(${branchTip.slice(0, 12)}) at ${config.projectDir} -- refusing to deploy a commit that is not `
+          + `merged onto "${branch}". Merge it first, or check --sha for a typo.`,
         );
       }
 

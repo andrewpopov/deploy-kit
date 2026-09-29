@@ -149,6 +149,35 @@ describe('release deploy — happy path', () => {
     expect(result.steps).toContain('flip');
   });
 
+  it('PKG-164: --sha materializes exactly that commit, through the same R plumbing as auto-cut', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    const result = release.deployRelease(relConfig(), { sha: SHA }, ctx(runtime));
+    expect(result.sha).toBe(SHA);
+    expect(result.steps).toContain('flip');
+    const joined = calls.join('\n');
+    expect(joined).toContain(`cat-file -e '${SHA}^{commit}'`);
+    expect(joined).toContain(`merge-base --is-ancestor '${SHA}' refs/heads/'master'`);
+    expect(joined).toContain(`worktree add --detach /srv/app/releases/a1b2c3d4e5f6-20260710T090000Z ${SHA}`);
+  });
+
+  it('PKG-164: merged-only guard aborts by name when --sha names a commit not on the deploy branch', () => {
+    const rt = makeReleaseRuntime();
+    const runtime = {
+      execFileSync: (_f: string, args: string[]) => {
+        const cmd = args[args.length - 1];
+        if (cmd.includes(`merge-base --is-ancestor '${SHA}'`)) {
+          const e: any = new Error('not merged');
+          e.stdout = '';
+          e.status = 1;
+          throw e;
+        }
+        return (rt.runtime.execFileSync as any)(_f, args);
+      },
+    };
+    expect(() => release.deployRelease(relConfig(), { sha: SHA }, ctx(runtime)))
+      .toThrow(/is NOT an ancestor of refs\/heads\/master/);
+  });
+
   it('prefers refs/heads over a STALE origin/<branch> (heads:heads fetch is authoritative)', () => {
     // If repo.git has a heads->remotes/origin refspec, origin/master is only updated by a
     // plain fetch — NOT our heads:heads fetch — so it can be stale after the remote moved.

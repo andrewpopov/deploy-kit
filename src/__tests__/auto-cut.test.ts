@@ -232,6 +232,18 @@ describe('autoCut', () => {
       .toThrow(/refusing to run with a --branch override in play/);
   });
 
+  it('rejects a --sha override in play (PKG-164)', () => {
+    const { runtime } = makeAutoCutRuntime();
+    expect(() => autoCut(baseConfig(), { projectRoot: ROOT, sha: 'a'.repeat(40) }, { ...baseCtx(), runtime }))
+      .toThrow(/refusing to run with a --sha override in play/);
+  });
+
+  it('--sha does NOT abort when config.autoCut is false (--no-auto-cut wins first)', () => {
+    const { runtime } = makeAutoCutRuntime();
+    const result = autoCut(baseConfig({ autoCut: false }), { projectRoot: ROOT, sha: 'a'.repeat(40) }, { ...baseCtx(), runtime });
+    expect(result).toEqual({ ran: false });
+  });
+
   it('aborts by its own message when the working tree is dirty', () => {
     const { runtime } = makeAutoCutRuntime({ statusQueue: ['M src/foo.js\n', ''] });
     expect(() => autoCut(baseConfig(), { projectRoot: ROOT }, { ...baseCtx(), runtime }))

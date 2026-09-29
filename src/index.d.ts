@@ -196,6 +196,17 @@ export interface DeployOptions {
   buildBeforeMigrate?: boolean;
   /** `--skip-pin-check`. Overrides the config's `verifyPins`. */
   verifyPins?: boolean;
+  /** `--branch`: override `config.branch` for this run. Rejected outright if
+   * auto-cut is configured and would run — see `AutoCutOptions.branch`. */
+  branch?: string;
+  /** `--sha`: deploy EXACTLY this commit (a full 40-char lowercase hex
+   * SHA-1) instead of the branch tip a plain pull would resolve. Must already
+   * be an ancestor of the deploy branch's tip — deploy() aborts otherwise.
+   * Mutually exclusive with `branch`. Rejected outright if auto-cut is
+   * configured and would run — see `AutoCutOptions.sha`. */
+  sha?: string;
+  /** `--no-auto-cut` (`false`). See `AutoCutOptions.autoCut`. */
+  autoCut?: boolean;
 }
 
 export interface RollbackOptions {
@@ -630,6 +641,12 @@ export interface AutoCutOptions {
   /** A `--branch` override in play — always aborts; auto-cut only ever
    * targets `config.branch` on the remote's actual default branch. */
   branch?: string;
+  /** A `--sha` override in play — always aborts, same as `branch` above; an
+   * operator supplying `--sha` wants exactly that commit deployed, never a
+   * fresh release auto-cut would cut and merge on top of it. Pass
+   * `autoCut: false` alongside `sha` to deploy an explicit commit on a repo
+   * that also has auto-cut enabled. */
+  sha?: string;
   /** The local controller checkout to operate in. Default `process.cwd()`. */
   projectRoot?: string;
 }

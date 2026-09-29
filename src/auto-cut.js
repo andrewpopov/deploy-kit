@@ -536,6 +536,15 @@ function autoCut(config, options = {}, ctx = {}) {
     throw new Error('auto-cut: refusing to run with a --branch override in play; auto-cut always targets config.branch on the remote default branch');
   }
 
+  // A --sha override in play -- always aborts here too, mirroring the
+  // --branch guard immediately above: an operator supplying --sha wants
+  // EXACTLY that commit deployed, never a fresh release auto-cut would cut
+  // and merge on top of it. Checked before ANY preflight or mutation, dry-run
+  // or not -- same rationale as --branch.
+  if (options.sha) {
+    throw new Error('auto-cut: refusing to run with a --sha override in play; pass --no-auto-cut to deploy an explicit --sha, or drop --sha to let auto-cut produce the release SHA itself');
+  }
+
   // 10. Resume -- checked before ANY preflight or mutation, dry-run or not:
   // the release may already be published, so re-running must hand back the
   // SAME R, never cut (or deploy a descendant) again.

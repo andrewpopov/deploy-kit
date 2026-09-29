@@ -21,7 +21,7 @@ const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
   '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
-  '--dir', '--json', '--local', '--branch', '--no-auto-cut', '--guard-config',
+  '--dir', '--json', '--local', '--branch', '--no-auto-cut', '--guard-config', '--sha',
 ];
 
 // Flags that take a following positional value. Kept in sync with the arity
@@ -31,7 +31,7 @@ const KNOWN_FLAGS = [
 // a used flag; parseOptions consumes it as --service's value).
 const VALUE_FLAGS = new Set([
   '--lines', '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env', '--dir', '--branch',
-  '--guard-config',
+  '--guard-config', '--sha',
 ]);
 
 // The set of flags each command actually reads. KNOWN_FLAGS above is only
@@ -49,7 +49,7 @@ const COMMAND_FLAGS = {
   'verify-tunnel-config': ['--dir', '--guard-config', '--json'],
   'verify-no-secrets': ['--dir', '--guard-config', '--json'],
   'clear-pending-release': ['--dir', '--json'],
-  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut'],
+  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut', '--sha'],
   rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock'],
   monitor: ['--steal-lock', '--no-lock', '--local'],
   status: [],
@@ -99,6 +99,14 @@ function validateCommandFlags(command, args) {
 
 const PORT_RE = /^[0-9]+$/;
 
+// `--sha` must be the FULL, unabbreviated 40-char hex SHA-1 -- an abbreviated
+// SHA is exactly the ambiguity this flag exists to remove (a short prefix can
+// become ambiguous, or resolve to a different object, as the repo grows).
+// Uppercase hex is valid git object-id syntax but never what `git rev-parse`
+// itself emits, so rejecting it here catches a copy-paste from a source that
+// normalizes case, rather than silently accepting it.
+const FULL_SHA_RE = /^[0-9a-f]{40}$/;
+
 // Reject anything we do not recognise. Silently ignoring an unknown flag is
 // dangerous precisely for the flag an operator reaches for when being careful:
 // a typo'd `--dry-rn`, or `--dry-run` passed to a version that predates it,
@@ -127,6 +135,18 @@ function parseOptions(args) {
     else if (a === '--api-key-env' && args[i + 1]) { options.apiKeyEnv = args[i + 1]; i += 1; }
     else if (a === '--dir' && args[i + 1]) { options.dir = args[i + 1]; i += 1; }
     else if (a === '--branch' && args[i + 1]) { options.branch = args[i + 1]; i += 1; }
+    else if (a === '--sha' && args[i + 1]) {
+      const value = args[i + 1];
+      if (!FULL_SHA_RE.test(value)) {
+        throw new Error(
+          `Invalid --sha "${value}": must be exactly 40 lowercase hex characters (a full, unabbreviated git `
+          + 'commit SHA-1). Abbreviated, uppercase, or non-hex values are rejected -- ambiguity here is exactly '
+          + 'what --sha exists to remove.',
+        );
+      }
+      options.sha = value;
+      i += 1;
+    }
     else if (a === '--guard-config' && args[i + 1]) { options.guardConfig = args[i + 1]; i += 1; }
     else if (a === '--json') { options.json = true; }
     else if (a === '--local') { options.local = true; }
@@ -192,11 +212,21 @@ Commands:
                                             takes no flags
   deploy [--skip-build|--skip-deps|--skip-migrate|--skip-pin-check]
          [--no-stash] [--dry-run] [--steal-lock] [--no-lock] [--branch NAME]
+         [--sha <40-hex-sha>] [--no-auto-cut]
                                             --skip-pin-check disables the post-install
                                             check that the installed tree matches what
                                             package.json pins. It is the escape hatch for
                                             a target you knowingly cannot fix right now —
                                             not a way to make a red deploy green.
+                                            --sha deploys EXACTLY that commit (must be a
+                                            full 40-char lowercase hex SHA, and already
+                                            merged onto the deploy branch) instead of the
+                                            branch tip a plain pull would resolve.
+                                            Mutually exclusive with --branch. Aborts if
+                                            auto-cut is configured and would run — pass
+                                            --no-auto-cut alongside --sha to deploy an
+                                            explicit commit on a repo that also has
+                                            auto-cut enabled.
   rollback [--skip-build|--skip-deps] [--dry-run] [--steal-lock] [--no-lock]
                                             (NOT --skip-migrate or --no-stash — rollback
                                             never reads them)
@@ -223,15 +253,26 @@ function dryRunContext(config) {
   const currentTarget = 'releases/111111111111-20981231T000000Z';
   const previousTarget = 'releases/222222222222-20981230T000000Z';
   let appsStopped = false;
+  // Tracks the target's planned HEAD across a `--sha`/auto-cut fast-forward
+  // (`git merge --ff-only 'R'`) -- deploy.js reads `git rev-parse HEAD` right
+  // after that merge and asserts it equals R exactly. Only `--sha` can ever
+  // reach this under `--dry-run` (auto-cut's own dry-run branch returns
+  // before producing an R for this planner to model at all), so this only
+  // needs to track ONE fast-forward per run, never a chain of them.
+  let headSha = sha;
   const plannedOutput = (rendered) => {
     if (rendered.includes('.deploy-kit-layout')) return '{"layout":"releases","version":1}';
     if (rendered.includes('.deploy-kit-state.json') && rendered.includes('cat ')) return '';
     if (rendered.includes('mv --version')) return 'mv (GNU coreutils) 9.0';
     if (rendered.includes('df -kP')) return '99999999';
     if (rendered.includes('rev-parse --abbrev-ref')) return config.branch || 'master';
+    // Only reached under `--sha --dry-run` (auto-cut's own dry-run branch
+    // returns before ever producing an R for this planner to model) -- the
+    // target is symbolically "on the deploy branch" for planning purposes.
+    if (rendered.includes('symbolic-ref -q --short HEAD')) return config.branch || 'master';
     if (rendered.includes('rev-parse refs/heads/') || rendered.includes(`rev-parse '${config.remote}'/`)) return sha;
     if (rendered.includes('date -u +%Y%m%dT%H%M%SZ')) return timestamp;
-    if (rendered.includes('git rev-parse HEAD')) return sha;
+    if (rendered.includes('git rev-parse HEAD')) return headSha;
     if (rendered.includes(`readlink ${config.projectDir}/current`)) return currentTarget;
     if (rendered.includes(`readlink ${config.projectDir}/previous`)) return previousTarget;
     if (rendered.includes('readlink -f /proc/')) return candidateDir;
@@ -256,6 +297,8 @@ function dryRunContext(config) {
     log.step(`[dry-run] ${rendered}`);
     if (rendered.includes('pm2 stop ')) appsStopped = true;
     if (/pm2 (startOrRestart|start|restart) /.test(rendered)) appsStopped = false;
+    const mergeMatch = rendered.match(/git merge --ff-only '([0-9a-f]{7,64})'/);
+    if (mergeMatch) headSha = mergeMatch[1];
     return plannedOutput(rendered);
   };
   return {
@@ -338,6 +381,14 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   const flagError = validateCommandFlags(command, argv.slice(1));
   if (flagError) {
     log.error(flagError);
+    return 1;
+  }
+
+  // --sha names an exact commit; --branch names an override branch tip. Both
+  // together is ambiguous about what the operator actually wants deployed --
+  // reject before any side effect, same as every other rejection above.
+  if (command === 'deploy' && options.sha && options.branch) {
+    log.error('deploy: --sha and --branch are mutually exclusive -- pass at most one');
     return 1;
   }
 

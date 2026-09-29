@@ -211,6 +211,57 @@ describe('CAIRN-190: deploy --branch override', () => {
   });
 });
 
+describe('PKG-164: deploy --sha', () => {
+  const FULL_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678'; // 40 hex
+
+  it('parseOptions accepts a full 40-char lowercase hex SHA', () => {
+    const options = cli.parseOptions(['--sha', FULL_SHA]) as { sha: string };
+    expect(options.sha).toBe(FULL_SHA);
+  });
+
+  it('parseOptions rejects an abbreviated (short) SHA', () => {
+    expect(() => cli.parseOptions(['--sha', FULL_SHA.slice(0, 12)])).toThrow(/Invalid --sha ".*must be exactly 40 lowercase hex/);
+  });
+
+  it('parseOptions rejects an uppercase SHA', () => {
+    expect(() => cli.parseOptions(['--sha', FULL_SHA.toUpperCase()])).toThrow(/Invalid --sha/);
+  });
+
+  it('parseOptions rejects a non-hex value of the right length', () => {
+    const notHex = `z${FULL_SHA.slice(1)}`;
+    expect(() => cli.parseOptions(['--sha', notHex])).toThrow(/Invalid --sha/);
+  });
+
+  it('--sha and --branch together is a usage error, before any dispatch', () => {
+    withConfig({ mode: 'local', projectDir: '/srv/app', appNames: ['app'] }, (dir) => {
+      const cap = captureLog();
+      const code = cli.run(['deploy', '--sha', FULL_SHA, '--branch', 'feature/x', '--dry-run'], { cwd: dir, env: {} });
+      const out = cap.out();
+      cap.restore();
+      expect(code).toBe(1);
+      expect(out).toMatch(/--sha and --branch are mutually exclusive/);
+      expect(out).not.toContain('[dry-run]');
+    });
+  });
+
+  it('--dry-run --sha prints the SHA fetch/merge path, never a plain branch pull', () => {
+    withConfig({ mode: 'local', projectDir: '/srv/app', appNames: ['app'], branch: 'main' }, (dir) => {
+      const cap = captureLog();
+      const code = cli.run(['deploy', '--sha', FULL_SHA, '--dry-run'], { cwd: dir, env: {} });
+      const out = cap.out();
+      cap.restore();
+      expect(code).toBe(0);
+      expect(out).toContain(`fetch 'origin' '${FULL_SHA}'`);
+      expect(out).toContain(`merge --ff-only '${FULL_SHA}'`);
+      expect(out).not.toContain('pull --ff-only');
+    });
+  });
+
+  it('rejects --sha without a value instead of deploying the branch tip', () => {
+    expect(() => cli.parseOptions(['--sha'])).toThrow(/Unknown argument: --sha/);
+  });
+});
+
 describe('no regression: every currently-valid invocation still dispatches', () => {
   it('deploy with every one of its real flags + --dry-run completes (exit 0)', () => {
     withConfig({ host: 'app@pi', projectDir: '/srv/app', appNames: ['app'], mode: 'ssh' }, (dir) => {

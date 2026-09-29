@@ -142,6 +142,7 @@ type TargetOverrides = {
   currentBranch?: string;
   rExists?: boolean;
   isAncestor?: boolean;
+  rOnBranch?: boolean; // whether R is an ancestor of the deploy branch's own tip (the merged-only guard)
   mergeMutatesHead?: boolean; // whether `git merge --ff-only R` actually moves target HEAD to R
   tamperAfterMerge?: boolean; // simulate something moving HEAD again before activation
   postStashDirty?: boolean;
@@ -155,7 +156,7 @@ const PRE_RESTART_CHECKOUT_CMD = 'git checkout deadbeefdeadbeefdeadbeefdeadbeefd
 // window and let each knob flip exactly one guard.
 function makeTargetHandler(over: TargetOverrides = {}) {
   const {
-    currentBranch = BRANCH, rExists = true, isAncestor = true,
+    currentBranch = BRANCH, rExists = true, isAncestor = true, rOnBranch = true,
     mergeMutatesHead = true, tamperAfterMerge = false, postStashDirty = false,
     preRestartCheckMovesHead = false,
   } = over;
@@ -165,8 +166,20 @@ function makeTargetHandler(over: TargetOverrides = {}) {
     if (cmd.includes('.deploy-kit-layout')) return '';
     if (cmd === 'git symbolic-ref -q --short HEAD') return `${currentBranch}\n`;
     if (cmd.startsWith('git fetch') && cmd.includes(MERGE_SHA)) return '';
+    // Merged-only guard's own branch-tip fetch/resolve, separate from the
+    // fetch of R itself above.
+    if (cmd === `git fetch '${REMOTE}' '${BRANCH}'`) return '';
+    if (cmd === `git rev-parse '${REMOTE}'/'${BRANCH}'`) return `${BASE_TIP}\n`;
     if (cmd.startsWith('git cat-file -e')) {
       if (!rExists) { const e: any = new Error('no commit'); e.stdout = ''; e.status = 1; throw e; }
+      return '';
+    }
+    // The merged-only guard's own ancestor check (`--is-ancestor R branchTip`)
+    // -- matched by R being the FIRST operand, which is unique to this call;
+    // the pre-existing "target HEAD ancestor of R" check below always has R
+    // as the SECOND operand instead.
+    if (cmd.startsWith(`git merge-base --is-ancestor '${MERGE_SHA}'`)) {
+      if (!rOnBranch) { const e: any = new Error('not merged'); e.stdout = ''; e.status = 1; throw e; }
       return '';
     }
     if (cmd.startsWith('git merge-base --is-ancestor')) {
@@ -394,6 +407,43 @@ describe('deploy() + auto-cut: deploy-by-SHA', () => {
     expect(result.healthy).toBe(true);
     expect(calls.some((c) => c.includes('git pull --ff-only'))).toBe(true);
     expect(calls.some((c) => c.includes(MERGE_SHA))).toBe(false);
+  });
+});
+
+describe('deploy() + --sha (PKG-164): deploy-by-SHA without auto-cut', () => {
+  it('deploys exactly the given --sha (not the branch tip), through the same R plumbing as auto-cut', () => {
+    // --no-auto-cut (config.autoCut: false) so autoCut() skips before ever
+    // reaching its own --sha guard -- this models an operator using --sha on
+    // a repo that also has auto-cut configured, deliberately opted out for
+    // this one run.
+    const { ctx, calls } = makeCombinedRuntime();
+    const result = deploy(legacyConfig({ autoCut: false }), { sha: MERGE_SHA, projectRoot: ROOT }, ctx);
+    expect(result.healthy).toBe(true);
+    expect(calls.some((c) => c.includes(`git fetch 'origin' '${MERGE_SHA}'`))).toBe(true);
+    expect(calls.some((c) => c.includes(`git merge --ff-only '${MERGE_SHA}'`))).toBe(true);
+    expect(calls.some((c) => c.includes('git pull --ff-only'))).toBe(false);
+  });
+
+  it('aborts before any target mutation when auto-cut is configured and would run alongside --sha', () => {
+    // release-kit.config.js IS present here (makeCombinedRuntime's default fs)
+    // and autoCut is NOT disabled -- auto-cut would actually run, so --sha
+    // must be rejected before touching the target at all.
+    const { ctx, calls } = makeCombinedRuntime();
+    expect(() => deploy(legacyConfig(), { sha: MERGE_SHA, projectRoot: ROOT }, ctx))
+      .toThrow(/refusing to run with a --sha override in play/);
+    // No auto-cut GitHub mutation, and never even reached fetching/merging R
+    // on the target -- the same "zero mutation" bar the pre-existing
+    // preflight/lock-ordering tests above hold auto-cut to.
+    expect(calls.some((c) => c.startsWith('git checkout -b'))).toBe(false);
+    expect(calls.some((c) => c.includes('npm run release:cut'))).toBe(false);
+    expect(calls.some((c) => c.startsWith('gh pr'))).toBe(false);
+    expect(calls.some((c) => c.includes(`git merge --ff-only '${MERGE_SHA}'`))).toBe(false);
+  });
+
+  it('merged-only guard: aborts by name when --sha names a commit that is not on the deploy branch', () => {
+    const { ctx } = makeCombinedRuntime({ rOnBranch: false });
+    expect(() => deploy(legacyConfig({ autoCut: false }), { sha: MERGE_SHA, projectRoot: ROOT }, ctx))
+      .toThrow(/is NOT an ancestor of origin\/master/);
   });
 });
 

@@ -699,6 +699,13 @@ function deployRelease(config, options = {}, ctx = {}) {
     R = autoCutResult.ran ? autoCutResult.sha : null;
     if (R) {
       log.info(`auto-cut: deploying release ${autoCutResult.version} (${R.slice(0, 12)}, PR #${autoCutResult.prNumber})`);
+    } else if (options.sha) {
+      // `--sha`: an operator-supplied exact commit, taking over from the
+      // branch tip exactly the way auto-cut's `R` does below -- see the
+      // matching comment in deploy.js for why runAutoCutPreflight above has
+      // already thrown if auto-cut is configured and would actually run.
+      R = options.sha;
+      log.info(`--sha: deploying ${R.slice(0, 12)} exactly`);
     }
 
     const pointers = readPointers(config, paths, c);
@@ -742,6 +749,24 @@ function deployRelease(config, options = {}, ctx = {}) {
           `Deploy aborted: fetched ${config.remote} into ${paths.repoGit} for auto-cut release ${R.slice(0, 12)}, `
           + `but \`git cat-file -e ${R}^{commit}\` still fails -- the commit is not actually present there. `
           + 'Refusing to materialize a release from a commit the bare repo does not have.',
+        );
+      }
+      // Merged-only guard: R must be an ancestor of the deploy branch's own
+      // tip. `refs/heads/<branch>` was already force-updated by the fetch
+      // above, so no extra fetch is needed here. Auto-cut's R always
+      // satisfies this by construction -- this only ever fires for a
+      // manually-supplied `--sha` naming a commit that is unmerged, on a
+      // different branch, or simply doesn't exist on the remote.
+      const mergedRes = runInDir(
+        paths.root,
+        `git --git-dir=${paths.repoGit} merge-base --is-ancestor ${shQuote(R)} refs/heads/${shQuote(branch)}`,
+        config, c, { tolerate: true },
+      );
+      if (!mergedRes.ok) {
+        throw new Error(
+          `Deploy aborted: release ${R.slice(0, 12)} is NOT an ancestor of refs/heads/${branch} in ${paths.repoGit} `
+          + `-- refusing to deploy a commit that is not merged onto "${branch}". Merge it first, or check --sha `
+          + 'for a typo.',
         );
       }
     } else {
