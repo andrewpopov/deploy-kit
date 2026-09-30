@@ -45,12 +45,12 @@
     "@andrewpopov/release-kit": "github:andrewpopov/release-kit#v0.3.1",
     "@eslint/js": "^9.39.5",
     "@types/node": "^24.0.0",
-    "@vitest/coverage-v8": "^4.0.18",
+    "@vitest/coverage-v8": "^4.1.11",
     "eslint": "^9.39.5",
     "globals": "^17.7.0",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.65.0",
-    "vitest": "^4.0.18"
+    "vitest": "^4.1.11"
   },
   "keywords": [
     "deployment",
