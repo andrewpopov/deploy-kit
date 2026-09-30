@@ -22,10 +22,11 @@ const baseOptions = (over: Record<string, unknown> = {}) => ({ sha: SHA, autoCut
 
 const PREFLIGHT_LINES: Record<string, string> = {
   DK_USER: 'dkapp', DK_UID: '1000', DK_LINGER: 'yes', DK_USER_MANAGER: 'yes', DK_NODE: '/usr/bin/node', DK_NODE_MAJOR: '24', DK_ACTIVE_UNITS: '0',
-  DK_SHELL: '/bin/bash', DK_UMASK: '0027', DK_OOM: '100', DK_PATH: '/usr/local/bin:/usr/bin', DK_HOME: '/srv/dkapp', DK_LOGNAME: 'dkapp', ENV_LANG: 'C.UTF-8', DK_END: '1',
+  DK_SHELL: '/bin/bash', DK_UMASK: '0027', DK_OOM: '100', DK_PATH: '/usr/local/bin:/usr/bin', DK_HOME: '/srv/dkapp', DK_LOGNAME: 'dkapp', ENV_LANG: 'C.UTF-8', ENVABSENT_PM2_HOME: '1', DK_END: '1',
 };
+const hex = (v: string) => Buffer.from(v, 'utf8').toString('hex');
 const preflight = (over: Record<string, string | null> = {}) => Object.entries({ ...PREFLIGHT_LINES, ...over })
-  .filter(([, v]) => v !== null).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
+  .filter(([, v]) => v !== null).map(([k, v]) => `${k}=${hex(v as string)}`).join('\n') + '\n';
 
 describe('flag and config refusals', () => {
   const refuses = (config: unknown, options: unknown, code: string) => {
@@ -86,10 +87,10 @@ describe('preflight parsing', () => {
     expect(() => parsePreflight(preflight(over as Record<string, string | null>), baseConfig(), quietLog)).toThrow(new RegExp(`^${code}:`));
   });
   it('rejects a repeated key (an injected line cannot override a captured value)', () => {
-    expect(() => parsePreflight(`${preflight()}DK_LINGER=yes\n`, baseConfig(), quietLog)).toThrow(/^ONHOST_PREFLIGHT:/);
+    expect(() => parsePreflight(`${preflight()}DK_LINGER=${hex('yes')}\n`, baseConfig(), quietLog)).toThrow(/^ONHOST_PREFLIGHT:/);
   });
   it('captures onHost.env names, recording absent ones as absent', () => {
-    const cap = parsePreflight(preflight({ ENV_DATABASE_URL: 'pg://x' }), baseConfig({ onHost: { env: ['DATABASE_URL', 'MISSING_ONE'] } }), quietLog);
+    const cap = parsePreflight(preflight({ ENV_DATABASE_URL: 'pg://x', ENVABSENT_MISSING_ONE: '1' }), baseConfig({ onHost: { env: ['DATABASE_URL', 'MISSING_ONE'] } }), quietLog);
     expect(cap.env).toEqual({ LANG: 'C.UTF-8', DATABASE_URL: 'pg://x' });
     expect(cap.absentEnv).toEqual(['PM2_HOME', 'MISSING_ONE']);
   });
@@ -97,6 +98,59 @@ describe('preflight parsing', () => {
     const log = { warning: vi.fn() };
     parsePreflight(preflight({ DK_NODE_OPTIONS_SET: '1' }), baseConfig(), log);
     expect(log.warning).toHaveBeenCalledTimes(1);
+  });
+});
+
+const PREFLIGHT_PLAIN = Object.entries(PREFLIGHT_LINES).filter(([k]) => !k.startsWith('ENV') && k !== 'DK_END')
+  .map(([k, v]) => `${k}=${hex(v)}`).join('\n') + '\n';
+
+describe('preflight line protocol (review finding 1, 3, 4)', () => {
+  const quietLog = { warning: vi.fn() };
+  const config = baseConfig({ onHost: { env: ['HOSTILE', 'EMPTY', 'LANG', 'HOSTILE', 'ABSENT_ONE'] } });
+
+  // Runs the REAL generated script under sh with a hostile environment, then parses its real output.
+  function runScript(env: Record<string, string>) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dk-pf-'));
+    try {
+      return execFileSync('sh', ['-se'], {
+        input: op.preflightScript(config), encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], env: { PATH: process.env.PATH, HOME: dir, USER: 'dkapp', ...env },
+      });
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  it('carries a hostile multi-line value through as data; a forged key never appears', () => {
+    const hostile = 'x\nENV_PM2_HOME=/tmp/x\nDK_LINGER=yes\nDK_END=1';
+    const output = runScript({ HOSTILE: hostile, EMPTY: '', LANG: 'C' });
+    const kv = op.parseKeyValues(output);
+    expect(kv.get('ENV_HOSTILE')).toBe(hostile);
+    expect(kv.has('ENV_PM2_HOME')).toBe(false);
+    expect(kv.get('DK_LINGER')).not.toBe('yes');
+    for (const line of output.split('\n')) expect(line).toMatch(/^([A-Z0-9_]+=([0-9a-f]{2})*)?$/);
+  });
+
+  it('allows a present-but-empty value, keeps absent distinct, and dedupes names', () => {
+    const output = runScript({ HOSTILE: 'v', EMPTY: '', LANG: 'C' });
+    expect(output.match(/^ENV_LANG=/gm)).toHaveLength(1);
+    expect(output.match(/^ENV_HOSTILE=/gm)).toHaveLength(1);
+    const cap = parsePreflight(`${PREFLIGHT_PLAIN}${output.split('\n').filter((l: string) => /^ENV/.test(l)).join('\n')}\nDK_END=${hex('1')}\n`, config, quietLog);
+    expect(cap.env).toMatchObject({ EMPTY: '', HOSTILE: 'v', LANG: 'C' });
+    expect(cap.absentEnv).toEqual(expect.arrayContaining(['PM2_HOME', 'ABSENT_ONE']));
+    expect('EMPTY' in cap.env).toBe(true);
+  });
+
+  it('still refuses control characters in a NON-empty value', () => {
+    expect(() => parsePreflight(preflight({ ENV_LANG: 'a\u0001b' }), baseConfig(), quietLog)).toThrow(/control characters/);
+  });
+
+  it('refuses any raw (non-hex) protocol line', () => {
+    expect(() => parsePreflight(`${preflight()}ENV_PM2_HOME=/tmp/x\n`, baseConfig(), quietLog)).toThrow(/^ONHOST_PREFLIGHT:/);
+  });
+
+  it('never emits a name twice in the submitted argv', () => {
+    const capture = { user: 'u', uid: '1', home: '/h', shell: '/bin/sh', umask: '0022', oomScoreAdj: 0, node: '/n', logname: 'u', path: '/bin', env: { LANG: 'C', X: '1' }, absentEnv: [] };
+    const argv = buildSubmitArgv({ unit: 'u', runDir: '/r', projectDir: '/p', capture, onHostEnv: ['LANG', 'X', 'X'] });
+    expect(argv.filter((a: string) => a.startsWith('LANG='))).toHaveLength(1);
+    expect(argv.filter((a: string) => a.startsWith('X='))).toHaveLength(1);
   });
 });
 
@@ -173,18 +227,18 @@ describe('systemd-run argv', () => {
     for (const banned of ['RuntimeMaxSec', '--collect', '--wait']) expect(joined).not.toContain(banned);
   });
 
-  it('survives hostile values: each stays ONE shell word, nothing expands locally, systemd specifiers are escaped', () => {
+  it('survives hostile values: each stays ONE shell word, nothing expands locally, `$` is doubled but `%` is left literal', () => {
     const hostile = { ...capture, path: `/bin:$(touch /tmp/pwn);'"\`x\` %h $HOME`, env: { LANG: 'a b;c', DATABASE_URL: "x' ; touch /tmp/pwn2 #" } };
     const argv = buildSubmitArgv({ unit, runDir, projectDir: '/srv/app', capture: hostile, onHostEnv: ['DATABASE_URL'] });
     const command = quoteArgv(argv);
     const words = execFileSync('sh', ['-c', `for a in ${command}; do printf '%s\\0' "$a"; done`], { encoding: 'utf8' }).split('\0').slice(0, -1);
     expect(words).toEqual(argv);
-    expect(argv).toContain("PATH=/bin:$$(touch /tmp/pwn);'\"`x` %%h $$HOME");
+    expect(argv).toContain("PATH=/bin:$$(touch /tmp/pwn);'\"`x` %h $$HOME");
     expect(argv).toContain('LANG=a b;c');
     expect(argv).toContain("DATABASE_URL=x' ; touch /tmp/pwn2 #");
     expect(argv).toContain('INVOCATION_ID=${INVOCATION_ID}');
     expect(fs.existsSync('/tmp/pwn')).toBe(false);
-    expect(systemdEscape('100%$')).toBe('100%%$$');
+    expect(systemdEscape('p%40ss$x')).toBe('p%40ss$$x');   // % is left alone: no specifier expansion in ExecStart argv
   });
 });
 
@@ -242,7 +296,7 @@ describe('the flow, against a scripted host', () => {
   });
 
   it('uploads a tar of named entries whose meta.json and config.json are what the manifest hashes', () => {
-    const h = host();
+    const h = host({ preflight: () => preflight({ ENVABSENT_DATABASE_URL: '1' }) });
     onHostDeploy(baseConfig({ onHost: { env: ['DATABASE_URL'] } }), baseOptions({ skipBuild: true, verifyPins: false }), deps(h));
     const upload = h.calls.find((c) => c.kind === 'upload')!;
     expect(upload.args[upload.args.length - 1]).toBe(
@@ -331,6 +385,6 @@ describe('the flow, against a scripted host', () => {
   it('the preflight script quotes the lock id into its unit match and lists each onHost.env name', () => {
     const script = op.preflightScript(baseConfig({ projectDir: '/srv/my.app', onHost: { env: ['DATABASE_URL'] } }));
     expect(script).toContain(shQuote('^deploy-kit-srv-my\\.app-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}-[0-9a-f]{8}\\.service$'));
-    expect(script).toContain('ENV_DATABASE_URL=%s');
+    expect(script).toContain('dk_emit ENV_DATABASE_URL "$DATABASE_URL"');
   });
 });

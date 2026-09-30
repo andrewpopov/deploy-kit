@@ -67,39 +67,50 @@ function validateOnHostRequest(config, options) {
 
 // ---- 2. preflight -------------------------------------------------------------------
 
+// Every name whose value is captured from the host's ssh environment, each exactly once.
+const captureEnvNames = (config) => [...new Set([...OPTIONAL_CAPTURE_ENV, ...((config.onHost && config.onHost.env) || [])])];
+
+// The remote script speaks a line protocol of KEY=<hex> lines. EVERY value is hex-encoded before
+// it is printed, so no captured byte (a newline in an env value, say) can ever be read back as a
+// protocol line of its own. Absence is explicit: ENVABSENT_<name>=.
 function preflightScript(config) {
   const unitPattern = `^deploy-kit-${lockId(config).replace(/\./g, '\\.')}-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}-[0-9a-f]{8}\\.service$`;
-  const optional = [...OPTIONAL_CAPTURE_ENV, ...((config.onHost && config.onHost.env) || [])];
   return [
+    'dk_emit() { printf \'%s=%s\\n\' "$1" "$(printf \'%s\' "$2" | od -An -tx1 | tr -d \' \\n\')"; }',
     'u=${USER:-$(id -un)}; uid=$(id -u)',
     'XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$uid}; export XDG_RUNTIME_DIR',
-    'printf \'DK_USER=%s\\nDK_UID=%s\\n\' "$u" "$uid"',
-    'printf \'DK_LINGER=%s\\n\' "$(loginctl show-user "$u" -p Linger 2>/dev/null | cut -d= -f2)"',
-    'if systemctl --user show-environment >/dev/null 2>&1; then echo DK_USER_MANAGER=yes; else echo DK_USER_MANAGER=no; fi',
+    'dk_emit DK_USER "$u"; dk_emit DK_UID "$uid"',
+    'dk_emit DK_LINGER "$(loginctl show-user "$u" -p Linger 2>/dev/null | cut -d= -f2)"',
+    'if systemctl --user show-environment >/dev/null 2>&1; then dk_emit DK_USER_MANAGER yes; else dk_emit DK_USER_MANAGER no; fi',
     'node_bin=$(command -v node 2>/dev/null) || true',
-    'printf \'DK_NODE=%s\\n\' "$(readlink -f "$node_bin" 2>/dev/null)"',
-    'printf \'DK_NODE_MAJOR=%s\\n\' "$(node -p \'process.versions.node.split(".")[0]\' 2>/dev/null)"',
-    `printf 'DK_ACTIVE_UNITS=%s\\n' "$(systemctl --user list-units --all --no-legend --plain --state=activating,active,deactivating 'deploy-kit-*' 2>/dev/null | awk '{print $1}' | grep -Ec ${shQuote(unitPattern)})"`,
-    'printf \'DK_SHELL=%s\\n\' "$(getent passwd "$u" | cut -d: -f7)"',
-    'printf \'DK_UMASK=%s\\n\' "$(umask)"',
-    'printf \'DK_OOM=%s\\n\' "$(cat /proc/self/oom_score_adj)"',
-    'printf \'DK_PATH=%s\\nDK_HOME=%s\\n\' "$PATH" "$HOME"',
-    'printf \'DK_LOGNAME=%s\\n\' "${LOGNAME:-$u}"',
-    '[ -n "${NODE_OPTIONS+x}" ] && echo DK_NODE_OPTIONS_SET=1',
-    ...optional.map((name) => `[ -n "\${${name}+x}" ] && printf 'ENV_${name}=%s\\n' "$${name}"`),
-    'echo DK_END=1',
+    'dk_emit DK_NODE "$(readlink -f "$node_bin" 2>/dev/null)"',
+    'dk_emit DK_NODE_MAJOR "$(node -p \'process.versions.node.split(".")[0]\' 2>/dev/null)"',
+    `dk_emit DK_ACTIVE_UNITS "$(systemctl --user list-units --all --no-legend --plain --state=activating,active,deactivating 'deploy-kit-*' 2>/dev/null | awk '{print $1}' | grep -Ec ${shQuote(unitPattern)})"`,
+    'dk_emit DK_SHELL "$(getent passwd "$u" | cut -d: -f7)"',
+    'dk_emit DK_UMASK "$(umask)"',
+    'dk_emit DK_OOM "$(cat /proc/self/oom_score_adj)"',
+    'dk_emit DK_PATH "$PATH"; dk_emit DK_HOME "$HOME"',
+    'dk_emit DK_LOGNAME "${LOGNAME:-$u}"',
+    '[ -n "${NODE_OPTIONS+x}" ] && dk_emit DK_NODE_OPTIONS_SET 1',
+    ...captureEnvNames(config).map((name) => `if [ -n "\${${name}+x}" ]; then dk_emit ENV_${name} "$${name}"; else dk_emit ENVABSENT_${name} 1; fi`),
+    'dk_emit DK_END 1',
   ].join('\n');
 }
 
+// Decodes the hex lines into a Map of KEY -> string. Anything that is not exactly KEY=<hex> is
+// refused, so a forged line cannot exist: the only bytes a captured value can contribute are hex digits.
 function parseKeyValues(output) {
   const values = new Map();
   for (const line of output.split('\n')) {
     if (line === '') continue;
-    const match = /^([A-Z0-9_]+)=(.*)$/.exec(line);
+    const match = /^([A-Z0-9_]+)=((?:[0-9a-f]{2})*)$/.exec(line);
     if (!match || values.has(match[1])) {
       throw new OnHostError('ONHOST_PREFLIGHT', `unparseable or repeated preflight line ${JSON.stringify(line.slice(0, 80))}`);
     }
-    values.set(match[1], match[2]);
+    const bytes = Buffer.from(match[2], 'hex');
+    const text = bytes.toString('utf8');
+    if (!Buffer.from(text, 'utf8').equals(bytes)) throw new OnHostError('ONHOST_PREFLIGHT', `${match[1]} is not valid UTF-8`);
+    values.set(match[1], text);
   }
   if (!values.has('DK_END')) throw new OnHostError('ONHOST_PREFLIGHT', 'preflight output was cut short (no DK_END)');
   return values;
@@ -147,11 +158,14 @@ function parsePreflight(output, config, log = defaultLog) {
 
   const env = {};
   const absentEnv = [];
-  for (const name of [...OPTIONAL_CAPTURE_ENV, ...((config.onHost && config.onHost.env) || [])]) {
+  for (const name of captureEnvNames(config)) {
     const value = kv.get(`ENV_${name}`);
-    if (value === undefined) absentEnv.push(name);
-    else if (!isPlainText(value)) throw new OnHostError('ONHOST_PREFLIGHT', `ENV_${name} holds control characters`);
-    else env[name] = value;
+    if (value === undefined) {
+      if (!kv.has(`ENVABSENT_${name}`)) throw new OnHostError('ONHOST_PREFLIGHT', `the preflight reported neither ENV_${name} nor ENVABSENT_${name}`);
+      absentEnv.push(name);
+    } else if (value !== '' && !isPlainText(value)) {
+      throw new OnHostError('ONHOST_PREFLIGHT', `ENV_${name} holds control characters`);
+    } else env[name] = value;
   }
   return {
     user, uid, home, shell, umask, oomScoreAdj, node, logname, path: pathValue, env, absentEnv,
@@ -203,8 +217,13 @@ function newRunId(now, sha, randomHex) {
   return runId;
 }
 
-// systemd expands `%` (specifiers) and `$` in unit settings and in ExecStart words itself.
-const systemdEscape = (value) => String(value).replace(/%/g, '%%').replace(/\$/g, '$$$$');
+// systemd substitutes $VAR / ${VAR} in ExecStart words at exec time, so a literal `$` is written `$$`.
+// `%` is NOT escaped: systemd-run hands ExecStart argv over D-Bus and no specifier expansion happens
+// there, so `%%` would reach the process as a literal `%%` (verified on the harness host, proof scenario m).
+// Probed there too: `%` in WorkingDirectory=, StandardOutput=append: and ExecStopPost= values of a transient
+// unit is literal as well. Those paths (projectDir, home, runDir) are nonetheless restricted to
+// [A-Za-z0-9_./-] (SAFE_ABS_PATH_RE), so a `%` or `$` in one is a named refusal, never a surprise.
+const systemdEscape = (value) => String(value).replace(/\$/g, '$$$$');
 
 // The full `systemd-run` argv, unquoted. The caller shQuote()s every element.
 function buildSubmitArgv({ unit, runDir, projectDir, capture, onHostEnv }) {
@@ -218,13 +237,13 @@ function buildSubmitArgv({ unit, runDir, projectDir, capture, onHostEnv }) {
     ...OPTIONAL_CAPTURE_ENV.filter((name) => name in capture.env).map((name) => `${name}=${systemdEscape(capture.env[name])}`),
     `XDG_RUNTIME_DIR=/run/user/${capture.uid}`,
     'INVOCATION_ID=${INVOCATION_ID}', // systemd substitutes this one, deliberately
-    ...onHostEnv.filter((name) => name in capture.env).map((name) => `${name}=${systemdEscape(capture.env[name])}`),
+    ...[...new Set(onHostEnv)].filter((name) => !OPTIONAL_CAPTURE_ENV.includes(name) && name in capture.env).map((name) => `${name}=${systemdEscape(capture.env[name])}`),
   ];
   return [
     'systemd-run', '--user', `--unit=${unit}`,
     prop('Type=exec'), prop('KillMode=process'), prop('OOMPolicy=continue'), prop('TasksMax=infinity'),
     prop(`UMask=${capture.umask}`),
-    prop(`WorkingDirectory=${systemdEscape(projectDir)}`),
+    prop(`WorkingDirectory=${projectDir}`),
     prop(`StandardOutput=append:${runDir}/log`),
     prop(`StandardError=append:${runDir}/log`),
     prop(`ExecStopPost=/bin/sh ${runDir}/kit/src/on-host/record.sh ${runDir}`),
@@ -336,5 +355,5 @@ function onHostDeploy(config, options, deps = {}) {
 }
 
 module.exports = {
-  onHostDeploy, validateOnHostRequest, preflightScript, parsePreflight, buildBundle, buildSubmitArgv, quoteArgv, newRunId, systemdEscape, jsYamlRoot,
+  onHostDeploy, validateOnHostRequest, preflightScript, parsePreflight, parseKeyValues, buildBundle, buildSubmitArgv, quoteArgv, newRunId, systemdEscape, jsYamlRoot,
 };

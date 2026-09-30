@@ -4,7 +4,7 @@
 # per scenario. Exits non-zero if any scenario FAILs. Every scenario starts from a fresh container
 # (harness.sh up) with v1 deployed over ssh; the on-host run then deploys v2.
 #
-# Usage: scripts/on-host-harness/proof.sh [scenario-id ...]   (default: a b c d e f g h h2 i j k l)
+# Usage: scripts/on-host-harness/proof.sh [scenario-id ...]   (default: a b c d e f g h h2 i j k l m)
 # Env:   KEEP=1 leaves the container up at the end (default: harness.sh down).
 #        PROOF_KEEP_LOGS=<dir> copies the per-scenario logs there (default: a fresh temp dir, printed).
 #
@@ -334,7 +334,31 @@ sc_l() {
   else fail l "unit_adj before=$before after=$after ssh=$sshadj op_exit=$rc attach_exit=$arc named=$named health=${sha:0:12} restored=$restored (see $SCRATCH/l.op.log)"; fi
 }
 
-ALL="a b c d e f g h h2 i j k l"
+sc_m() {
+  reset
+  # Values with %, $, ${}, quotes, and (DK_NL) a newline plus a forged protocol line, exported from the
+  # ssh environment (~/.bashrc, prepended ahead of Debian's non-interactive early return). DK_EMPTY is present but empty.
+  hroot sh -c "printf '%s' 'a%40b\$c\${d}%n '\\''q'\\'' \"dq\"' > $APP/probe.val && chown dkapp:dkapp $APP/probe.val"
+  hssh "cat > $APP/rc.add" <<'RC'
+export DK_PROBE="$(cat /srv/dkapp/probe.val)"
+export DK_NL=$'x\nENV_PM2_HOME=/tmp/x'
+export DK_EMPTY=
+RC
+  hssh "cat $APP/rc.add $APP/.bashrc > $APP/.bashrc.new && mv $APP/.bashrc.new $APP/.bashrc"
+  local want got empty
+  want=$(hssh "cat $APP/probe.val"); [ "$(hssh 'printf %s "$DK_PROBE"')" = "$want" ] || { fail m "ssh env does not hold the probe value"; return; }
+  # (1) A forwarded value holding a newline (+ a forged KEY=VALUE line) is refused by name; nothing is submitted.
+  dk env-nl deploy --on-host --sha "$T" --no-auto-cut >"$SCRATCH/m.nl.log" 2>&1; local nlrc=$?
+  local nlnamed; nlnamed=$(clean "$SCRATCH/m.nl.log" | grep -c 'ENV_DK_NL holds control characters')
+  # (2) Every other hostile byte arrives in the hook unchanged; a present-but-empty value is still present.
+  dk env-hook deploy --on-host --sha "$T" --no-auto-cut >"$SCRATCH/m.op.log" 2>&1; local rc=$?
+  got=$(hssh "cat $APP/env-probe.out; echo x"); got=${got%x}; empty=$(hssh "cat $APP/env-empty.out 2>/dev/null")
+  if [ $nlrc -eq 1 ] && [ "$nlnamed" -ge 1 ] && [ $rc -eq 0 ] && [ "$got" = "$want" ] && [ "$empty" = set ]; then
+    pass m "hook saw byte-identical value ${#got} bytes [$got] (hex $(printf %s "$got" | od -An -tx1 | tr -d ' \n')); empty value present; newline+forged-key value refused by name, exit $nlrc"
+  else fail m "nl_exit=$nlrc nl_named=$nlnamed exit=$rc probe=[$got] want=[$want] empty=[$empty] (see $SCRATCH/m.op.log)"; fi
+}
+
+ALL="a b c d e f g h h2 i j k l m"
 for id in ${*:-$ALL}; do
   "sc_$id" || fail "$id" "scenario function crashed"
 done
