@@ -27,7 +27,8 @@ function writeLastDeployRecord(config, { sha, layout, release = null }, ctx) {
     const json = JSON.stringify({
       version: 1, sha, finishedAt: new Date().toISOString(), layout, release,
     });
-    const file = `${config.projectDir}/${LAST_DEPLOY_FILE}`;
+    // No projectDir means steps run in the current directory (local mode), so the record goes there too.
+    const file = config.projectDir ? `${config.projectDir}/${LAST_DEPLOY_FILE}` : LAST_DEPLOY_FILE;
     const res = runOnTarget(atomicWriteCommand(file, json, { mode: '640' }), config, { runtime: ctx.runtime });
     if (!res.ok) throw new Error('write command failed');
     return true;

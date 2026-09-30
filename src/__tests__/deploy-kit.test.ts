@@ -15,6 +15,7 @@ const {
   DEFAULT_CONFIG, deploy, rollback, remote, buildHealthCommand, startTunnel, init, runOnTarget, runScriptOnTarget,
 } = kit;
 const cli = require('../cli.js') as { run: Function; parseOptions: Function };
+const { writeLastDeployRecord } = require('../last-deploy.js') as { writeLastDeployRecord: Function };
 // PKG-82: lock/prev-sha state moved off a hardcoded /tmp path onto
 // lockDir()/prevShaFile() (target-side, under $HOME/.deploy-kit). Import the
 // real helpers so lock-shape assertions below track lock.js instead of
@@ -537,6 +538,16 @@ describe('deploy pipeline', () => {
       const { runtime, calls } = makeRuntime({ prevShaFileSeed: PLAUSIBLE_SHA });
       rollback(cfg, {}, ctxWith(runtime));
       expect(lastDeployWrites(calls)).toEqual([]);
+    });
+
+    it('writes the record in the working directory, never under "null/", when projectDir is unset', () => {
+      const { runtime, calls } = makeRuntime();
+      const noDir = mergeConfig(baseConfig, { projectDir: null, mode: 'local' });
+      expect(writeLastDeployRecord(noDir, { sha: NEW_SHA, layout: 'legacy' }, ctxWith(runtime))).toBe(true);
+      const writes = lastDeployWrites(calls);
+      expect(writes).toHaveLength(1);
+      expect(writes[0]).not.toContain('null/');
+      expect(writes[0]).toMatch(/&& mv -f \S+ \.deploy-kit-last-deploy\.json$/);
     });
 
     it('warns but does not fail the deploy when the record cannot be written', () => {
