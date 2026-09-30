@@ -1,0 +1,6 @@
+{
+  "name": "dkapp",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": { "build": "node -e \"require('./server.js')\" --check || true" }
+}

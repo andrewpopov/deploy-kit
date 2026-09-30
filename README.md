@@ -109,6 +109,8 @@ text or redirection filenames.
 | `ssh.batchMode` | `string \| null` | `'yes'` | ssh | unreleased | `-o BatchMode`; `null` omits. Turns any remaining ssh prompt into a fast failure instead of hanging an unattended deploy. |
 | `stepTimeoutSeconds` | `number \| null` | `1800` | both | 0.5 | Per-command wall-clock timeout; explicit `null` = no limit. |
 | `lock` | `boolean` | `true` | both | 0.5 | Take an atomic target lock so concurrent deploys can't interleave. |
+| `localShell` | `string \| null` | `null` | local | unreleased | Absolute path of the shell `mode:'local'` commands run under (default `sh`). `deploy --on-host` sets it to the ssh login shell captured from the host, so hooks run under the shell they would over ssh. |
+| `onHost.env` | `string[]` | `[]` | ssh | unreleased | `deploy --on-host` only: names of environment variables to capture from the host's ssh environment and forward to the unit. Names must match `^[A-Z_][A-Z0-9_]*$`; `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `PM2_HOME`, `XDG_RUNTIME_DIR`, `NODE_OPTIONS` and `INVOCATION_ID` are refused (deploy-kit sets them itself). |
 | `buildBeforeMigrate` | `boolean` | `false` | both | 0.2 | Build while apps are UP (paused window = just migration). |
 | `verifyPins` | `boolean` | `true` | both | 0.17 | Abort the deploy when the target's installed packages disagree with what its `package.json` pins. Runs on the target right after install, before backup/migrate/build/restart, so a stale install costs a deploy rather than an outage. Neither `npm install` nor `npm ci` re-resolves a changed `github:owner/repo#ref` (verified against npm 11.9.0), so without this a dependency the manifest says was replaced ships silently. Escape hatch: `--skip-pin-check`. |
 | `hooks.install` | `string` | `npm ci --prefer-offline \|\| npm ci \|\| npm install` | both | 0.1 | Dependency install; offline-first so a GitHub outage can't break a no-dep-change deploy. |
@@ -655,7 +657,8 @@ npx deploy-kit clear-pending-release  # discard a stuck auto-cut pending-release
 | `announce-discord` | `--webhook-env NAME` `--service NAME` | Convenience `deliveryEvent.command`: read the post-deploy delivery event on stdin, POST a release announcement to a Discord webhook (env var `NAME`, default `DISCORD_RELEASE_WEBHOOK`). Always exits 0 — an unset env var, malformed stdin, or a failed/timed-out POST is a clear stderr warning, never a failure, since a broken announcement must never fail an already-succeeded deploy. Opt-in — deploy/release stay policy-free. |
 | `run-host-operations` | `--action NAME` `--api-url-env ENV` `--api-key-env ENV` | Host-agent command. Requires a base URL and a narrowly scoped API key, read from the env vars named by `--api-url-env`/`--api-key-env` (default `HOST_OPERATIONS_API_URL` / `HOST_OPERATIONS_API_KEY`). Claims at most one request matching `--action`, runs this checkout's existing configured deploy pipeline, and completes the short-lived lease with a redacted result. It never executes a command, host, or path supplied by the operations API. Example: a Cairn-hosted operations API polling for `DEPLOY_CAIRN_PRODUCTION` requests would run `deploy-kit run-host-operations --action DEPLOY_CAIRN_PRODUCTION --api-url-env CAIRN_OPERATIONS_API_URL --api-key-env CAIRN_OPERATIONS_API_KEY`. |
 | `run-cairn-operations` | — | **Deprecated** alias for `run-host-operations` with the old fixed defaults (action `DEPLOY_CAIRN_PRODUCTION`, env vars `CAIRN_OPERATIONS_API_URL` / `CAIRN_OPERATIONS_API_KEY`). Kept for existing Cairn consumers; new integrations should use `run-host-operations` directly. |
-| `deploy` | `--skip-build` `--skip-deps` `--skip-migrate` `--skip-pin-check` `--no-stash` `--dry-run` `--steal-lock` `--no-lock` `--branch NAME` `--sha SHA` `--no-auto-cut` | Run the full pipeline. `--branch` selects a validated git branch for this invocation without changing config. `--sha` deploys EXACTLY that commit — a full, unabbreviated 40-char lowercase hex SHA-1 that must already be merged onto the deploy branch (fails closed otherwise, naming both SHAs) — instead of whatever `git pull`/the branch tip would resolve. `--sha` only moves the target FORWARD: a SHA behind the target's current HEAD is refused rather than silently downgrading it; use `deploy-kit rollback` to go backward. Mutually exclusive with `--branch`. Rejected whenever a release-kit config is present and auto-cut isn't disabled — regardless of whether there is anything to cut — pass `--no-auto-cut` alongside `--sha` to deploy an explicit commit on a repo that also has auto-cut enabled. Under the release layout, `--no-stash` is rejected (nothing to stash — see Release layout below). |
+| `deploy` | `--skip-build` `--skip-deps` `--skip-migrate` `--skip-pin-check` `--no-stash` `--dry-run` `--steal-lock` `--no-lock` `--branch NAME` `--sha SHA` `--no-auto-cut` `--on-host` | Run the full pipeline. `--on-host` runs it ON the host in a transient systemd user unit so it survives this session's death — see [On-host deploys](#on-host-deploys---on-host). `--branch` selects a validated git branch for this invocation without changing config. `--sha` deploys EXACTLY that commit — a full, unabbreviated 40-char lowercase hex SHA-1 that must already be merged onto the deploy branch (fails closed otherwise, naming both SHAs) — instead of whatever `git pull`/the branch tip would resolve. `--sha` only moves the target FORWARD: a SHA behind the target's current HEAD is refused rather than silently downgrading it; use `deploy-kit rollback` to go backward. Mutually exclusive with `--branch`. Rejected whenever a release-kit config is present and auto-cut isn't disabled — regardless of whether there is anything to cut — pass `--no-auto-cut` alongside `--sha` to deploy an explicit commit on a repo that also has auto-cut enabled. Under the release layout, `--no-stash` is rejected (nothing to stash — see Release layout below). |
+| `attach <run-id>` | — | Follow an `--on-host` run (log stream, then the host's own records) from the local receipts file `~/.deploy-kit/on-host-runs.jsonl`. Exit `0` succeeded, `1` failed, `70` outcome unknown, `75` transport lost. Reads `.deploy-kit.config.json` only for its `ssh` options. See [On-host deploys](#on-host-deploys---on-host). |
 | `rollback` | `--skip-build` `--skip-deps` `--dry-run` `--steal-lock` `--no-lock` | Reset to the recorded pre-deploy SHA, rebuild, restart, health-gate. Does **not** accept `--skip-migrate` or `--no-stash` — rollback never reads them. Under the release layout, `--skip-build`/`--skip-deps` are rejected (rollback is an instant flip to an already-built release — see Release layout below). |
 | — `--dry-run` | | Prints the complete deterministic command stream and executes nothing locally or remotely. Release-layout captured values are symbolic and internally consistent so every phase can be reviewed; config validation remains real. See Release layout below. |
 | `monitor` | `--steal-lock` `--no-lock` `--local` | Run the `monitor` checks, alert on transitions, exit `0`/`1`/`2`. For a cron. `--local` (Since 0.19) forces `mode:'local'` for this run. |
@@ -676,6 +679,94 @@ Or programmatically:
 const { loadConfig, deploy } = require('@andrewpopov/deploy-kit');
 deploy(loadConfig());
 ```
+
+## On-host deploys (`--on-host`)
+
+```
+deploy-kit deploy --on-host --sha <40-hex> --no-auto-cut [--skip-build] [--skip-deps] [--skip-migrate] [--skip-pin-check]
+deploy-kit attach <run-id>
+```
+
+**When to use it.** An ssh-mode deploy runs every step from your session, so losing the
+session (laptop sleeps, agent is killed, network drops) mid-deploy strands the host with
+apps stopped and the lock held. `--on-host` runs the same release-layout pipeline on the
+host as a transient systemd **user** unit, so the deploy finishes whatever happens to the
+operator. It is the same pipeline with the same semantics, relocated — not a new deploy
+mode. Use it for any deploy you cannot afford to have interrupted.
+
+**What it does.** Validates flags and config, runs one read-only ssh preflight, stages a
+self-contained bundle (this deploy-kit, `js-yaml`, the resolved config and a manifest of
+digests) in `~/.deploy-kit/runs/<run-id>/` on the host, appends a local receipt, verifies
+the manifest remotely, then submits `systemd-run --user` (`KillMode=process`,
+`OOMPolicy=continue`, `Type=exec`, no runtime cap) and attaches. Attaching is the same code as
+`deploy-kit attach`: it streams the unit's log and classifies the outcome from records written
+on the host. The run id is `<YYYYMMDDTHHMMSSZ>-<sha12>-<8 hex>`; the unit is
+`deploy-kit-<lockId>-<run-id>`.
+
+**Requirements.** Config: `layout.type: 'releases'`, `mode: 'ssh'`, `lock` not `false`, a finite
+`stepTimeoutSeconds`. Flags: `--sha` and `--no-auto-cut` are required; `--dry-run`, `--no-lock`,
+`--steal-lock`, `--branch` and `--no-stash` are refused by name (`ONHOST_*`), before any ssh.
+
+**Host prerequisites** (the preflight refuses by name if any is missing):
+
+- **Linger**: `sudo loginctl enable-linger <user>` (`ONHOST_NO_LINGER`), so the user manager
+  and its units outlive the ssh session. `systemctl --user` must work over ssh (`ONHOST_NO_USER_MANAGER`).
+- **`KillUserProcesses=no`** in `logind.conf` (the Debian default; with `yes`, logind kills the
+  user's processes at logout regardless of linger).
+- **node >= 20** on the ssh `PATH` (`ONHOST_NODE`).
+- **OOM-score parity.** Units in the user manager default to a *higher* `oom_score_adj` than an
+  ssh session, so under memory pressure the kernel would kill the deploy before the apps it
+  manages. host-run refuses (`ONHOST_OOM_SCORE`) when the unit's value exceeds the ssh
+  session's. Match them with two drop-ins (use your ssh session's value, usually `0`;
+  `cat /proc/self/oom_score_adj` over ssh), then `systemctl daemon-reload` and restart
+  `user@<uid>.service` (or reboot):
+
+  `/etc/systemd/system/user@.service.d/oom-parity.conf`
+  ```ini
+  [Service]
+  OOMScoreAdjust=0
+  ```
+  `/etc/systemd/user.conf.d/oom-parity.conf`
+  ```ini
+  [Manager]
+  DefaultOOMScoreAdjust=0
+  ```
+- For PM2 apps, run the PM2 daemon as a system service (`pm2-<user>.service`, with
+  `PM2_HOME` set there) so it is not in the unit's cgroup. host-run logs a loud
+  `PM2_DAEMON_NOT_SYSTEM_SERVICE` warning after a successful deploy when it is not; the
+  deploy's result is unaffected.
+
+**Environment contract.** The unit starts under `env -i` with exactly: `PATH`, `HOME`, `USER`,
+`LOGNAME`, `SHELL` (the login shell), `LANG` and `PM2_HOME` (when set), `XDG_RUNTIME_DIR` — all
+captured from the host's own ssh session during preflight, not from the operator — plus
+`INVOCATION_ID` and every name listed in `onHost.env` (values captured from the host's ssh
+environment; a name absent there is simply absent). Nothing is forwarded from the operator's
+environment. Hooks run under the captured login shell and the captured `umask`. `NODE_OPTIONS`
+is not forwarded; if it is set in the ssh environment the operator only warns.
+
+**Exit codes** (`deploy --on-host` returns `attach`'s):
+
+| Code | Meaning |
+| --- | --- |
+| `0` | `result.json` reports `success/exited/0` **and** `outcome.json` has `ok: true`. |
+| `1` | The deploy failed, the unit died badly, host-run never claimed the run (`result-unstarted.json`), or a refusal before submission (flags, config, preflight, upload, manifest). |
+| `70` | Outcome unknown: the records are missing, invalid or contradict each other (e.g. a clean unit exit with no `outcome.json`). Inspect the host; the reasons are printed. |
+| `75` | Transport lost (5 retries with backoff exhausted) **or** the submission's acknowledgement was lost. The deploy may still be running. **Do not redeploy**: `deploy-kit attach <run-id>`. Submission is never retried automatically. |
+
+**`attach <run-id>`.** Looks the run up in `~/.deploy-kit/on-host-runs.jsonl` (written before
+anything is submitted, so a lost acknowledgement is still attachable), then follows the log by
+byte offset and reads `started`, `outcome.json`, `result.json` and `result-unstarted.json`
+every 3 s. It stops when a result exists, or when the unit is inactive/failed and 30 s pass
+without one. Re-running it after the deploy finished just re-reads the records and returns the
+same exit code. It must be run from a directory whose `.deploy-kit.config.json` carries the
+same `ssh` options as the deploy; the host and run directory come from the receipt.
+
+**Known limitations.** These are pre-existing weaknesses that on-host runs inherit unchanged,
+not something `--on-host` adds: a step's timed-out *descendants* are not reaped
+(PKG-191), and a stale lock is taken over
+on age alone (PKG-192). Only the
+release layout is supported. A hard host reboot mid-deploy interrupts the run like any other
+deploy; the existing journal recovery applies on the next invocation.
 
 ## Safety behavior
 

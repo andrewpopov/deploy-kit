@@ -80,6 +80,13 @@ const DEFAULT_CONFIG = {
   // Take an atomic lock on the target (mkdir) so two concurrent deploys can't
   // interleave pm2 stop/start + git pulls. false disables; --steal-lock overrides.
   lock: true,
+  // Shell used for `mode: 'local'` commands (default 'sh'). `deploy --on-host`
+  // (PKG-187) sets this to the operator's captured ssh login shell so hooks run
+  // under the same shell they would over ssh.
+  localShell: null,
+  // `deploy --on-host` (PKG-187): { env: [NAMES] } -- extra environment variable
+  // names captured from the target's ssh environment and forwarded to host-run.
+  onHost: null,
   // Build before the backup/stop/migrate block (apps stay up during build) so the
   // paused window is just migration. Default false = build after migrate (paused).
   buildBeforeMigrate: false,
@@ -216,6 +223,8 @@ const KEY_TYPES = {
   ssh: 'object',
   stepTimeoutSeconds: 'number?',
   lock: 'boolean',
+  localShell: 'string?',
+  onHost: 'object?',
   buildBeforeMigrate: 'boolean',
   verifyPins: 'boolean',
   layout: 'object?',
@@ -495,6 +504,30 @@ function validateMonitor(m, source) {
 // fine (deploy normalizes defaults); `type` is the only required key.
 const LAYOUT_KEYS = ['type', 'keepReleases', 'sharedPaths', 'releaseChecks', 'runningShaCommand'];
 
+// Names the on-host runner sets itself (or that would let a config redirect the
+// unit's identity or runtime); they can never be forwarded via `onHost.env`.
+const ON_HOST_FORBIDDEN_ENV = [
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'PM2_HOME', 'XDG_RUNTIME_DIR', 'NODE_OPTIONS', 'INVOCATION_ID',
+];
+const ON_HOST_ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+
+function validateOnHost(onHost, source) {
+  const problems = rejectUnknownKeys(onHost, ['env'], source, 'onHost');
+  if (!('env' in onHost)) return problems;
+  if (!Array.isArray(onHost.env)) {
+    problems.push(`${source}: "onHost.env" must be an array of environment variable names`);
+    return problems;
+  }
+  for (const name of onHost.env) {
+    if (typeof name !== 'string' || !ON_HOST_ENV_NAME_RE.test(name)) {
+      problems.push(`${source}: "onHost.env" entry ${JSON.stringify(name)} must match ${ON_HOST_ENV_NAME_RE}`);
+    } else if (ON_HOST_FORBIDDEN_ENV.includes(name)) {
+      problems.push(`${source}: "onHost.env" must not include "${name}" (set by deploy-kit itself)`);
+    }
+  }
+  return problems;
+}
+
 // Validate the opt-in `layout` block. Returns human-readable problem strings.
 // Enforces Codex's shared-path safety rules at config time: relative, cannot
 // escape the release, and no two paths overlap (one being a prefix of another
@@ -653,6 +686,12 @@ function validateConfig(raw, { source = 'config' } = {}) {
   }
   if (typeof raw.remote === 'string' && !isValidRefName(raw.remote)) {
     problems.push(`${source}: "remote" ("${raw.remote}") must be a valid git ref name (letters, digits, ".", "_", "-", "/"; no "..", no leading "-", no shell metacharacters)`);
+  }
+  if (typeof raw.localShell === 'string' && !raw.localShell.startsWith('/')) {
+    problems.push(`${source}: "localShell" must be an absolute path (start with "/")`);
+  }
+  if (raw.onHost != null && typeof raw.onHost === 'object' && !Array.isArray(raw.onHost)) {
+    problems.push(...validateOnHost(raw.onHost, source));
   }
   if (raw.deliveryEvent != null && typeof raw.deliveryEvent === 'object' && !Array.isArray(raw.deliveryEvent)) {
     problems.push(...validateDeliveryEvent(raw.deliveryEvent, source));

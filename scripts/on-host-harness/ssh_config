@@ -1,0 +1,12 @@
+# Pass with `ssh -F scripts/on-host-harness/ssh_config dkapp-harness <cmd>` (run from this dir or
+# use harness.sh ssh, which substitutes the real .state path). Paths are relative to the cwd ssh
+# is started in, so harness.sh writes a resolved copy to .state/ssh_config for tests.
+Host dkapp-harness
+  HostName 127.0.0.1
+  Port 2299
+  User dkapp
+  IdentityFile @STATE@/id_ed25519
+  IdentitiesOnly yes
+  StrictHostKeyChecking no
+  UserKnownHostsFile @STATE@/known_hosts
+  LogLevel ERROR

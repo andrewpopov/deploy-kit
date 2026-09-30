@@ -22,7 +22,7 @@ const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
   '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
-  '--dir', '--json', '--local', '--branch', '--no-auto-cut', '--guard-config', '--sha',
+  '--dir', '--json', '--local', '--branch', '--no-auto-cut', '--guard-config', '--sha', '--on-host',
 ];
 
 // Flags that take a following positional value. Kept in sync with the arity
@@ -50,7 +50,7 @@ const COMMAND_FLAGS = {
   'verify-tunnel-config': ['--dir', '--guard-config', '--json'],
   'verify-no-secrets': ['--dir', '--guard-config', '--json'],
   'clear-pending-release': ['--dir', '--json'],
-  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut', '--sha'],
+  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut', '--sha', '--on-host'],
   rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock'],
   monitor: ['--steal-lock', '--no-lock', '--local'],
   status: [],
@@ -121,6 +121,7 @@ function parseOptions(args) {
     else if (a === '--steal-lock') options.stealLock = true;
     else if (a === '--no-lock') options.lock = false;
     else if (a === '--no-auto-cut') options.autoCut = false;
+    else if (a === '--on-host') options.onHost = true;
     else if (a === '--webhook-env' && args[i + 1]) { options.webhookEnv = args[i + 1]; i += 1; }
     else if (a === '--service' && args[i + 1]) { options.service = args[i + 1]; i += 1; }
     else if (a === '--action' && args[i + 1]) { options.action = args[i + 1]; i += 1; }
@@ -200,7 +201,7 @@ Commands:
                                             takes no flags
   deploy [--skip-build|--skip-deps|--skip-migrate|--skip-pin-check]
          [--no-stash] [--dry-run] [--steal-lock] [--no-lock] [--branch NAME]
-         [--sha <40-hex-sha>] [--no-auto-cut]
+         [--sha <40-hex-sha>] [--no-auto-cut] [--on-host]
                                             --skip-pin-check disables the post-install
                                             check that the installed tree matches what
                                             package.json pins. It is the escape hatch for
@@ -219,6 +220,16 @@ Commands:
                                             --no-auto-cut alongside --sha to deploy an
                                             explicit commit on a repo that also has
                                             auto-cut enabled.
+                                            --on-host runs the release-layout pipeline ON the host
+                                            in a transient systemd user unit, so it survives the
+                                            death of this session. Requires --sha and --no-auto-cut,
+                                            a releases layout, mode ssh, and lock on; refuses
+                                            --dry-run/--no-lock/--steal-lock/--branch. Exit: 0
+                                            succeeded, 1 failed/refused, 70 outcome unknown, 75
+                                            transport lost or submission unacknowledged (do NOT
+                                            redeploy; attach). See README "On-host deploys".
+  attach <run-id>                          follow an --on-host run from the local receipts file
+                                            (~/.deploy-kit/on-host-runs.jsonl); same exit codes
   rollback [--skip-build|--skip-deps] [--dry-run] [--steal-lock] [--no-lock]
                                             (NOT --skip-migrate or --no-stash — rollback
                                             never reads them)
@@ -370,6 +381,34 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     if (result.ok) { log.success(result.message); return 0; }
     log.error(result.message);
     return 1;
+  }
+
+  // host-run takes a positional <runDir>, like port-guard, and is invoked only by
+  // the on-host systemd unit: no config load, no banner, no flags.
+  if (command === 'host-run') {
+    const rest = argv.slice(1);
+    if (rest.length !== 1 || rest[0].startsWith('-')) {
+      log.error('Usage: deploy-kit host-run <runDir>');
+      return 1;
+    }
+    return require('./on-host/host-run').hostRun(rest[0], { env });
+  }
+
+  // attach takes a positional <run-id>, like host-run; it needs the config only for its ssh options.
+  if (command === 'attach') {
+    const rest = argv.slice(1);
+    if (rest.length !== 1 || rest[0].startsWith('-')) {
+      log.error('Usage: deploy-kit attach <run-id>');
+      return 1;
+    }
+    let attachConfig;
+    try {
+      attachConfig = loadConfig({ cwd });
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
+    return require('./on-host/attach').attachRun(rest[0], attachConfig);
   }
 
   const options = parseOptions(argv.slice(1));
@@ -581,6 +620,10 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     return 1;
   }
   if (options.lock === false) config = { ...config, lock: false };
+
+  if (command === 'deploy' && options.onHost) {
+    return require('./on-host/operator').onHostDeploy(config, options, { cwd });
+  }
 
   switch (command) {
     case 'deploy':

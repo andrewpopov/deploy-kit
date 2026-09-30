@@ -1,0 +1,38 @@
+{
+  "host": "dkapp@127.0.0.1",
+  "projectDir": "/srv/dkapp",
+  "mode": "ssh",
+  "branch": "main",
+  "appNames": [
+    "dkapp-web"
+  ],
+  "port": 3999,
+  "healthPath": "/health",
+  "stepTimeoutSeconds": 120,
+  "ecosystemFile": "ecosystem.config.cjs",
+  "verifyPins": false,
+  "ssh": {
+    "options": [
+      "Port=2299",
+      "IdentityFile=../../.state/id_ed25519",
+      "IdentitiesOnly=yes",
+      "UserKnownHostsFile=../../.state/known_hosts"
+    ],
+    "strictHostKeyChecking": "no"
+  },
+  "hooks": {
+    "install": "npm install --no-audit --no-fund",
+    "build": "printf '%s' \"$DK_PROBE\" > /srv/dkapp/env-probe.out; if [ -n \"${DK_EMPTY+x}\" ]; then echo set > /srv/dkapp/env-empty.out; fi"
+  },
+  "layout": {
+    "type": "releases",
+    "keepReleases": 3,
+    "runningShaCommand": "curl -sf localhost:3999/health"
+  },
+  "onHost": {
+    "env": [
+      "DK_PROBE",
+      "DK_EMPTY"
+    ]
+  }
+}
