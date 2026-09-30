@@ -128,6 +128,12 @@ describe('preflight line protocol (review finding 1, 3, 4)', () => {
     for (const line of output.split('\n')) expect(line).toMatch(/^([A-Z0-9_]+=([0-9a-f]{2})*)?$/);
   });
 
+  it('round-trips a long value with repeated 16-byte blocks (od would otherwise print *)', () => {
+    const repeated = 'a'.repeat(64) + 'b'.repeat(40);
+    const output = runScript({ HOSTILE: repeated, EMPTY: '', LANG: 'C' });
+    expect(op.parseKeyValues(output).get('ENV_HOSTILE')).toBe(repeated);
+  });
+
   it('allows a present-but-empty value, keeps absent distinct, and dedupes names', () => {
     const output = runScript({ HOSTILE: 'v', EMPTY: '', LANG: 'C' });
     expect(output.match(/^ENV_LANG=/gm)).toHaveLength(1);

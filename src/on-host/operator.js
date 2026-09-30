@@ -76,7 +76,7 @@ const captureEnvNames = (config) => [...new Set([...OPTIONAL_CAPTURE_ENV, ...((c
 function preflightScript(config) {
   const unitPattern = `^deploy-kit-${lockId(config).replace(/\./g, '\\.')}-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}-[0-9a-f]{8}\\.service$`;
   return [
-    'dk_emit() { printf \'%s=%s\\n\' "$1" "$(printf \'%s\' "$2" | od -An -tx1 | tr -d \' \\n\')"; }',
+    'dk_emit() { printf \'%s=%s\\n\' "$1" "$(printf \'%s\' "$2" | od -An -v -tx1 | tr -d \' \\n\')"; }',
     'u=${USER:-$(id -un)}; uid=$(id -u)',
     'XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$uid}; export XDG_RUNTIME_DIR',
     'dk_emit DK_USER "$u"; dk_emit DK_UID "$uid"',
