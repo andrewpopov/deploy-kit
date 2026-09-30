@@ -14,6 +14,7 @@ const { onlineAppNames } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
 const { clearAutoCutPending } = require('./auto-cut');
 const { assertShaOptions } = require('./sha-options');
+const { writeLastDeployRecord } = require('./last-deploy');
 
 function defaultSleep(seconds) {
   const ms = seconds * 1000;
@@ -817,6 +818,13 @@ function deploy(config, options = {}, ctx = {}) {
       }
       deliveryEvent = { delivered };
     }
+
+    // Restart, health and every post-deploy check have passed: record the commit now
+    // running (HEAD after the pull/sha checkout) for host monitoring.
+    writeLastDeployRecord(config, {
+      sha: runOnTarget('git rev-parse HEAD', config, { runtime, capture: true }).output.trim(),
+      layout: 'legacy',
+    }, c);
 
     // The resume window (crash-recovery pointer at .deploy-kit/pending-release.json
     // on the CONTROLLER) only closes once R has actually landed on the target --

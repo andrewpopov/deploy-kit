@@ -144,6 +144,31 @@ Set `"mode": "local"` for a box that runs the deploy on itself (no SSH) — it r
 each step as `sh -c 'cd <projectDir> && …'` and skips the tracked-file stash. See
 the local-mode example below.
 
+### Last-deploy record (`.deploy-kit-last-deploy.json`)
+
+After a deploy **fully** succeeds — restart, health check, and every
+`postDeployChecks` entry passed — deploy-kit writes
+`<projectDir>/.deploy-kit-last-deploy.json` on the target (over ssh in
+`mode: "ssh"`, locally in `mode: "local"`; for the release layout `projectDir` is
+the app root holding `current`/`releases`, next to `.deploy-kit-state.json`).
+Host monitoring reads it to draw deploy annotations. It is always on; there is
+no option.
+
+```json
+{"version":1,"sha":"<40-hex commit now running>","finishedAt":"<ISO-8601 UTC>","layout":"legacy","release":null}
+```
+
+`layout` is `"legacy"` or `"release"`; `release` is the release id (release
+layout) or `null`. Nothing else is ever written — no config, env, or paths. The
+file is replaced atomically (same-dir temp file, `chmod 640`, `mv -f`).
+
+- A failed, aborted, or rolled-back deploy leaves the previous record untouched.
+  A release-layout `remain-active`/`manual` post-check outcome is still a failed
+  deploy (it throws), so it does not write one either; `deploy-kit rollback`
+  never writes one.
+- A failure to write the record is **observability, not correctness**: deploy-kit
+  logs a warning and the deploy still succeeds.
+
 ### Release layout (artifact-first deploys)
 
 The default (legacy) deploy runs `pull → npm ci → migrate → build → restart` **on

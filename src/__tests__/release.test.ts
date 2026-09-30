@@ -103,6 +103,9 @@ const relConfig = (over: any = {}) => mergeConfig(DEFAULT_CONFIG, {
 
 const ctx = (runtime: any) => ({ runtime, sleep: () => {} });
 
+const lastDeployWrites = (calls: string[]) => calls.filter((c) => c.includes('.deploy-kit-last-deploy.json.tmp'));
+const lastDeployRecord = (command: string) => JSON.parse(/printf '%s' '(.*?)' > /.exec(command)![1]);
+
 describe('release deploy — happy path', () => {
   it('builds inside the release, then flips current atomically', () => {
     const { runtime, calls } = makeReleaseRuntime();
@@ -465,6 +468,50 @@ describe('release deploy — running-SHA verification retries across a transient
     expect(v.ok).toBe(false);
     expect(v.reason).toContain('reports SHA <none>');
     expect(v.reason).toContain('after 3 attempts');
+  });
+});
+
+describe('release deploy — last-deploy record (PKG-189)', () => {
+  const failingCheck = (onFailure: string) => ({ name: 'public-smoke', command: 'run-smoke', onFailure });
+
+  it('writes exactly the contract fields at the app root after the done journal', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    release.deployRelease(relConfig({
+      postDeployChecks: [{ name: 'public-smoke', command: 'run-smoke', onFailure: 'rollback' }],
+    }), {}, ctx(runtime));
+    const writes = lastDeployWrites(calls);
+    expect(writes).toHaveLength(1);
+    const record = lastDeployRecord(writes[0]);
+    expect(Object.keys(record).sort()).toEqual(['finishedAt', 'layout', 'release', 'sha', 'version']);
+    expect(record).toMatchObject({
+      version: 1, sha: SHA, layout: 'release', release: 'a1b2c3d4e5f6-20260710T090000Z',
+    });
+    expect(writes[0]).toMatch(/chmod 640 .*\.deploy-kit-last-deploy\.json\.tmp\.\$\$ && mv -f /);
+    expect(writes[0]).toContain('/srv/app/.deploy-kit-last-deploy.json');
+    expect(calls.indexOf(writes[0])).toBeGreaterThan(calls.findIndex((c) => c.includes('run-smoke')));
+  });
+
+  it.each(['rollback', 'remain-active', 'manual'])('writes nothing when a post-deploy check fails under %s', (policy) => {
+    const { runtime, calls } = makeReleaseRuntime({ fail: ['run-smoke'] });
+    expect(() => release.deployRelease(relConfig({ postDeployChecks: [failingCheck(policy)] }), {}, ctx(runtime)))
+      .toThrow(/public-smoke/);
+    expect(lastDeployWrites(calls)).toEqual([]);
+  });
+
+  it('writes nothing when activation never verifies healthy (rolled back)', () => {
+    const { runtime, calls } = makeReleaseRuntime({ fail: ['curl'] });
+    expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow();
+    expect(lastDeployWrites(calls)).toEqual([]);
+  });
+
+  it('warns but does not fail the deploy when the record cannot be written', () => {
+    const { runtime, calls } = makeReleaseRuntime({ fail: ['.deploy-kit-last-deploy.json'] });
+    const warnings: string[] = [];
+    const log = { ...kit.makeLogger(() => {}, () => {}), warning: (m: string) => warnings.push(m) };
+    const result = release.deployRelease(relConfig(), {}, { ...ctx(runtime), log });
+    expect(result.healthy).toBe(true);
+    expect(lastDeployWrites(calls)).toHaveLength(1);
+    expect(warnings.some((m) => /Last-deploy record .* could not be written/.test(m))).toBe(true);
   });
 });
 
