@@ -372,6 +372,17 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     return 1;
   }
 
+  // host-run takes a positional <runDir>, like port-guard, and is invoked only by
+  // the on-host systemd unit: no config load, no banner, no flags.
+  if (command === 'host-run') {
+    const rest = argv.slice(1);
+    if (rest.length !== 1 || rest[0].startsWith('-')) {
+      log.error('Usage: deploy-kit host-run <runDir>');
+      return 1;
+    }
+    return require('./on-host/host-run').hostRun(rest[0], { env });
+  }
+
   const options = parseOptions(argv.slice(1));
 
   // Reject any flag this command does not consume, BEFORE any side effect

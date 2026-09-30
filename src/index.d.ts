@@ -162,6 +162,10 @@ export interface DeployConfig {
    * deploy. Explicit `null` opts out. */
   stepTimeoutSeconds?: number | null;
   lock?: boolean;
+  /** Absolute path of the shell used for `mode: 'local'` commands. Default `sh`. */
+  localShell?: string | null;
+  /** `deploy --on-host`: extra environment variable names forwarded from the target's ssh environment. */
+  onHost?: { env?: string[] } | null;
   buildBeforeMigrate?: boolean;
   /** Abort the deploy when the target's installed packages disagree with what its
    * package.json pins. Default `true`. Neither `npm install` nor `npm ci`

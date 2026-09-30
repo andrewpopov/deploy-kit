@@ -96,11 +96,11 @@ function assertNotJsonEncodedShellScript(command) {
 // project dir first (matching the hand-rolled `ssh host "cd dir && cmd"` idiom)
 // and add connect/keepalive timeouts; in 'local' mode (script runs on the box,
 // e.g. sano) we run it directly.
-function buildTargetCommand(command, { mode, host, projectDir, ssh }) {
+function buildTargetCommand(command, { mode, host, projectDir, ssh, localShell }) {
   assertNotJsonEncodedShellScript(command);
   if (mode === 'local') {
     const prefix = projectDir ? `cd ${projectDir} && ` : '';
-    return { file: 'sh', args: ['-c', `${prefix}${command}`] };
+    return { file: localShell || 'sh', args: ['-c', `${prefix}${command}`] };
   }
   if (!host) {
     throw new Error('deploy-kit: mode "ssh" requires a `host` (user@host)');
