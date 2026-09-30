@@ -15,6 +15,7 @@ const {
   DEFAULT_CONFIG, deploy, rollback, remote, buildHealthCommand, startTunnel, init, runOnTarget, runScriptOnTarget,
 } = kit;
 const cli = require('../cli.js') as { run: Function; parseOptions: Function };
+const { writeLastDeployRecord } = require('../last-deploy.js') as { writeLastDeployRecord: Function };
 // PKG-82: lock/prev-sha state moved off a hardcoded /tmp path onto
 // lockDir()/prevShaFile() (target-side, under $HOME/.deploy-kit). Import the
 // real helpers so lock-shape assertions below track lock.js instead of
@@ -129,6 +130,9 @@ const baseConfig = mergeConfig(DEFAULT_CONFIG, {
 });
 
 const ctxWith = (runtime: any) => ({ runtime, sleep: () => {} });
+
+const lastDeployWrites = (calls: string[]) => calls.filter((c) => c.includes('.deploy-kit-last-deploy.json.tmp'));
+const lastDeployRecord = (command: string) => JSON.parse(/printf '%s' '(.*?)' > /.exec(command)![1]);
 
 describe('config', () => {
   it('deep-merges hooks and health over defaults', () => {
@@ -497,6 +501,66 @@ describe('deploy pipeline', () => {
     expect(() => deploy(cfg, {}, ctxWith(failed.runtime))).toThrow(/Post-deploy check: public-smoke failed/);
   });
 
+  describe('last-deploy record (PKG-189)', () => {
+    const cfg = mergeConfig(baseConfig, {
+      health: { attempts: 1, delaySeconds: 0 },
+      postDeployChecks: [{ name: 'public-smoke', command: 'npm run test:smoke:prod' }],
+    });
+    const NEW_SHA = 'b'.repeat(40);
+
+    it('writes exactly the contract fields, atomically, with the commit now running, after health and post-deploy checks', () => {
+      const { runtime, calls } = makeRuntime({ headSha: NEW_SHA });
+      deploy(cfg, {}, ctxWith(runtime));
+      const writes = lastDeployWrites(calls);
+      expect(writes).toHaveLength(1);
+      const record = lastDeployRecord(writes[0]);
+      expect(Object.keys(record).sort()).toEqual(['finishedAt', 'layout', 'release', 'sha', 'version']);
+      expect(record).toMatchObject({ version: 1, sha: NEW_SHA, layout: 'legacy', release: null });
+      expect(new Date(record.finishedAt).toISOString()).toBe(record.finishedAt);
+      expect(writes[0]).toMatch(/chmod 640 .*\.deploy-kit-last-deploy\.json\.tmp\.\$\$ && mv -f /);
+      expect(writes[0]).toContain('/srv/app/.deploy-kit-last-deploy.json');
+      expect(calls.indexOf(writes[0])).toBeGreaterThan(calls.findIndex((c) => c.includes('npm run test:smoke:prod')));
+    });
+
+    it('leaves the previous record untouched when health fails or a post-deploy check fails', () => {
+      const unhealthy = makeRuntime();
+      const base = unhealthy.runtime.execFileSync;
+      const badHealth = { execFileSync: (f: string, a: string[], o: any) => (a[a.length - 1].includes('curl') ? '503' : base(f, a, o)) };
+      expect(() => deploy(cfg, {}, ctxWith(badHealth))).toThrow(/unhealthy/);
+      expect(lastDeployWrites(unhealthy.calls)).toEqual([]);
+
+      const badCheck = makeRuntime({ fail: ['npm run test:smoke:prod'] });
+      expect(() => deploy(cfg, {}, ctxWith(badCheck.runtime))).toThrow(/Post-deploy check/);
+      expect(lastDeployWrites(badCheck.calls)).toEqual([]);
+    });
+
+    it('does not write a record from a rollback', () => {
+      const { runtime, calls } = makeRuntime({ prevShaFileSeed: PLAUSIBLE_SHA });
+      rollback(cfg, {}, ctxWith(runtime));
+      expect(lastDeployWrites(calls)).toEqual([]);
+    });
+
+    it('writes the record in the working directory, never under "null/", when projectDir is unset', () => {
+      const { runtime, calls } = makeRuntime();
+      const noDir = mergeConfig(baseConfig, { projectDir: null, mode: 'local' });
+      expect(writeLastDeployRecord(noDir, { sha: NEW_SHA, layout: 'legacy' }, ctxWith(runtime))).toBe(true);
+      const writes = lastDeployWrites(calls);
+      expect(writes).toHaveLength(1);
+      expect(writes[0]).not.toContain('null/');
+      expect(writes[0]).toMatch(/&& mv -f \S+ \.deploy-kit-last-deploy\.json$/);
+    });
+
+    it('warns but does not fail the deploy when the record cannot be written', () => {
+      const { runtime, calls } = makeRuntime({ fail: ['.deploy-kit-last-deploy.json'] });
+      const warnings: string[] = [];
+      const log = { ...kit.makeLogger(() => {}, () => {}), warning: (m: string) => warnings.push(m) };
+      const result = deploy(cfg, {}, { ...ctxWith(runtime), log });
+      expect(result.healthy).toBe(true);
+      expect(lastDeployWrites(calls)).toHaveLength(1);
+      expect(warnings.some((m) => /Last-deploy record .* could not be written/.test(m))).toBe(true);
+    });
+  });
+
   it('rejects malformed postDeployChecks instead of silently ignoring them', () => {
     expect(validateConfig({ postDeployChecks: [{ name: '', command: '' }] }).join('\n'))
       .toMatch(/postDeployChecks\[0\]\.(name|command)/);
@@ -532,7 +596,8 @@ describe('deploy pipeline', () => {
     const { runtime: r2, calls: c2 } = makeRuntime();
     const withEmpty = deploy(mergeConfig(baseConfig, { preRestartChecks: [] }), {}, ctxWith(r2));
     expect(withEmpty.steps).toEqual(base.steps);
-    expect(c2).toEqual(c1);
+    const maskClock = (cmds: string[]) => cmds.map((cmd) => cmd.replace(/"finishedAt":"[^"]*"/, '"finishedAt":"<clock>"'));
+    expect(maskClock(c2)).toEqual(maskClock(c1));
   });
 
   it('preRestartChecks also gates rollback, immediately before its restart', () => {

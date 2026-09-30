@@ -508,6 +508,18 @@ function run(deployFn: Function, config: any, appNames: string[]) {
   return { calls, result, error };
 }
 
+// Delta 8 (observability, PKG-189): a fully successful deploy now ends by recording
+// `.deploy-kit-last-deploy.json` -- the write itself, plus (legacy only) the HEAD read
+// that immediately precedes it. It is purely additive and post-success, so it is
+// stripped from the CURRENT run rather than woven into the v0.9.4 sequence; its own
+// behavior is pinned in deploy-kit.test.ts and release.test.ts.
+function withoutLastDeployRecord(calls: string[]): string[] {
+  const writeIndex = calls.findIndex((cmd) => cmd.includes('.deploy-kit-last-deploy.json'));
+  if (writeIndex < 0) return calls;
+  const dropsHeadRead = calls[writeIndex - 1]?.endsWith('git rev-parse HEAD');
+  return calls.filter((_, i) => i !== writeIndex && !(dropsHeadRead && i === writeIndex - 1));
+}
+
 describe('consumer regression: v0.9.4 command sequence is byte-identical (preRestartChecks absent)', () => {
   for (const [name, raw] of Object.entries(CONFIGS)) {
     it(`${name}: deploy() emits the same command sequence as v0.9.4`, () => {
@@ -518,7 +530,7 @@ describe('consumer regression: v0.9.4 command sequence is byte-identical (preRes
       const oldRun = run(oldDeploy.deploy, config, appNames);
       const newRun = run(kit.deploy, config, appNames);
 
-      expect(newRun.calls).toEqual(applyIntentionalDeltas(oldRun.calls, config));
+      expect(withoutLastDeployRecord(newRun.calls)).toEqual(applyIntentionalDeltas(oldRun.calls, config));
       expect(newRun.error).toEqual(applyIntentionalErrorDelta(oldRun.error, config));
 
       // Guard against this test silently going vacuous again (the release-id

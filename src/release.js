@@ -10,6 +10,7 @@ const { parsePm2List } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
 const { clearAutoCutPending } = require('./auto-cut');
 const { assertShaOptions } = require('./sha-options');
+const { atomicWriteCommand, writeLastDeployRecord } = require('./last-deploy');
 
 // Bump when the on-host layout changes shape. The host migration writes this
 // version into .deploy-kit-layout; a release deploy refuses a host whose marker
@@ -979,6 +980,8 @@ function deployRelease(config, options = {}, ctx = {}) {
     // ---- Phase: metadata + prune (success; still holding the lock) ----
     st.phase = 'done';
     persistState(config, paths, { phase: 'done', current: `releases/${releaseId}`, previous: st.prevTarget, sha: st.sha, backupId: st.backupId, migrated: st.migrated, ts }, c);
+    // Restart, health and every post-deploy check have passed: record it for host monitoring.
+    writeLastDeployRecord(config, { sha: st.sha, layout: 'release', release: releaseId }, c);
     prune(config, paths, releaseId, c);
     steps.push('prune');
 
@@ -1036,9 +1039,7 @@ function activateSymlink(config, paths, relTarget, ctx, { link, tolerate = false
 // truncated/empty state. Gated — a failed write aborts rather than silently
 // reporting success. Used both for durable journaling and the final success record.
 function persistState(config, paths, state, ctx) {
-  const json = JSON.stringify({ ...state, layoutVersion: LAYOUT_VERSION }).replace(/'/g, "'\\''");
-  const tmp = `${paths.stateFile}.tmp.$$`;
-  const cmd = `printf '%s' '${json}' > ${tmp} && mv -f ${tmp} ${paths.stateFile}`;
+  const cmd = atomicWriteCommand(paths.stateFile, JSON.stringify({ ...state, layoutVersion: LAYOUT_VERSION }));
   const res = runOnTarget(cmd, { ...config, projectDir: paths.root }, { runtime: ctx.runtime });
   if (!res.ok) throw new Error(`Failed to persist release metadata (${paths.stateFile})`);
 }
