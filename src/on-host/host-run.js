@@ -180,7 +180,7 @@ function warnIfPm2NotSystemService({ env, log, readFile, run }) {
   try {
     const pm2Home = env.PM2_HOME || path.join(env.HOME || os.homedir(), '.pm2');
     const daemonPid = readFile(path.join(pm2Home, 'pm2.pid')).trim();
-    const mainPid = String(run('systemctl', ['--user', 'show', '-p', 'MainPID', '--value', `pm2-${env.USER}.service`])).trim();
+    const mainPid = String(run('systemctl', ['show', '-p', 'MainPID', '--value', `pm2-${env.USER}.service`])).trim();
     if (daemonPid === mainPid) return;
     log.warning(`PM2_DAEMON_NOT_SYSTEM_SERVICE: pm2.pid is ${daemonPid}, pm2-${env.USER}.service MainPID is ${mainPid}`);
   } catch (error) {
@@ -241,4 +241,6 @@ function hostRun(runDir, deps = {}) {
   }
 }
 
-module.exports = { hostRun, OnHostError, OPTION_ALLOWLIST, INVOCATION_ID_RE };
+module.exports = {
+  hostRun, OnHostError, OPTION_ALLOWLIST, INVOCATION_ID_RE, listFiles, sha256File,
+};

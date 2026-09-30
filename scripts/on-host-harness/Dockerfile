@@ -14,6 +14,11 @@ RUN useradd -m -d /srv/dkapp -s /bin/bash dkapp && usermod -p '*' dkapp \
     && mkdir -p /run/sshd
 COPY seed /opt/seed
 RUN chmod +x /opt/seed/bootstrap.sh && su dkapp -c /opt/seed/bootstrap.sh
+# OOM-score parity (README "On-host deploys"): without these the user manager's units sit at 200
+# while an ssh session sits at 0, and host-run refuses with ONHOST_OOM_SCORE.
+RUN mkdir -p /etc/systemd/system/user@.service.d /etc/systemd/user.conf.d \
+    && printf '[Service]\nOOMScoreAdjust=0\n' > /etc/systemd/system/user@.service.d/oom-parity.conf \
+    && printf '[Manager]\nDefaultOOMScoreAdjust=0\n' > /etc/systemd/user.conf.d/oom-parity.conf
 COPY pm2-dkapp.service /etc/systemd/system/pm2-dkapp.service
 RUN systemctl enable ssh pm2-dkapp \
     && systemctl mask getty.target console-getty.service 2>/dev/null || true
