@@ -129,7 +129,8 @@ const baseConfig = mergeConfig(DEFAULT_CONFIG, {
   autoCut: false,
 });
 
-const ctxWith = (runtime: any) => ({ runtime, sleep: () => {} });
+const FIXED_NOW = Date.parse("2026-07-10T09:00:00Z");
+const ctxWith = (runtime: any) => ({ runtime, sleep: () => {}, now: () => FIXED_NOW });
 
 const lastDeployWrites = (calls: string[]) => calls.filter((c) => c.includes('.deploy-kit-last-deploy.json.tmp'));
 const lastDeployRecord = (command: string) => JSON.parse(/printf '%s' '(.*?)' > /.exec(command)![1]);

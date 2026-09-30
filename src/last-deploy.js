@@ -25,7 +25,7 @@ function writeLastDeployRecord(config, { sha, layout, release = null }, ctx) {
       return false;
     }
     const json = JSON.stringify({
-      version: 1, sha, finishedAt: new Date().toISOString(), layout, release,
+      version: 1, sha, finishedAt: new Date(ctx.now ? ctx.now() : Date.now()).toISOString(), layout, release,
     });
     // No projectDir means steps run in the current directory (local mode), so the record goes there too.
     const file = config.projectDir ? `${config.projectDir}/${LAST_DEPLOY_FILE}` : LAST_DEPLOY_FILE;
