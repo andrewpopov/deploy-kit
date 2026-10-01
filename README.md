@@ -562,6 +562,16 @@ laptop-driven `deploy`/`rollback`, but the 24/7 `monitor` cron runs on the targe
 itself: every check and the alert sink then execute locally (no ssh), while `host` is
 left untouched and still identifies the target in the monitor header/alert event.
 
+**Running `monitor` on the target host (PKG-197).** There is no auto-detection of
+"I am on the target": `--on-host` (PKG-187) is an explicit operator-side flag and
+defines no identity check, and `monitor --local` is likewise explicit. A timer or
+cron running on the host must therefore pass it, e.g.
+`ExecStart=pnpm exec deploy-kit monitor --local`; without it deploy-kit ssh-es to
+`host` (even `user@127.0.0.1`), one session per command. Over ssh (a genuinely
+remote `monitor`) a run now shares one connection (OpenSSH `ControlMaster=auto`,
+`ControlPersist=60`, a private per-run socket directory that is closed and removed at
+exit); an `ssh.options` entry for `ControlMaster`/`ControlPath` takes precedence.
+
 #### `alert-discord` — bundled Discord sink (opt-in convenience, not a policy change)
 
 `monitor.alert` is deliberately **policy-free**: `monitor.js`/`checks.js` only know
