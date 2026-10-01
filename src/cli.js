@@ -655,7 +655,7 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
           log.error('No `monitor` config block — add one to enable `deploy-kit monitor` (see MonitorConfig).');
           return 2;
         }
-        return require('./monitor').monitor(config, options).exitCode; // 0 ok/warn · 1 crit · 2 monitor error
+        return require('./ssh-mux').withSshMux(config, (c) => require('./monitor').monitor(c, options)).exitCode; // 0 ok/warn · 1 crit · 2 monitor error
       } catch (error) {
         log.error(error instanceof Error ? error.message : String(error));
         return 2;
