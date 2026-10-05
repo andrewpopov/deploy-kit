@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { createRequire } from 'module';
 
 const require = createRequire(__filename);
-const { autoCut, PENDING_RELEASE_PATH } = require('../auto-cut.js');
+const { autoCut, runLocal, PENDING_RELEASE_PATH } = require('../auto-cut.js');
+const { normalizeRuntime } = require('../exec.js');
 const { mergeConfig, DEFAULT_CONFIG } = require('../index.js');
 
 const REMOTE = 'origin';
@@ -721,5 +722,69 @@ describe('autoCut mode: "local" (detached temp worktree)', () => {
     // No worktree command of any kind in ssh mode.
     expect(sshCalls.some((c: string) => c.includes('worktree'))).toBe(false);
     void sshCfg;
+  });
+});
+
+// PKG-207: a consumer's pre-push hook printed ~2.2 MB, Node's 1 MB execFileSync
+// default killed the push with ENOBUFS, and the thrown error carried neither the
+// code nor any stdout, so the operator saw only "command failed: git push".
+describe('runLocal (PKG-207)', () => {
+  const BIG_OUTPUT_CMD = `node -e "process.stdout.write('x'.repeat(2 * 1024 * 1024))"`;
+
+  it('a captured command printing more than the 1 MB Node default does not die with ENOBUFS (real execFileSync)', () => {
+    const res = runLocal(normalizeRuntime(), process.cwd(), BIG_OUTPUT_CMD);
+    expect(res.ok).toBe(true);
+    expect(res.output.length).toBe(2 * 1024 * 1024);
+  });
+
+  it('streams the release push to the operator (stderr, no pipe) instead of buffering it', () => {
+    const { runtime } = makeAutoCutRuntime();
+    const ctx = baseCtx();
+    wireCutSideEffects(runtime, ctx.fs);
+    const optionsByCmd = new Map<string, any>();
+    const original = runtime.execFileSync;
+    runtime.execFileSync = (file: string, args: string[], options: any) => {
+      optionsByCmd.set(args[args.length - 1], options);
+      return original(file, args, options);
+    };
+    autoCut(baseConfig(), { projectRoot: ROOT }, { ...ctx, runtime });
+    const pushCmd = [...optionsByCmd.keys()].find((c) => c.startsWith('git push -u')) as string;
+    expect(optionsByCmd.get(pushCmd).stdio).toEqual(['ignore', 2, 2]);
+    const commitCmd = [...optionsByCmd.keys()].find((c) => c.startsWith('git commit -m')) as string;
+    expect(optionsByCmd.get(commitCmd).stdio).toEqual(['ignore', 2, 2]);
+    // Everything else stays captured, with a generous buffer cap.
+    const revParse = optionsByCmd.get('git rev-parse HEAD');
+    expect(revParse.stdio).toBeUndefined();
+    expect(revParse.maxBuffer).toBeGreaterThanOrEqual(64 * 1024 * 1024);
+  });
+
+  it('a failure names the error code, signal, exit status, stderr and a bounded tail of stdout', () => {
+    const runtime = {
+      execFileSync: () => {
+        const err: any = new Error('spawnSync sh ENOBUFS');
+        err.code = 'ENOBUFS';
+        err.signal = 'SIGTERM';
+        err.status = null;
+        err.stderr = 'hook said: nope';
+        err.stdout = `HEAD-MARKER${'.'.repeat(10000)}TAIL-MARKER`;
+        throw err;
+      },
+    };
+    let message = '';
+    try { runLocal(runtime, ROOT, 'git push -u origin x'); } catch (e: any) { message = e.message; }
+    expect(message.split('\n')[0]).toBe('auto-cut: command failed: git push -u origin x');
+    expect(message).toContain('code=ENOBUFS');
+    expect(message).toContain('signal=SIGTERM');
+    expect(message).toContain('hook said: nope');
+    expect(message).toContain('TAIL-MARKER');
+    expect(message).not.toContain('HEAD-MARKER');
+    expect(message.length).toBeLessThan(4500);
+  });
+
+  it('a plain non-zero exit reports the exit status', () => {
+    const runtime = {
+      execFileSync: () => { const err: any = new Error('x'); err.status = 3; err.stdout = ''; err.stderr = ''; throw err; },
+    };
+    expect(() => runLocal(runtime, ROOT, 'false')).toThrow(/command failed: false\n.*exit=3/);
   });
 });

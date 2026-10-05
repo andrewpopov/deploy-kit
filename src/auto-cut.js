@@ -17,6 +17,26 @@ const CUT_SCRIPT_NAME = 'release:cut';
 
 // ---- small local helpers ---------------------------------------------------
 
+const LOCAL_MAX_BUFFER = 64 * 1024 * 1024;
+const FAILURE_STDOUT_TAIL_CHARS = 4000;
+
+function describeFailure(error) {
+  const reasons = [];
+  if (error && error.code != null) reasons.push(`code=${error.code}`);
+  if (error && error.signal) reasons.push(`signal=${error.signal}`);
+  if (error && error.status != null) reasons.push(`exit=${error.status}`);
+  const stderr = String((error && error.stderr) || '');
+  const stdout = String((error && error.stdout) || '');
+  const lines = [];
+  if (reasons.length) lines.push(reasons.join(' '));
+  if (stderr) lines.push(stderr);
+  if (stdout) {
+    const truncated = stdout.length > FAILURE_STDOUT_TAIL_CHARS;
+    lines.push(`stdout (${truncated ? `last ${FAILURE_STDOUT_TAIL_CHARS} chars` : 'full'}):\n${truncated ? stdout.slice(-FAILURE_STDOUT_TAIL_CHARS) : stdout}`);
+  }
+  return lines.length ? `\n${lines.join('\n')}` : '';
+}
+
 // Run a shell one-liner on the LOCAL controller checkout (never the deploy
 // target -- auto-cut always runs on the machine invoking deploy-kit, before
 // either pipeline touches a host). Mirrors exec.js's `sh -c` idiom for
@@ -24,17 +44,23 @@ const CUT_SCRIPT_NAME = 'release:cut';
 // normalizeRuntime seam as every other deploy-kit module, without pulling in
 // runOnTarget (which builds ssh/host commands from `config`, not applicable
 // here).
-function runLocal(runtime, cwd, command, { allowFailure = false, input } = {}) {
-  const execOptions = { cwd, encoding: 'utf8' };
+//
+// Captured commands get a generous maxBuffer (Node's 1 MB default killed a
+// push whose pre-push hook printed ~2.2 MB, PKG-207). `stream: true` is for
+// commands that run git hooks (commit, push): their output goes live to this
+// process's stderr (fd 2, so a --json stdout stays clean) and is never
+// buffered, so a long gate is visible as it runs and has no size cap.
+function runLocal(runtime, cwd, command, { allowFailure = false, input, stream = false } = {}) {
+  const execOptions = { cwd, encoding: 'utf8', maxBuffer: LOCAL_MAX_BUFFER };
   if (input != null) execOptions.input = input;
+  if (stream) execOptions.stdio = ['ignore', 2, 2];
   try {
     const output = runtime.execFileSync('sh', ['-c', command], execOptions);
     return { ok: true, output: String(output || ''), stderr: '' };
   } catch (error) {
     const result = { ok: false, output: String((error && error.stdout) || ''), stderr: String((error && error.stderr) || ''), error };
     if (!allowFailure) {
-      const detail = result.stderr ? `\n${result.stderr}` : '';
-      throw new Error(`auto-cut: command failed: ${command}${detail}`);
+      throw new Error(`auto-cut: command failed: ${command}${describeFailure(error)}`);
     }
     return result;
   }
@@ -680,7 +706,7 @@ function autoCut(config, options = {}, ctx = {}) {
       }
 
       runLocal(runtime, cutCwd, `git add -- ${toStage.map((p) => `'${p.replace(/'/g, "'\\''")}'`).join(' ')}`);
-      runLocal(runtime, cutCwd, `git commit -m ${shQuote(`release: cut ${newVersion}`)}`);
+      runLocal(runtime, cutCwd, `git commit -m ${shQuote(`release: cut ${newVersion}`)}`, { stream: true });
       const cleanRes = runLocal(runtime, cutCwd, 'git status --porcelain=v2 --ignore-submodules=none');
       if (cleanRes.output.trim() !== '') {
         throw new Error('auto-cut: working tree is not clean after committing the cut -- something outside the validated diff was left behind');
@@ -689,7 +715,7 @@ function autoCut(config, options = {}, ctx = {}) {
       const cutSha = cutShaRes.output.trim();
 
       // 8. Merge with a pre-merge CAS.
-      runLocal(runtime, cutCwd, `git push -u ${shQuote(config.remote)} ${shQuote(cutBranch)}`);
+      runLocal(runtime, cutCwd, `git push -u ${shQuote(config.remote)} ${shQuote(cutBranch)}`, { stream: true });
       const prTitle = `release: cut ${newVersion}`;
       runLocal(runtime, cutCwd, `gh pr create --base ${shQuote(config.branch)} --head ${shQuote(cutBranch)} --title ${shQuote(prTitle)} --body ${shQuote('Automated release cut by deploy-kit auto-cut.')}`);
       const prNumberRes = runLocal(runtime, cutCwd, `gh pr view ${shQuote(cutBranch)} --json number -q .number`);
@@ -824,6 +850,7 @@ function wouldAutoCutRun(config, options = {}, ctx = {}) {
 
 module.exports = {
   autoCut,
+  runLocal,
   clearAutoCutPending,
   clearPendingReleasePointer,
   wouldAutoCutRun,

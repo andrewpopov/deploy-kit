@@ -683,6 +683,14 @@ argument directly), not just a suggestion. Passing an unsupported flag (a typo, 
 flag from a different command) exits `1` naming the offending flag(s) and what the
 command actually supports, instead of parsing fine and silently doing nothing with it.
 
+**Auto-cut output.** When `deploy` cuts a release first (auto-cut), the release
+`git commit` and `git push` stream their output live to stderr, so a long pre-commit
+or pre-push gate is visible as it runs and has no size limit. Other local commands are
+captured with a 64 MB buffer. A failed command's error names the command, then the
+error code, signal or exit status (for example `code=ENOBUFS`), its stderr, and the
+last 4000 characters of its captured stdout. Streamed commands print their own output
+live instead, so their error carries only the code and exit status.
+
 Or programmatically:
 
 ```js
