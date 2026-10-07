@@ -9,6 +9,11 @@ export interface DeployHooks {
   generate?: string | null;
   backup?: string | null;
   migrate?: string | null;
+  /** Release layout only. Read-only probe run before `migrate` (writers stopped,
+   * backup taken): exit 0 with a last non-empty stdout line that is exactly a
+   * base-10 integer = pending migrations. Exactly 0 skips `migrate`; anything
+   * else runs it as usual. null = disabled. */
+  pendingMigrations?: string | null;
   build?: string | null;
   restart?: string | null;
   /** Restore the pre-migration DB backup during release-layout recovery. Receives

@@ -310,6 +310,22 @@ describe('deploy pipeline', () => {
     expect(calls.some((c) => c.includes('DEPLOY_KIT_SHARED_DIR'))).toBe(false);
   });
 
+  // PKG-212: the probe is release-layout only. Legacy has no migrated marker or DB
+  // restore for it to protect, so it must say it is ignored, never run it, and
+  // keep running migrate.
+  it('hooks.pendingMigrations is ignored under the legacy layout with a warning; migrate still runs', () => {
+    const { runtime, calls } = makeRuntime();
+    const warnings: string[] = [];
+    const log = { ...kit.makeLogger(() => {}, () => {}), warning: (m: string) => warnings.push(m) };
+    const cfg = mergeConfig(baseConfig, { hooks: { ...baseConfig.hooks, pendingMigrations: 'check-pending' } });
+
+    const result = deploy(cfg, {}, { ...ctxWith(runtime), log });
+
+    expect(result.steps).toContain('migrate');
+    expect(calls.some((c) => c.includes('check-pending'))).toBe(false);
+    expect(warnings.some((w) => /hooks\.pendingMigrations is ignored by the legacy/.test(w))).toBe(true);
+  });
+
   it('omits unsafe or noisy backup output from delivery events without failing the deploy', () => {
     for (const backupOutput of [
       '../../etc/shadow',

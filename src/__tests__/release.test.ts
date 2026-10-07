@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { createRequire } from 'module';
-import { execSync } from 'child_process';
+import { execSync, execFileSync as realExecFileSync } from 'child_process';
+import { mkdtempSync, openSync, closeSync, readdirSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import path from 'path';
 
 const require = createRequire(__filename);
 const kit = require('../index.js') as typeof import('../index');
@@ -31,11 +34,17 @@ function makeReleaseRuntime(over: any = {}) {
     previousLink: 'releases/00000000bbbb-20260708T090000Z',
     tracked: '',
     stateContent: '', // what `cat .deploy-kit-state.json` returns (interrupted-deploy guard)
+    pending: '', // stdout of the hooks.pendingMigrations probe ('check-pending')
+    restoreTail: '', // stdout of the restore-output `tail -c` read-back
     fail: [] as string[],
+    // A command that exits non-zero but still printed something (key = substring
+    // of the command, value = the stdout it leaves behind; `code` is the error code).
+    failStdout: {} as Record<string, { stdout: string; code?: string }>,
     ...over,
   };
   const calls: string[] = [];
   const inputs: Array<{ command: string; input: string | undefined }> = [];
+  const execOptions: Array<{ command: string; options: any }> = [];
   // Model PM2 stop/start so the GATED, verified writer-stop can be exercised: a
   // `pm2 stop` marks apps stopped; a start/restart brings them back online.
   const stopped = new Set<string>();
@@ -43,6 +52,15 @@ function makeReleaseRuntime(over: any = {}) {
     const cmd = args[args.length - 1];
     calls.push(cmd);
     inputs.push({ command: cmd, input: options.input });
+    execOptions.push({ command: cmd, options });
+    const failStdoutKey = Object.keys(cfg.failStdout).find((k) => cmd.includes(k));
+    if (failStdoutKey) {
+      const err: any = new Error(`fake failure with output: ${cmd}`);
+      err.stdout = cfg.failStdout[failStdoutKey].stdout;
+      err.code = cfg.failStdout[failStdoutKey].code;
+      err.status = 1;
+      throw err;
+    }
     if (cfg.fail.some((f: string) => cmd.includes(f))) {
       const err: any = new Error(`fake failure: ${cmd}`);
       err.stdout = '';
@@ -67,10 +85,12 @@ function makeReleaseRuntime(over: any = {}) {
     if (cmd.includes('git ls-files')) return cfg.tracked;
     if (cmd.includes('get-running-sha')) return cfg.runningSha;
     if (cmd.includes('run-backup')) return cfg.backupId;
+    if (cmd.includes('check-pending')) return cfg.pending;
+    if (cmd.includes('tail -c')) return cfg.restoreTail;
     if (cmd.includes('curl')) return '200';
     return '';
   };
-  return { runtime: { execFileSync }, calls, inputs, cfg };
+  return { runtime: { execFileSync }, calls, inputs, execOptions, cfg };
 }
 
 const relConfig = (over: any = {}) => mergeConfig(DEFAULT_CONFIG, {
@@ -1448,5 +1468,257 @@ describe('legacy path refuses a release-layout host', () => {
     });
     expect(() => kit.deploy(legacy, {}, ctx(runtime))).toThrow(/Refusing to run a legacy in-place deploy/);
     expect(calls.some((cmd) => cmd.includes('git pull'))).toBe(false);
+  });
+});
+
+// PKG-212: a failed deploy with nothing to migrate must never take the app down.
+describe('PKG-212: hooks.pendingMigrations skips a provably no-op migrate', () => {
+  const probeHooks = (extra: any = {}) => ({
+    install: 'npm ci', build: 'npm run build', backup: 'run-backup', migrate: 'run-migrate',
+    restore: 'run-restore', pendingMigrations: 'check-pending', ...extra,
+  });
+  const probeConfig = (over: any = {}) => relConfig({ hooks: probeHooks(), ...over });
+  const smoke = { name: 'public-smoke', command: 'run-smoke', onFailure: 'rollback' };
+
+  // Every journal / success record the pipeline wrote, in order, parsed back from the
+  // atomic-write commands (so a test reads what the host would have on disk).
+  const journals = (calls: string[]) => calls
+    .filter((cmd) => cmd.includes('.deploy-kit-state.json.tmp'))
+    .map((cmd) => JSON.parse(/printf '%s' '(.*?)' > /.exec(cmd)![1]));
+  const indexOfCall = (calls: string[], needle: string) => calls.findIndex((cmd) => cmd.includes(needle));
+
+  it('exactly 0: the migrate hook is not run, migrated stays false, and the audit field is journaled', () => {
+    const { runtime, calls } = makeReleaseRuntime({ pending: '0\n' });
+    const result = release.deployRelease(probeConfig(), {}, ctx(runtime));
+    expect(result.steps).toEqual(
+      ['materialize', 'shared', 'install', 'verify-pins', 'build', 'validate', 'backup', 'migrate-skipped', 'flip', 'health', 'prune'],
+    );
+    expect(calls.some((cmd) => cmd.includes('run-migrate'))).toBe(false);
+    expect(indexOfCall(calls, 'run-backup')).toBeLessThan(indexOfCall(calls, 'check-pending'));
+    expect(indexOfCall(calls, 'pm2 stop app')).toBeLessThan(indexOfCall(calls, 'check-pending'));
+    // The probe runs in the candidate release, not the live root.
+    expect(calls.find((cmd) => cmd.includes('check-pending'))).toMatch(/cd \/srv\/app\/releases\/a1b2c3d4e5f6-20260710T090000Z && check-pending/);
+    const written = journals(calls);
+    expect(written.every((j) => j.migrated === false)).toBe(true);
+    expect(written.find((j) => j.phase === 'flipped')).toMatchObject({ migrated: false, migrationsPending: 0 });
+    expect(written.at(-1)).toMatchObject({ phase: 'done', migrated: false, migrationsPending: 0 });
+  });
+
+  it('exactly 0 then a failed post-flip check: rolls back WITHOUT calling restore and resumes the previous release', () => {
+    const { runtime, calls, cfg } = makeReleaseRuntime({ pending: '0', fail: ['run-smoke'] });
+    expect(() => release.deployRelease(probeConfig({ postDeployChecks: [smoke] }), {}, ctx(runtime)))
+      .toThrow(/public-smoke \(policy: rollback\)/);
+    expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('run-migrate'))).toBe(false);
+    const flipBack = indexOfCall(calls, `ln -s ${cfg.currentLink} /srv/app/.dk-swap.$$.current`);
+    expect(flipBack).toBeGreaterThan(indexOfCall(calls, 'run-smoke'));
+    // forward restart + the recovery's resume of the previous release.
+    expect(calls.filter((cmd) => cmd.includes('pm2 startOrRestart')).length).toBe(2);
+    expect(calls.findLastIndex((cmd) => cmd.includes('pm2 startOrRestart'))).toBeGreaterThan(flipBack);
+    expect(journals(calls).at(-1)).toMatchObject({ phase: 'post-deploy-rolled-back', migrated: false, migrationsPending: 0 });
+  });
+
+  it('pending > 0: runs migrate, marks migrated BEFORE it, and keeps restore-on-failure', () => {
+    const { runtime, calls } = makeReleaseRuntime({ pending: '2', fail: ['run-smoke'] });
+    expect(() => release.deployRelease(probeConfig({ postDeployChecks: [smoke] }), {}, ctx(runtime))).toThrow(/public-smoke/);
+    const migratedJournal = calls.findIndex((cmd) => cmd.includes('.deploy-kit-state.json.tmp') && cmd.includes('"migrated":true'));
+    expect(migratedJournal).toBeGreaterThan(indexOfCall(calls, 'check-pending'));
+    expect(migratedJournal).toBeLessThan(indexOfCall(calls, 'run-migrate'));
+    expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(true);
+    expect(journals(calls).find((j) => j.phase === 'migrated')).toMatchObject({ migrated: true, migrationsPending: 2 });
+  });
+
+  // Whatever the probe says, anything other than a clean exit and a bare integer is
+  // "unknown", i.e. "may have migrated": fall back to today's path.
+  const unknown: Array<[string, any]> = [
+    ['non-zero exit that still printed 0', { failStdout: { 'check-pending': { stdout: '0\n' } } }],
+    ['timeout that left a partial 0', { failStdout: { 'check-pending': { stdout: '0\n', code: 'ETIMEDOUT' } } }],
+    ['plain failure, no output', { fail: ['check-pending'] }],
+    ['empty output', { pending: '' }],
+    ['stderr-only (nothing on stdout)', { pending: '\n\n' }],
+    ['"0 extra"', { pending: '0 extra\n' }],
+    ['negative', { pending: '-1\n' }],
+    ['exponent', { pending: '1e0\n' }],
+    ['leading space', { pending: ' 0\n' }],
+    ['trailing space', { pending: '0 \n' }],
+    ['0 followed by a non-numeric last line', { pending: '0\nwarning: stale cache\n' }],
+    ['not a number', { pending: 'none\n' }],
+  ];
+  it.each(unknown)('falls back to running migrate: %s', (_name, over) => {
+    const warnings: string[] = [];
+    const log = { ...kit.makeLogger(() => {}, () => {}), warning: (m: string) => warnings.push(m) };
+    const { runtime, calls } = makeReleaseRuntime(over);
+    const result = release.deployRelease(probeConfig(), {}, { ...ctx(runtime), log });
+    expect(result.steps).toContain('migrate');
+    expect(result.steps).not.toContain('migrate-skipped');
+    const migratedJournal = calls.findIndex((cmd) => cmd.includes('.deploy-kit-state.json.tmp') && cmd.includes('"migrated":true'));
+    expect(migratedJournal).toBeGreaterThanOrEqual(0);
+    expect(migratedJournal).toBeLessThan(indexOfCall(calls, 'run-migrate'));
+    expect(warnings.some((w) => /Pending-migration probe/.test(w))).toBe(true);
+    expect(journals(calls).at(-1)).toMatchObject({ phase: 'done', migrated: true });
+    expect(journals(calls).at(-1)).not.toHaveProperty('migrationsPending');
+  });
+
+  it.each([['trailing newline', '0\n'], ['CRLF', '0\r\n'], ['leading log noise', 'checking drizzle journal\n0']])(
+    'accepts a bare 0 as the last non-empty line: %s',
+    (_name, pending) => {
+      const { runtime, calls } = makeReleaseRuntime({ pending });
+      release.deployRelease(probeConfig(), {}, ctx(runtime));
+      expect(calls.some((cmd) => cmd.includes('run-migrate'))).toBe(false);
+    },
+  );
+
+  it('hook absent: no probe, migrate runs exactly as before', () => {
+    const { runtime, calls } = makeReleaseRuntime();
+    const result = release.deployRelease(relConfig(), {}, ctx(runtime));
+    expect(calls.some((cmd) => cmd.includes('check-pending'))).toBe(false);
+    expect(result.steps).toContain('migrate');
+  });
+
+  it('--skip-migrate runs neither the probe nor migrate', () => {
+    const { runtime, calls } = makeReleaseRuntime({ pending: '0' });
+    release.deployRelease(probeConfig(), { skipMigrate: true }, ctx(runtime));
+    expect(calls.some((cmd) => cmd.includes('check-pending') || cmd.includes('run-migrate'))).toBe(false);
+  });
+
+  it('--dry-run plans the conservative path (the probe is never executed, so migrate stays in the plan)', () => {
+    const plan = cli.dryRunContext(probeConfig());
+    const result = release.deployRelease(probeConfig(), {}, plan);
+    expect(result.steps).toContain('migrate');
+    expect(result.steps).not.toContain('migrate-skipped');
+  });
+
+  it('a metadata write failure right after a zero probe still resumes the previous release without a restore', () => {
+    const { runtime, calls } = makeReleaseRuntime({ pending: '0', fail: ['"migrationsPending":0'] });
+    expect(() => release.deployRelease(probeConfig(), {}, ctx(runtime))).toThrow(/Failed to persist release metadata/);
+    expect(calls.some((cmd) => cmd.includes('run-migrate') || cmd.includes('run-restore'))).toBe(false);
+    expect(calls.some((cmd) => cmd.includes('pm2 startOrRestart'))).toBe(true);
+  });
+
+  describe('interrupted after a zero probe (the journal a real run wrote is fed to the next invocation)', () => {
+    const NEW_WORK = { name: 'no-new-deploy-work', command: 'no-new-deploy-work' };
+    const firstRun = () => {
+      const first = makeReleaseRuntime({ pending: '0' });
+      release.deployRelease(probeConfig(), {}, ctx(first.runtime));
+      return journals(first.calls);
+    };
+
+    it('before the flip: the stopped journal is auto-recovered with no DB restore', () => {
+      const stopped = firstRun().find((j) => j.phase === 'stopped');
+      const stoppedAfterProbe = { ...stopped, migrationsPending: 0 };
+      const { runtime, calls } = makeReleaseRuntime({
+        canonical: `/srv/app/${stopped.prevTarget}`, stateContent: JSON.stringify(stoppedAfterProbe), fail: ['no-new-deploy-work'],
+      });
+      expect(() => release.deployRelease(probeConfig({ preDeployChecks: [NEW_WORK] }), {}, ctx(runtime))).toThrow(/Pre-deploy check failed/);
+      expect(indexOfCall(calls, 'pm2 startOrRestart')).toBeGreaterThanOrEqual(0);
+      expect(indexOfCall(calls, 'pm2 startOrRestart')).toBeLessThan(indexOfCall(calls, 'no-new-deploy-work'));
+      expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(false);
+    });
+
+    it('after the flip: a flipped journal still fails closed before any deploy work (migrationsPending never authorizes recovery)', () => {
+      const flipped = firstRun().find((j) => j.phase === 'flipped');
+      expect(flipped).toMatchObject({ migrated: false, migrationsPending: 0 });
+      const { runtime, calls } = makeReleaseRuntime({ stateContent: JSON.stringify(flipped) });
+      expect(() => release.deployRelease(probeConfig({ preDeployChecks: [NEW_WORK] }), {}, ctx(runtime))).toThrow(/MANUAL RECOVERY REQUIRED/);
+      expect(calls.some((cmd) => /no-new-deploy-work|fetch --prune|worktree add|pm2 /.test(cmd))).toBe(false);
+      expect(calls.some((cmd) => cmd.includes('run-restore'))).toBe(false);
+    });
+  });
+});
+
+describe('PKG-212: a failed automatic rollback blocks the next deploy (V2)', () => {
+  const smoke = { name: 'public-smoke', command: 'run-smoke', onFailure: 'rollback' };
+
+  it('invocation 1 journals post-deploy-rollback-failed; invocation 2 refuses before any mutation', () => {
+    const first = makeReleaseRuntime({ fail: ['run-smoke', 'run-restore'] });
+    expect(() => release.deployRelease(relConfig({ postDeployChecks: [smoke] }), {}, ctx(first.runtime)))
+      .toThrow(/MANUAL RECOVERY REQUIRED/);
+    const written = first.calls
+      .filter((cmd) => cmd.includes('.deploy-kit-state.json.tmp'))
+      .map((cmd) => /printf '%s' '(.*?)' > /.exec(cmd)![1]);
+    const journal = written.at(-1)!;
+    expect(JSON.parse(journal)).toMatchObject({ phase: 'post-deploy-rollback-failed', recoveryOutcome: 'rollback-failed' });
+
+    const second = makeReleaseRuntime({ stateContent: journal });
+    const secondConfig = relConfig({ preDeployChecks: [{ name: 'no-new-deploy-work', command: 'no-new-deploy-work' }] });
+    expect(() => release.deployRelease(secondConfig, {}, ctx(second.runtime)))
+      .toThrow(/MANUAL RECOVERY REQUIRED[^]*rollback FAILED[^]*\.deploy-kit-state\.json/);
+    expect(second.calls.some((cmd) => /no-new-deploy-work|fetch --prune|worktree add|pm2 |run-restore|run-migrate|run-backup/.test(cmd))).toBe(false);
+  });
+
+  it.each(['post-deploy-rolled-back', 'post-deploy-degraded', 'post-deploy-manual-decision', 'recovered', 'done'])(
+    'a terminal "%s" journal does not block the next deploy',
+    (phase) => {
+      const { runtime } = makeReleaseRuntime({ stateContent: JSON.stringify({ phase, releaseId: 'a1b2c3d4e5f6-20260710T010000Z' }) });
+      expect(release.deployRelease(relConfig(), {}, ctx(runtime)).healthy).toBe(true);
+    },
+  );
+});
+
+describe('PKG-212: restore output is streamed, bounded and never kills the restore (V3)', () => {
+  it('runs restore with inherited stdio and no capture buffer (nothing to overflow)', () => {
+    const { runtime, execOptions } = makeReleaseRuntime({ fail: ['run-migrate'] });
+    expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow();
+    const restore = execOptions.find(({ command }) => command.includes('run-restore'))!;
+    expect(restore.options.stdio).toEqual(['inherit', 'inherit', 'inherit']);
+    expect(restore.options.maxBuffer).toBeUndefined();
+  });
+
+  it('logs the tail of the restore output when restore fails', () => {
+    const errors: string[] = [];
+    const log = { ...kit.makeLogger(() => {}, () => {}), error: (m: string) => errors.push(m) };
+    const { runtime } = makeReleaseRuntime({ fail: ['run-migrate', 'run-restore'], restoreTail: 'pg_restore: role "app" does not exist' });
+    expect(() => release.deployRelease(relConfig(), {}, { ...ctx(runtime), log })).toThrow(/could not be auto-restored/);
+    const logged = errors.find((m) => m.startsWith('Restore hook failed'));
+    expect(logged).toContain('pg_restore: role "app" does not exist');
+    expect(logged).toContain('not redacted');
+  });
+
+  // Real shell + real execFileSync for the restore wrapper only (stdout/stderr that
+  // would be inherited go to a file so the test run stays quiet). Output of 3 MB is
+  // well past Node's 1 MB default capture limit, the thing a naive `capture: true`
+  // would die on.
+  const withRealRestore = (restoreHook: string, run: (ctxArgs: any, root: string, errors: string[]) => void) => {
+    const root = mkdtempSync(path.join(tmpdir(), 'dk-restore-'));
+    const sink = openSync(path.join(root, 'sink.out'), 'w');
+    const errors: string[] = [];
+    try {
+      const base = makeReleaseRuntime({ fail: ['run-migrate'] });
+      const runtime = {
+        execFileSync: (file: string, args: string[], options: any = {}) => {
+          const command = args[args.length - 1];
+          if (!command.includes('deploy-kit-restore-output')) return base.runtime.execFileSync(file, args, options);
+          const stdio = (options.stdio as string[]).map((s, i) => (s === 'inherit' ? (i === 0 ? 'ignore' : sink) : s));
+          return realExecFileSync('sh', ['-c', command.split('/srv/app').join(root)], { ...options, stdio });
+        },
+      };
+      const log = { ...kit.makeLogger(() => {}, () => {}), error: (m: string) => errors.push(m) };
+      run({ runtime, log, config: relConfig({ hooks: { install: 'npm ci', build: 'npm run build', backup: 'run-backup', migrate: 'run-migrate', restore: restoreHook } }) }, root, errors);
+    } finally {
+      closeSync(sink);
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+  const BIG = "head -c 3000000 /dev/zero | tr '\\0' x; echo; ";
+
+  it('a successful restore that prints more than the old capture limit is not killed, and leaves no scratch files', () => {
+    withRealRestore(`${BIG}echo restore-ok`, ({ runtime, log, config }, root, errors) => {
+      // The deploy still throws its original (migrate) failure -- but NOT the restore escalation.
+      expect(() => release.deployRelease(config, {}, { ...ctx(runtime), log }))
+        .toThrow(/^Deploy aborted: command failed in .*run-migrate/);
+      expect(errors.some((m) => m.startsWith('Restore hook failed'))).toBe(false);
+      expect(readdirSync(root).filter((f) => f.startsWith('.deploy-kit-restore-output'))).toEqual([]);
+    });
+  });
+
+  it('a failing restore with the same volume keeps its real exit status and logs only a bounded tail', () => {
+    withRealRestore(`${BIG}echo RESTORE-TAIL-MARKER; exit 7`, ({ runtime, log, config }, root, errors) => {
+      expect(() => release.deployRelease(config, {}, { ...ctx(runtime), log })).toThrow(/could not be auto-restored/);
+      const logged = errors.find((m) => m.startsWith('Restore hook failed'))!;
+      expect(logged).toContain('(exit 7)');
+      expect(logged).toContain('RESTORE-TAIL-MARKER');
+      expect(logged.length).toBeLessThan(5000);
+      expect(readdirSync(root).filter((f) => f.startsWith('.deploy-kit-restore-output'))).toEqual([]);
+    });
   });
 });

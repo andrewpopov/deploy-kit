@@ -3,7 +3,7 @@ import { createRequire } from 'module';
 
 const require = createRequire(__filename);
 const kit = require('../index.js') as typeof import('../index');
-const { validateConfig } = kit;
+const { validateConfig, DEFAULT_CONFIG } = kit;
 
 // PKG-82: these guards existed only for keys that were already validated
 // (projectDir, sharedPaths, monitor probe url/headers). This file targets the
@@ -226,7 +226,7 @@ describe('config validation: nested key allowlisting (PKG-135 Finding 6)', () =>
       hooks: {
         install: 'npm ci', generate: 'npx prisma generate', backup: 'npm run backup',
         migrate: 'npm run migrate', build: 'npm run build', restart: 'pm2 restart app',
-        restore: 'npm run restore',
+        restore: 'npm run restore', pendingMigrations: 'node scripts/pending-migrations.mjs',
       },
       health: { attempts: 30, delaySeconds: 2 },
       ssh: {
@@ -253,6 +253,26 @@ describe('config validation: nested key allowlisting (PKG-135 Finding 6)', () =>
       deliveryEvent: { command: 'npx deploy-kit announce-discord' },
     });
     expect(problems).toEqual([]);
+  });
+
+  // PKG-212: hooks.pendingMigrations is a registered hook (so it is neither an
+  // unknown-key typo nor silently ignored), null disables it, and a blank command
+  // is rejected rather than quietly meaning "always unknown".
+  describe('hooks.pendingMigrations', () => {
+    it('defaults to null (disabled)', () => {
+      expect(DEFAULT_CONFIG.hooks.pendingMigrations).toBeNull();
+    });
+    it.each([['a command', 'node scripts/pending.mjs'], ['null', null]])('accepts %s', (_name, value) => {
+      expect(validateConfig({ hooks: { pendingMigrations: value } })).toEqual([]);
+    });
+    it.each([['empty', ''], ['whitespace-only', '   ']])('rejects an %s string by name', (_name, value) => {
+      expect(validateConfig({ hooks: { pendingMigrations: value } }).join('\n'))
+        .toMatch(/"hooks\.pendingMigrations" must be a non-empty command/);
+    });
+    it('rejects a non-string by name', () => {
+      expect(validateConfig({ hooks: { pendingMigrations: 0 as unknown as string } }).join('\n'))
+        .toMatch(/"hooks\.pendingMigrations" must be string or null/);
+    });
   });
 
   // A partial override of any block (a real, common shape: a consumer only

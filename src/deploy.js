@@ -194,6 +194,11 @@ function deploy(config, options = {}, ctx = {}) {
   };
 
   log.header(`🚀 Deploying (${config.mode}${config.host ? ` → ${config.host}` : ''})`);
+  // The legacy pipeline has no migrated marker or DB restore, so there is nothing
+  // for the probe to protect; say so rather than let it look like it took effect.
+  if (config.hooks.pendingMigrations) {
+    log.warning('hooks.pendingMigrations is ignored by the legacy (non-release) layout; `hooks.migrate` always runs.');
+  }
   const branch = resolveBranch(config, c);
   const steps = [];
   let backupId = null;

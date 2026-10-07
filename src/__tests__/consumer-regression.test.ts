@@ -520,6 +520,17 @@ function withoutLastDeployRecord(calls: string[]): string[] {
   return calls.filter((_, i) => i !== writeIndex && !(dropsHeadRead && i === writeIndex - 1));
 }
 
+// Delta 11 (PKG-212, release layout only): the restore hook is now wrapped so its
+// output still streams live while a bounded tail is kept for the failure log and its
+// real exit status is re-raised (see release.js's `restoreCommand`; the wrapper's
+// behavior is pinned against a real shell in release.test.ts). Like the last-deploy
+// record, it is normalized out of the CURRENT run rather than woven into the v0.9.4
+// sequence: the inner `env + hook` text must still be exactly what v0.9.4 ran.
+const RESTORE_WRAPPER = /^((?:cd \S+ && )?)\{ (export DEPLOY_KIT_BACKUP_ID='[^']*'; )?rm -f \S+ \S+; \{ \( ([\s\S]*?) \) 2>&1; echo \$\? > \S+; \} \| \{ tee \S+ \|\| cat; \}; dk_status=[\s\S]*; exit "\$\{dk_status:-1\}"; \}$/;
+function withoutRestoreWrapper(calls: string[]): string[] {
+  return calls.map((cmd) => cmd.replace(RESTORE_WRAPPER, '$1$2$3'));
+}
+
 describe('consumer regression: v0.9.4 command sequence is byte-identical (preRestartChecks absent)', () => {
   for (const [name, raw] of Object.entries(CONFIGS)) {
     it(`${name}: deploy() emits the same command sequence as v0.9.4`, () => {
@@ -530,7 +541,7 @@ describe('consumer regression: v0.9.4 command sequence is byte-identical (preRes
       const oldRun = run(oldDeploy.deploy, config, appNames);
       const newRun = run(kit.deploy, config, appNames);
 
-      expect(withoutLastDeployRecord(newRun.calls)).toEqual(applyIntentionalDeltas(oldRun.calls, config));
+      expect(withoutRestoreWrapper(withoutLastDeployRecord(newRun.calls))).toEqual(applyIntentionalDeltas(oldRun.calls, config));
       expect(newRun.error).toEqual(applyIntentionalErrorDelta(oldRun.error, config));
 
       // Guard against this test silently going vacuous again (the release-id
