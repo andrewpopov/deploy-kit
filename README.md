@@ -117,6 +117,7 @@ text or redirection filenames.
 | `hooks.generate` | `string \| null` | `null` | both | unreleased | Codegen that writes into `node_modules` (e.g. `npx prisma generate`). Runs unconditionally right after install, before build. Keep this OUT of `hooks.build`: a build tool's own cache (Nx/Turbo) can replay a cache hit and skip the build command entirely, silently skipping a generator baked into it while `npm ci` has already wiped what it was supposed to regenerate. `null` = skip. |
 | `hooks.backup` | `string \| null` | `null` | both | 0.1 | Pre-migration backup **gate** — a failure aborts before any schema change. Preferred output contract: JSON on stdout with a top-level `backupId` (db-backup >= 0.18.0 emits this). Legacy fallbacks remain supported: `id`, `created.fullPath`, `created.fileName`, or a safe final-line id/path. The parsed id is correlated to `deliveryEvent` as a leaf-only `backupReference`; if nothing parses, deploy-kit logs a loud warning (restore correlation unavailable) but never fails the deploy over it. |
 | `hooks.migrate` | `string \| null` | `null` | both | 0.1 | Migration command; runs with `dbBoundApps` paused. |
+| `hooks.pendingMigrations` | `string \| null` | `null` | release | unreleased | Read-only probe that lets a no-op migration skip `hooks.migrate`, so a later failure rolls code back without a DB restore. Runs in the candidate release after the backup, with writers stopped, right before `migrate`. Exit `0` and a last non-empty stdout line that is exactly a base-10 integer (the pending count); only a count of exactly `0` skips `migrate`. Anything else runs it as usual. Ignored under the legacy layout (`loadConfig` warns); skipped with `--skip-migrate`. Must be a non-empty command. See [Skipping a no-op migration](#skipping-a-no-op-migration). |
 | `hooks.build` | `string \| null` | `null` | both | 0.1 | Build command. |
 | `hooks.restart` | `string \| null` | `null` | both | 0.3 | Override the app (re)start command. `null` → the `ecosystemFile`-aware start-or-restart idiom. |
 | `hooks.restore` | `string \| null` | `null` | both | 0.7 | Restore the pre-migration DB backup during release-layout recovery (gets `DEPLOY_KIT_BACKUP_ID`). `null` = no auto-restore. |
@@ -239,7 +240,61 @@ apps, restore the backup, rewrite the `current`/`previous` symlinks, or restart
 PM2; the operator must reconcile the database/schema and the `current` pointer
 by hand, then set `"phase":"done"` in `.deploy-kit-state.json` (or remove it)
 before deploying again. Post-deploy policy/rollback interruptions likewise
-require manual reconciliation.
+require manual reconciliation, and so does a rollback that itself **failed**: a
+`post-deploy-rollback-failed` journal (for example, the restore hook failed) blocks
+the next `deploy` with `MANUAL RECOVERY REQUIRED` before any release work or app
+change. deploy-kit never retries that restore on its own.
+
+#### Skipping a no-op migration
+
+Without `hooks.pendingMigrations`, a release deploy marks the database `migrated`
+before it runs `hooks.migrate`, because a migration that fails partway may have
+touched the schema. That is the right default, but it also means a code-only
+deploy whose migrate hook did nothing still restores the backup if a later check
+fails, and a failing restore leaves the apps stopped.
+
+`hooks.pendingMigrations` lets the app prove the migration is a no-op:
+
+```json
+"hooks": {
+  "backup": "npm run db:backup",
+  "migrate": "npm run db:migrate:prod",
+  "restore": "npm run db:restore",
+  "pendingMigrations": "node scripts/pending-migrations.mjs"
+}
+```
+
+**Probe contract.** The command runs in the candidate release after the backup,
+with `dbBoundApps` stopped, immediately before `hooks.migrate`. It must exit `0`
+and print, as its last non-empty stdout line, the pending count as a bare
+base-10 integer (`0`, `3`). The whole line must be digits: ` 0`, `0 `, `-1`,
+`1e0` and `0 extra` are all "unknown". Only an exact `0` skips the migrate hook;
+`migrated` stays `false`, the journal records `migrationsPending: 0`, and the
+step list shows `migrate-skipped`. A recovery then flips `current` back and
+resumes the previous release with **no** DB restore. A count above `0` runs
+`hooks.migrate` as today. A non-zero exit, a timeout (`stepTimeoutSeconds`), empty
+or malformed output all count as unknown: deploy-kit warns, journals
+`migrated: true` first, and runs `hooks.migrate`. `--dry-run` never runs the probe
+and plans the migrate step.
+
+**What `0` must mean.** deploy-kit cannot check this, so the probe has to:
+report pending migrations by the **same selection rules as your migrator** (same
+database, schema, candidate migration files), and exit non-zero on a divergent or
+unreadable history. Equal row counts are not enough: candidate `{A,B}` against
+applied `{A,C}` has no pending *count* difference but is not "nothing to do". `0`
+means the entire migrate hook can safely be omitted, **including any seed or other
+work you bundled into it**. If you do bundle such work, do not use this hook.
+
+**Isolation assumption.** Skipping is only safe if nothing else changes the schema
+between the backup and a rollback: your app has exclusive ownership of schema
+migrations across backup, probe, migrate and rollback. The deploy lock is scoped
+to the target and project path, can be disabled, stolen or expire, and an empty
+`dbBoundApps` confirms "writers stopped" trivially, so it does not exclude every
+schema race. A database shared across deploy roots, or migrated by an external
+tool, needs its own coordination covering that interval.
+
+The probe is read at the release layout only; the legacy pipeline has no migrated
+marker or restore to protect, ignores the hook; `loadConfig` logs a warning saying so.
 
 #### Post-deploy failure policy
 

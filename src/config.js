@@ -178,6 +178,15 @@ const DEFAULT_CONFIG = {
     generate: null, // e.g. 'npx prisma generate'. null = skip.
     backup: null, // pre-migration backup gate; abort deploy if it fails. null = skip.
     migrate: null, // e.g. 'npm run db:migrate:prod'. null = skip.
+    // Release layout only (loadConfig warns that the legacy deploy ignores it). Read-only
+    // probe run in the candidate release, with DB writers stopped and the backup
+    // taken, immediately before `migrate`: exit 0 and a last non-empty stdout
+    // line that is exactly a base-10 integer, the number of pending migrations.
+    // Exactly 0 skips `migrate` entirely, so a later failure rolls code back
+    // WITHOUT a DB restore. Anything else (non-zero exit, timeout, malformed
+    // output) is "unknown" and runs `migrate` exactly as if this hook were
+    // absent. See README "Skipping a no-op migration". null = disabled.
+    pendingMigrations: null,
     build: null, // e.g. 'npm run build'. null = skip.
     // Override the app (re)start command. null → the ecosystemFile-aware
     // start-or-restart idiom (see pm2StartOrRestart). Set this only when a repo
@@ -329,6 +338,7 @@ const HOOKS_TYPES = {
   generate: 'string?',
   backup: 'string?',
   migrate: 'string?',
+  pendingMigrations: 'string?',
   build: 'string?',
   restart: 'string?',
   restore: 'string?',
@@ -660,6 +670,12 @@ function validateConfig(raw, { source = 'config' } = {}) {
   // leave "hooks.migrate" at its default (disabled).
   if (raw.hooks != null && typeof raw.hooks === 'object' && !Array.isArray(raw.hooks)) {
     problems.push(...validateBlock(raw.hooks, HOOKS_TYPES, source, 'hooks'));
+    // A blank command would exit 0 with no output: unparseable, so it could only
+    // ever mean "unknown". Reject the typo instead of silently disabling the skip.
+    const pending = raw.hooks.pendingMigrations;
+    if (typeof pending === 'string' && !pending.trim()) {
+      problems.push(`${source}: "hooks.pendingMigrations" must be a non-empty command (use null to disable)`);
+    }
   }
   if (raw.health != null && typeof raw.health === 'object' && !Array.isArray(raw.health)) {
     problems.push(...validateBlock(raw.health, HEALTH_TYPES, source, 'health'));
@@ -741,7 +757,14 @@ function loadConfig({
     }
   }
 
-  return mergeConfig(mergeConfig(DEFAULT_CONFIG, fileConfig), override);
+  const merged = mergeConfig(mergeConfig(DEFAULT_CONFIG, fileConfig), override);
+  // Known here (and only here) is the EFFECTIVE layout across file + override. The
+  // legacy pipeline has no migrated marker or DB restore for the probe to protect,
+  // so say it is ignored rather than let it look like it took effect.
+  if (merged.hooks.pendingMigrations && merged.layout?.type !== 'releases') {
+    log.warning('hooks.pendingMigrations is ignored unless layout.type is "releases"; `hooks.migrate` always runs under the legacy layout.');
+  }
+  return merged;
 }
 
 module.exports = {

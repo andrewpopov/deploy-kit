@@ -299,6 +299,22 @@ function preflight(config, paths, ctx) {
   }
 }
 
+// The pending-migrations probe passes only on a clean exit AND a last stdout line
+// that is exactly a base-10 integer (no sign, exponent, padding or trailing words).
+// Only exactly-empty lines are skipped (after dropping one trailing \r per line), so
+// a final whitespace-only line is the answer, and it is not a number. Returns the count, or null for anything else -- null means
+// "unknown", which the caller treats as "may have migrated". The full runner
+// result is inspected (not `capture()`, which discards the exit status) so a
+// failed or timed-out probe that happened to print "0" is never believed.
+function parsePendingCount(res) {
+  if (!res.ok) return null;
+  const lines = (res.output || '').split('\n').map((line) => line.replace(/\r$/, '')).filter((line) => line !== '');
+  const last = lines[lines.length - 1];
+  if (last === undefined || !/^[0-9]+$/.test(last)) return null;
+  const count = Number(last);
+  return Number.isSafeInteger(count) ? count : null;
+}
+
 // Read a previous deploy's durable recovery journal. Only "stopped" is safe to
 // recover automatically: the journal is written the moment the stop phase BEGINS
 // (before stopWritersConfirmed() runs — see the disruptive-window call site), so
@@ -343,6 +359,15 @@ function readInterruptedDeploy(config, paths, ctx) {
       + 'auto-restore the backup, rewrite the `current`/`previous` symlinks, stop apps, or restart PM2. '
       + 'Reconcile the database/schema and the `current` pointer by hand, then set "phase":"done" in '
       + `${paths.stateFile} (or remove it) before deploying again.`,
+    );
+  }
+  if (state.phase === 'post-deploy-rollback-failed') {
+    throw new Error(
+      `MANUAL RECOVERY REQUIRED — a previous deploy's automatic rollback FAILED (phase "${state.phase}", release `
+      + `${state.releaseId || '?'}, backup ${state.backupId || 'none'}). The database and the running release may `
+      + 'not match, and deploy-kit will not retry the restore or touch any app. Reconcile the database/schema and '
+      + `the \`current\` pointer by hand, then set "phase":"done" in ${paths.stateFile} (or remove it) before `
+      + 'deploying again.',
     );
   }
   if (['post-deploy-failed', 'post-deploy-rollback'].includes(state.phase)) {
@@ -415,10 +440,15 @@ function deployRelease(config, options = {}, ctx = {}) {
   const freshState = () => ({
     phase: 'preflight', dbAppsPaused: false, flipped: false, prevTarget: null,
     releaseDir: null, releaseId: null, sha: null, branch: null, backupId: null,
-    migrated: false, failedCheck: null, failurePolicy: null, recoveryOutcome: null,
+    migrated: false, migrationsPending: null, failedCheck: null, failurePolicy: null, recoveryOutcome: null,
   });
   const st = freshState();
   let recoveringInterrupted = false;
+
+  // Informational audit field, written only once a probe has answered: a deploy
+  // without `hooks.pendingMigrations` keeps a byte-identical journal (the consumer
+  // regression fixtures pin that).
+  const migrationsPendingField = () => (st.migrationsPending == null ? {} : { migrationsPending: st.migrationsPending });
 
   // Durably journal the disruptive-phase state BEFORE each irreversible op, so a
   // process/SSH/power loss leaves an on-host record of whether the DB was migrated
@@ -426,7 +456,7 @@ function deployRelease(config, options = {}, ctx = {}) {
   // this at least makes the truth recoverable instead of lost in process memory).
   const journal = () => persistState(config, paths, {
     phase: st.phase, releaseId: st.releaseId, sha: st.sha, backupId: st.backupId,
-    migrated: st.migrated, flipped: st.flipped, prevTarget: st.prevTarget,
+    migrated: st.migrated, ...migrationsPendingField(), flipped: st.flipped, prevTarget: st.prevTarget,
     failedCheck: st.failedCheck, failurePolicy: st.failurePolicy,
     recoveryOutcome: st.recoveryOutcome,
   }, c);
@@ -909,7 +939,34 @@ function deployRelease(config, options = {}, ctx = {}) {
       }
       steps.push('backup');
     }
-    if (!skipMigrate && config.hooks.migrate) {
+    // An exact, trustworthy 0 means the migrate hook has nothing to do, so it is
+    // not run and `migrated` stays false: a later failure then rolls code back
+    // without restoring the DB. Every other outcome is "unknown" and falls through
+    // to the migrate block below unchanged. Writers are stopped and the backup is
+    // taken, so the answer cannot move under us (given exclusive migration
+    // ownership -- see README "Skipping a no-op migration").
+    let migrateHookNeeded = !skipMigrate && Boolean(config.hooks.migrate);
+    if (migrateHookNeeded && config.hooks.pendingMigrations) {
+      log.step('Checking for pending database migrations (writers stopped)');
+      const probe = runInDir(st.releaseDir, config.hooks.pendingMigrations, config, c, { capture: true });
+      const pending = parsePendingCount(probe);
+      if (pending === 0) {
+        st.migrationsPending = 0;
+        journal();
+        migrateHookNeeded = false;
+        steps.push('migrate-skipped');
+        log.success('No pending database migrations; skipping the migrate hook');
+      } else if (pending === null) {
+        log.warning(
+          `Pending-migration probe ${probe.ok ? 'printed no usable count' : 'failed'}; treating the result as unknown `
+          + 'and running the migrate hook',
+        );
+      } else {
+        st.migrationsPending = pending;
+        log.info(`${pending} pending database migration${pending === 1 ? '' : 's'}`);
+      }
+    }
+    if (migrateHookNeeded) {
       // Mark migrated BEFORE running: a migration that fails partway may have already
       // touched the schema, so recovery from here on must restore the DB, not just
       // resume the previous (possibly-incompatible) code.
@@ -979,7 +1036,7 @@ function deployRelease(config, options = {}, ctx = {}) {
 
     // ---- Phase: metadata + prune (success; still holding the lock) ----
     st.phase = 'done';
-    persistState(config, paths, { phase: 'done', current: `releases/${releaseId}`, previous: st.prevTarget, sha: st.sha, backupId: st.backupId, migrated: st.migrated, ts }, c);
+    persistState(config, paths, { phase: 'done', current: `releases/${releaseId}`, previous: st.prevTarget, sha: st.sha, backupId: st.backupId, migrated: st.migrated, ...migrationsPendingField(), ts }, c);
     // Restart, health and every post-deploy check have passed: record it for host monitoring.
     writeLastDeployRecord(config, { sha: st.sha, layout: 'release', release: releaseId }, c);
     prune(config, paths, releaseId, c);
