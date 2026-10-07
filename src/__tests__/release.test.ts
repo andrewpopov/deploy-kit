@@ -1,9 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createRequire } from 'module';
-import { execSync, execFileSync as realExecFileSync } from 'child_process';
-import { mkdtempSync, openSync, closeSync, readdirSync, readFileSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
-import path from 'path';
+import { execSync } from 'child_process';
 
 const require = createRequire(__filename);
 const kit = require('../index.js') as typeof import('../index');
@@ -1665,122 +1662,13 @@ describe('PKG-212: a failed automatic rollback blocks the next deploy (V2)', () 
   );
 });
 
-describe('PKG-212: restore output is streamed, bounded and never kills the restore (V3)', () => {
-  it('runs the hook text unmodified, streamed through the tail runner with no capture buffer', () => {
+describe('PKG-212: the restore hook is run exactly as before (no capture, no wrapper)', () => {
+  it('runs the original command text with inherited stdio and no buffer limit', () => {
     const { runtime, execOptions } = makeReleaseRuntime({ fail: ['run-migrate'] });
     expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow();
     const restore = execOptions.find(({ command }) => command.includes('run-restore'))!;
-    // The target command is byte-for-byte the pre-PKG-212 one: no wrapper around the hook.
     expect(restore.command).toBe("cd /srv/app && export DEPLOY_KIT_BACKUP_ID='/var/lib/smarthome/backups/smarthome-20260710T090000Z.db.gpg'; run-restore");
-    expect(restore.options.stdio).toEqual(['inherit', 'pipe', 'inherit']); // pipe carries only the bounded tail
+    expect(restore.options.stdio).toEqual(['inherit', 'inherit', 'inherit']);
     expect(restore.options.maxBuffer).toBeUndefined();
-  });
-
-  it('logs the tail of the restore output when restore fails', () => {
-    const errors: string[] = [];
-    const log = { ...kit.makeLogger(() => {}, () => {}), error: (m: string) => errors.push(m) };
-    const { runtime } = makeReleaseRuntime({ fail: ['run-migrate'], failStdout: { 'run-restore': { stdout: 'pg_restore: role "app" does not exist' } } });
-    expect(() => release.deployRelease(relConfig(), {}, { ...ctx(runtime), log })).toThrow(/could not be auto-restored/);
-    const logged = errors.find((m) => m.startsWith('Restore hook failed'));
-    expect(logged).toContain('pg_restore: role "app" does not exist');
-    expect(logged).toContain('not redacted');
-  });
-
-  // Real shell, real child, real tail runner for the restore call only; every other
-  // command stays on the fake. The tail runner's live stderr goes to a file so the
-  // test run stays quiet. 3 MB is well past Node's 1 MB default capture limit.
-  const withRealRestore = (restoreHook: (root: string) => string, run: (a: any, root: string, errors: string[]) => void) => {
-    const root = mkdtempSync(path.join(tmpdir(), 'dk-restore-'));
-    const sink = openSync(path.join(root, 'sink.out'), 'w');
-    const errors: string[] = [];
-    try {
-      const base = makeReleaseRuntime({ fail: ['run-migrate'], canonical: `${root}/releases/a1b2c3d4e5f6-20260710T090000Z` });
-      const runtime = {
-        execFileSync: (file: string, args: string[], options: any = {}) => {
-          if (file !== process.execPath) return base.runtime.execFileSync(file, args, options);
-          const stdio = (options.stdio as string[]).map((s, i) => (s === 'inherit' ? (i === 0 ? 'ignore' : sink) : s));
-          return realExecFileSync(file, args, { ...options, stdio });
-        },
-      };
-      const log = { ...kit.makeLogger(() => {}, () => {}), error: (m: string) => errors.push(m) };
-      const config = relConfig({
-        mode: 'local', host: null, projectDir: root,
-        hooks: { install: 'npm ci', build: 'npm run build', backup: 'run-backup', migrate: 'run-migrate', restore: restoreHook(root) },
-      });
-      run({ runtime, log, config }, root, errors);
-    } finally {
-      closeSync(sink);
-      rmSync(root, { recursive: true, force: true });
-    }
-  };
-  const BIG = "head -c 3000000 /dev/zero | tr '\\0' x; echo; ";
-  const migrateAbort = /^Deploy aborted: command failed in .*run-migrate/; // the ORIGINAL error: restore succeeded
-  const deployOnce = ({ runtime, log, config }: any) => () => release.deployRelease(config, {}, { ...ctx(runtime), log });
-
-  it('a successful restore printing 3 MB is not killed and logs nothing', () => {
-    withRealRestore(() => `${BIG}echo restore-ok`, (a, _root, errors) => {
-      expect(deployOnce(a)).toThrow(migrateAbort);
-      expect(errors.some((m) => m.startsWith('Restore hook failed'))).toBe(false);
-    });
-  });
-
-  it('a failing restore keeps the CHILD\'s exit status and logs only a bounded tail', () => {
-    withRealRestore(() => `${BIG}echo RESTORE-TAIL-MARKER; exit 7`, (a, _root, errors) => {
-      expect(deployOnce(a)).toThrow(/could not be auto-restored/);
-      const logged = errors.find((m) => m.startsWith('Restore hook failed'))!;
-      expect(logged).toContain('(exit 7)');
-      expect(logged).toContain('RESTORE-TAIL-MARKER');
-      expect(logged.length).toBeLessThan(5000);
-    });
-  });
-
-  it('a hook with a trailing # comment still runs (nothing is appended to the hook text)', () => {
-    withRealRestore((root) => `echo ran > ${root}/ran.flag # restore the backup`, (a, root) => {
-      expect(deployOnce(a)).toThrow(migrateAbort);
-      expect(readFileSync(path.join(root, 'ran.flag'), 'utf8')).toBe('ran\n');
-    });
-  });
-
-  it('a hook ending in a here-document still runs', () => {
-    withRealRestore((root) => `cat <<'EOF' > ${root}/heredoc.out\nfrom-heredoc\nEOF`, (a, root) => {
-      expect(deployOnce(a)).toThrow(migrateAbort);
-      expect(readFileSync(path.join(root, 'heredoc.out'), 'utf8')).toBe('from-heredoc\n');
-    });
-  });
-
-  it('leaves no scratch files behind (nothing is written to the target)', () => {
-    withRealRestore(() => 'exit 0', (a, root) => {
-      expect(deployOnce(a)).toThrow(migrateAbort);
-      expect(readdirSync(root).filter((f) => f.startsWith('.deploy-kit'))).toEqual([]);
-    });
-  });
-});
-
-describe('PKG-212: tail runner reports the child\'s status, whatever happens to diagnostics', () => {
-  const { runWithTail } = require('../tail-runner.js');
-  const quiet = { write: (_b: unknown, cb?: () => void) => { if (cb) cb(); return true; } };
-  const sh = (script: string, extra: any = {}) => runWithTail({
-    file: 'sh', args: ['-c', script], tailBytes: 16, live: quiet, report: quiet, ...extra,
-  });
-  const throwingTail = () => ({ push: () => { throw new Error('tail buffer exploded'); }, value: () => { throw new Error('boom'); } });
-
-  it.each([[0, 'echo hi'], [3, 'echo hi; exit 3']])('exit %i comes from the child', async (code, script) => {
-    expect(await sh(script)).toBe(code);
-  });
-  it.each([[0, 'echo hi'], [3, 'echo hi; exit 3']])('exit %i survives a tail buffer that throws on every write and read', async (code, script) => {
-    expect(await sh(script, { makeTail: throwingTail })).toBe(code);
-  });
-  it('exit status survives a tail buffer that cannot even be created', async () => {
-    expect(await sh('exit 4', { makeTail: () => { throw new Error('no buffer'); } })).toBe(4);
-  });
-  it('survives a reporting stream that throws', async () => {
-    const report = { write: () => { throw new Error('stdout closed'); } };
-    expect(await sh('echo hi; exit 5', { report })).toBe(5);
-  });
-  it('keeps only the last tailBytes bytes, with no total-output limit', async () => {
-    const chunks: Buffer[] = [];
-    const report = { write: (b: Buffer, cb: () => void) => { chunks.push(b); cb(); return true; } };
-    expect(await sh("head -c 3000000 /dev/zero | tr '\\0' x; printf TAIL-END", { report })).toBe(0);
-    expect(Buffer.concat(chunks).toString()).toBe('xxxxxxxxTAIL-END');
   });
 });

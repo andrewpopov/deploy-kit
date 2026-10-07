@@ -64,8 +64,8 @@ function isReleaseLayout(config) {
 
 // Run one command on the target in a chosen directory (buildTargetCommand prefixes
 // `cd <projectDir> &&`, so we clone the config with projectDir swapped to `dir`).
-function runInDir(dir, command, config, ctx, { capture = false, tolerate = false, input, tailBytes } = {}) {
-  const res = runOnTarget(command, { ...config, projectDir: dir }, { capture, runtime: ctx.runtime, input, tailBytes });
+function runInDir(dir, command, config, ctx, { capture = false, tolerate = false, input } = {}) {
+  const res = runOnTarget(command, { ...config, projectDir: dir }, { capture, runtime: ctx.runtime, input });
   if (!res.ok && !tolerate && !capture) {
     throw new Error(`Deploy aborted: command failed in ${dir}: ${command}`);
   }
@@ -315,19 +315,6 @@ function parsePendingCount(res) {
   return Number.isSafeInteger(count) ? count : null;
 }
 
-// Restore-hook output tail kept for the failure log (see exec.js `tailBytes`).
-const RESTORE_TAIL_BYTES = 4096;
-
-// log.js has no redaction layer, so only the tail of the hook's own output is
-// logged -- never the environment or the command line.
-function logRestoreFailure(res, ctx) {
-  const code = res.error && typeof res.error.status === 'number' ? ` (exit ${res.error.status})` : '';
-  ctx.log.error(
-    `Restore hook failed${code}. Last ${RESTORE_TAIL_BYTES} bytes of its output (not redacted):\n`
-    + `${res.tail || '<no output captured>'}`,
-  );
-}
-
 // Read a previous deploy's durable recovery journal. Only "stopped" is safe to
 // recover automatically: the journal is written the moment the stop phase BEGINS
 // (before stopWritersConfirmed() runs — see the disruptive-window call site), so
@@ -510,8 +497,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // "FOO='bar' cd /tmp && node -e \"console.log(process.env.FOO)\""` prints
     // undefined; `export FOO='bar'; cd /tmp && node …` prints bar).
     const env = st.backupId ? `export DEPLOY_KIT_BACKUP_ID='${st.backupId}'; ` : '';
-    const res = runInDir(paths.root, `${env}${config.hooks.restore}`, config, c, { tolerate: true, tailBytes: RESTORE_TAIL_BYTES });
-    if (!res.ok) logRestoreFailure(res, c);
+    const res = runInDir(paths.root, `${env}${config.hooks.restore}`, config, c, { tolerate: true });
     return res.ok;
   };
 
