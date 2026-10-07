@@ -178,7 +178,7 @@ const DEFAULT_CONFIG = {
     generate: null, // e.g. 'npx prisma generate'. null = skip.
     backup: null, // pre-migration backup gate; abort deploy if it fails. null = skip.
     migrate: null, // e.g. 'npm run db:migrate:prod'. null = skip.
-    // Release layout only (the legacy deploy ignores it and warns). Read-only
+    // Release layout only (loadConfig warns that the legacy deploy ignores it). Read-only
     // probe run in the candidate release, with DB writers stopped and the backup
     // taken, immediately before `migrate`: exit 0 and a last non-empty stdout
     // line that is exactly a base-10 integer, the number of pending migrations.
@@ -757,7 +757,14 @@ function loadConfig({
     }
   }
 
-  return mergeConfig(mergeConfig(DEFAULT_CONFIG, fileConfig), override);
+  const merged = mergeConfig(mergeConfig(DEFAULT_CONFIG, fileConfig), override);
+  // Known here (and only here) is the EFFECTIVE layout across file + override. The
+  // legacy pipeline has no migrated marker or DB restore for the probe to protect,
+  // so say it is ignored rather than let it look like it took effect.
+  if (merged.hooks.pendingMigrations && merged.layout?.type !== 'releases') {
+    log.warning('hooks.pendingMigrations is ignored unless layout.type is "releases"; `hooks.migrate` always runs under the legacy layout.');
+  }
+  return merged;
 }
 
 module.exports = {

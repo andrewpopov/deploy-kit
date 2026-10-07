@@ -11,4 +11,4 @@ probe runs after the backup with writers stopped; when it exits 0 and prints exa
 release without a restore. Any other result (non-zero exit, timeout, malformed
 output) runs the migrate hook as before. The probe must use the same selection rules
 as your migrator and needs exclusive ownership of schema migrations; see the README.
-It is ignored, with a warning, under the legacy layout.
+It is ignored under the legacy layout, and loadConfig warns about it.

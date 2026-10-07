@@ -311,19 +311,34 @@ describe('deploy pipeline', () => {
   });
 
   // PKG-212: the probe is release-layout only. Legacy has no migrated marker or DB
-  // restore for it to protect, so it must say it is ignored, never run it, and
-  // keep running migrate.
-  it('hooks.pendingMigrations is ignored under the legacy layout with a warning; migrate still runs', () => {
+  // restore for it to protect, so it is never run and migrate still runs; loadConfig
+  // (where the effective layout is known) is the one place that says so.
+  it('hooks.pendingMigrations is never run under the legacy layout; migrate still runs', () => {
     const { runtime, calls } = makeRuntime();
-    const warnings: string[] = [];
-    const log = { ...kit.makeLogger(() => {}, () => {}), warning: (m: string) => warnings.push(m) };
     const cfg = mergeConfig(baseConfig, { hooks: { ...baseConfig.hooks, pendingMigrations: 'check-pending' } });
-
-    const result = deploy(cfg, {}, { ...ctxWith(runtime), log });
-
+    const result = deploy(cfg, {}, ctxWith(runtime));
     expect(result.steps).toContain('migrate');
     expect(calls.some((c) => c.includes('check-pending'))).toBe(false);
-    expect(warnings.some((w) => /hooks\.pendingMigrations is ignored by the legacy/.test(w))).toBe(true);
+  });
+
+  describe('loadConfig: hooks.pendingMigrations diagnostic', () => {
+    const load = (raw: object, override: object = {}) => {
+      const warnings: string[] = [];
+      const log = { ...kit.makeLogger(() => {}, () => {}), warning: (m: string) => warnings.push(m) };
+      loadConfig({ cwd: '/x', fsImpl: { existsSync: () => true, readFileSync: () => JSON.stringify(raw) } as any, override, log });
+      return warnings.filter((w) => /pendingMigrations/.test(w));
+    };
+    const hooks = { pendingMigrations: 'check-pending', migrate: 'm', backup: 'b', restore: 'r' };
+    it('warns under the legacy layout', () => {
+      expect(load({ hooks })).toHaveLength(1);
+    });
+    it('does not warn under the release layout, including one supplied only by the override', () => {
+      expect(load({ hooks, layout: { type: 'releases' } })).toEqual([]);
+      expect(load({ hooks }, { layout: { type: 'releases' } })).toEqual([]);
+    });
+    it('does not warn when the hook is unset', () => {
+      expect(load({ hooks: { migrate: 'm' } })).toEqual([]);
+    });
   });
 
   it('omits unsafe or noisy backup output from delivery events without failing the deploy', () => {

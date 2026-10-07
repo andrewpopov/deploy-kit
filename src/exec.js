@@ -1,6 +1,9 @@
 'use strict';
 
+const path = require('path');
 const { execFileSync: nodeExecFileSync } = require('child_process');
+
+const TAIL_RUNNER = path.join(__dirname, 'tail-runner.js');
 
 // Single-quote a value for safe interpolation into a remote shell command,
 // escaping an embedded quote with the standard '\'' idiom. config.js already
@@ -137,19 +140,30 @@ function buildTargetCommand(command, { mode, host, projectDir, ssh, localShell }
 // normal deploy run (no `dryRun` on the runtime) is completely unaffected:
 // `readOnly` only ever changes behavior under `--dry-run`. Never set this on
 // a call that mutates anything.
+//
+// `tailBytes` (a number, capture:false only) streams the command's output live to
+// stderr with NO size limit while keeping the last `tailBytes` bytes, returned as
+// `tail`. The command text and its exit status are untouched: the target command
+// is run exactly as without it, through tail-runner.js, and `ok`/`error.status`
+// are the child's own. Use it where a failure's cause must be visible but the
+// command's output can be arbitrarily large (the release restore hook).
 function runOnTarget(command, config, {
-  capture = false, runtime, input, timeoutSeconds, readOnly = false,
+  capture = false, runtime, input, timeoutSeconds, readOnly = false, tailBytes,
 } = {}) {
   const normalized = normalizeRuntime(runtime);
   const execFileSync = (readOnly && normalized.dryRun) ? normalized.realExecFileSync : normalized.execFileSync;
-  const { file, args } = buildTargetCommand(command, config);
+  const target = buildTargetCommand(command, config);
+  const tailing = Number.isInteger(tailBytes) && tailBytes > 0 && !capture;
+  const { file, args } = tailing
+    ? { file: process.execPath, args: [TAIL_RUNNER, String(tailBytes), target.file, ...target.args] }
+    : target;
   const hasInput = input != null;
   const execOptions = {
     encoding: 'utf8',
     // stdin is a pipe when we're feeding `input`, otherwise ignored (capture) or
     // inherited (live). stdout/stderr are captured or inherited as before.
     stdio: [hasInput ? 'pipe' : (capture ? 'ignore' : 'inherit'),
-      capture ? 'pipe' : 'inherit',
+      capture || tailing ? 'pipe' : 'inherit',
       capture ? 'pipe' : 'inherit'],
   };
   if (hasInput) execOptions.input = input;
@@ -161,11 +175,15 @@ function runOnTarget(command, config, {
   const bound = timeoutSeconds !== undefined ? timeoutSeconds : config.stepTimeoutSeconds;
   if (bound) {
     execOptions.timeout = bound * 1000;
-    execOptions.killSignal = 'SIGKILL';
+    // The tail runner forwards SIGTERM as a SIGKILL to the real command; a
+    // SIGKILL on the runner itself would orphan it.
+    execOptions.killSignal = tailing ? 'SIGTERM' : 'SIGKILL';
   }
   try {
     const output = execFileSync(file, args, execOptions);
-    return { ok: true, output: capture ? String(output || '') : '', stderr: '' };
+    return {
+      ok: true, output: capture ? String(output || '') : '', stderr: '', ...(tailing ? { tail: String(output || '') } : {}),
+    };
   } catch (error) {
     // execFileSync surfaces a timeout as ETIMEDOUT; on its own that tells the
     // operator nothing about which step hung or what the bound was.
@@ -177,6 +195,7 @@ function runOnTarget(command, config, {
       ok: false,
       output: capture ? String(error.stdout || '') : '',
       stderr: capture ? String(error.stderr || '') : '',
+      ...(tailing ? { tail: String(error.stdout || '') } : {}),
       error,
     };
   }
