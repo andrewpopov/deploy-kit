@@ -578,6 +578,7 @@ function deployRelease(config, options = {}, ctx = {}) {
           runInDir(paths.root, `git --git-dir=${paths.repoGit} worktree remove --force ${st.releaseDir} 2>/dev/null || rm -rf ${st.releaseDir}`, config, c, { tolerate: true });
           runInDir(paths.root, `git --git-dir=${paths.repoGit} worktree prune 2>/dev/null || true`, config, c, { tolerate: true });
         }
+        log.info(`No change was made to the live release on ${config.host || 'this machine'}; it is safe to re-run deploy.`);
         return;
       case 'stopped':
         // writers stopped, nothing migrated/flipped — resume previous, verify.

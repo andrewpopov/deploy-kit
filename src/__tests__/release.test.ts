@@ -803,6 +803,30 @@ describe('release rollback — post-flip recovery (PKG-135 Finding 5)', () => {
 });
 
 describe('release deploy — failure recovery by phase', () => {
+  describe('safe-to-re-run line (PKG-224)', () => {
+    const SAFE = 'No change was made to the live release on';
+    const run = (fail: string[]) => {
+      const { runtime } = makeReleaseRuntime({ fail });
+      const infos: string[] = [];
+      const log = { ...kit.makeLogger(() => {}, () => {}), info: (m: string) => infos.push(m) };
+      try { release.deployRelease(relConfig(), {}, { ...ctx(runtime), log }); } catch { /* expected */ }
+      return infos;
+    };
+
+    it('is logged when the failure is before anything on the target changed (install)', () => {
+      expect(run(['npm ci']).some((m) => m.includes(SAFE) && m.includes('safe to re-run deploy'))).toBe(true);
+    });
+
+    it('is logged for a build failure too', () => {
+      expect(run(['npm run build']).some((m) => m.includes(SAFE))).toBe(true);
+    });
+
+    it('is NOT logged once the writers were stopped (backup failure) or the DB was touched (migration failure)', () => {
+      expect(run(['run-backup']).some((m) => m.includes(SAFE))).toBe(false);
+      expect(run(['run-migrate']).some((m) => m.includes(SAFE))).toBe(false);
+    });
+  });
+
   it('install failure: current keeps serving, apps never stopped, candidate quarantined', () => {
     const { runtime, calls } = makeReleaseRuntime({ fail: ['npm ci'] });
     expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow(/npm ci/);

@@ -788,3 +788,86 @@ describe('runLocal (PKG-207)', () => {
     expect(() => runLocal(runtime, ROOT, 'false')).toThrow(/command failed: false\n.*exit=3/);
   });
 });
+
+// PKG-224: a rejected release-cut push (typically the repo's pre-push gate,
+// whose output may not stream back) used to surface as a bare "command
+// failed: git push" -- nothing said whether anything shipped or what state the
+// checkout was left in.
+describe('autoCut failure explanation (PKG-224)', () => {
+  function runFailingCut(failOver: string[], stderrFor: Record<string, string> = {}, config = baseConfig()) {
+    const { runtime, calls } = makeAutoCutRuntime({ fail: failOver });
+    const failing = runtime.execFileSync;
+    runtime.execFileSync = (file: string, args: string[], options: any) => {
+      const cmd = args[args.length - 1];
+      try {
+        return failing(file, args, options);
+      } catch (error: any) {
+        const key = Object.keys(stderrFor).find((k) => cmd.includes(k));
+        if (key) error.stderr = stderrFor[key];
+        throw error;
+      }
+    };
+    const ctx = { ...baseCtx(), runtime };
+    wireCutSideEffects(runtime, ctx.fs);
+    let error: any;
+    try { autoCut(config, { projectRoot: ROOT }, ctx); } catch (e) { error = e; }
+    return { error, calls };
+  }
+
+  it('a rejected cut push says it was the gate, that nothing was released or deployed, and that the checkout was restored', () => {
+    const { error, calls } = runFailingCut(['git push -u']);
+    expect(error.message).toContain('the release-cut push to origin was rejected');
+    expect(error.message).toContain("pre-push gate");
+    expect(error.message).toContain('lane-broker log');
+    expect(error.message).toContain('Nothing was released or deployed.');
+    expect(error.message).toContain('The controller checkout is back on master and the local release/cut-20260817T120000Z was deleted.');
+    expect(error.message).toContain('re-run deploy-kit deploy');
+    // git's own failure detail stays appended.
+    expect(error.message).toContain('auto-cut: command failed: git push -u');
+    expect(error.message).toContain('fake stderr');
+    expect(calls.some((c: string) => c.startsWith('git branch -D'))).toBe(true);
+  });
+
+  it('says so instead of claiming a restore when the restore step itself fails', () => {
+    const { error } = runFailingCut(['git push -u', "git checkout 'master'"]);
+    expect(error.message).toContain('Could not put the controller checkout back on master');
+    expect(error.message).not.toContain('The controller checkout is back on master');
+    expect(error.message).toContain('Nothing was released or deployed.');
+  });
+
+  it('names the leftover local branch when only its deletion fails', () => {
+    const { error } = runFailingCut(['git push -u', 'git branch -D']);
+    expect(error.message).toContain('could not be deleted -- delete it with git branch -D release/cut-20260817T120000Z');
+    expect(error.message).toContain('The controller checkout is back on master');
+  });
+
+  it('calls a dropped SSH connection a dropped connection, not a gate rejection', () => {
+    const { error } = runFailingCut(['git push -u'], { 'git push -u': 'Connection to github.com closed by remote host.' });
+    expect(error.message).toContain('the connection to origin dropped during the release-cut push');
+    expect(error.message).not.toContain('pre-push gate');
+    expect(error.message).toContain('closed by remote host');
+  });
+
+  it('a failure before the push (commit) gets the same nothing-released honesty', () => {
+    const { error } = runFailingCut(['git commit -m']);
+    expect(error.message).toContain('the release cut failed before anything was pushed.');
+    expect(error.message).toContain('Nothing was released or deployed.');
+    expect(error.message).toContain('The controller checkout is back on master');
+  });
+
+  it('a failure after the push (gh pr create) does not claim nothing was released, only that nothing was deployed', () => {
+    const { error } = runFailingCut(['gh pr create']);
+    expect(error.message).toContain('failed after release/cut-20260817T120000Z was pushed to origin');
+    expect(error.message).toContain('Nothing was deployed');
+    expect(error.message).not.toContain('Nothing was released or deployed.');
+  });
+
+  it('local mode says the controller checkout was never touched', () => {
+    const { runtime, fs } = makeLocalRuntime({ fail: ['git push -u'] });
+    let error: any;
+    try { autoCut(localConfig(), { projectRoot: ROOT }, localCtx(fs, { runtime })); } catch (e) { error = e; }
+    expect(error.message).toContain('The controller checkout was never touched');
+    expect(error.message).not.toContain('is back on');
+    expect(error.message).toContain('Nothing was released or deployed.');
+  });
+});

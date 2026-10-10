@@ -746,6 +746,18 @@ error code, signal or exit status (for example `code=ENOBUFS`), its stderr, and 
 last 4000 characters of its captured stdout. Streamed commands print their own output
 live instead, so their error carries only the code and exit status.
 
+**A failed cut.** If the release-cut push is rejected (usually the repository's
+pre-push gate; run through a lane broker, its output is in the lane log rather than
+above), or anything else fails between creating the cut branch and the merge, the
+error says so first: nothing was released or deployed, and whether the controller
+checkout is back on the deploy branch with the local `release/cut-*` branch deleted
+(it reports any step that failed instead of claiming it). A dropped SSH connection
+is called out as such. Fix the gate failure, or just re-run `deploy-kit deploy` if it
+was a flaky or load-dependent test. Failures after the branch was pushed (PR create,
+merge poll) say the branch, and possibly a PR, may still exist on the remote. Under
+the release layout, a failure in preflight, materialize, install, build or validate
+also logs that no change was made to the live release and it is safe to re-run.
+
 Or programmatically:
 
 ```js

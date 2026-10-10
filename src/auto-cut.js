@@ -521,11 +521,58 @@ function removeLocalCutWorktree(runtime, controllerCwd, tmpWorktreeDir) {
 // runs in its own detached temp worktree, so the controller checkout is
 // never on the cut branch to begin with.
 function restoreControllerCheckoutAfterFailedCut(runtime, rootDir, originalBranch, cutBranch) {
-  if (!cutBranch) return;
+  if (!cutBranch) return { checkedOut: false, branchDeleted: false };
   runLocal(runtime, rootDir, 'git reset --hard HEAD', { allowFailure: true });
   runLocal(runtime, rootDir, 'git clean -fd', { allowFailure: true });
-  runLocal(runtime, rootDir, `git checkout ${shQuote(originalBranch)}`, { allowFailure: true });
-  runLocal(runtime, rootDir, `git branch -D ${shQuote(cutBranch)}`, { allowFailure: true });
+  const checkout = runLocal(runtime, rootDir, `git checkout ${shQuote(originalBranch)}`, { allowFailure: true });
+  const deletion = runLocal(runtime, rootDir, `git branch -D ${shQuote(cutBranch)}`, { allowFailure: true });
+  return { checkedOut: checkout.ok, branchDeleted: deletion.ok };
+}
+
+const SSH_DROP_PATTERN = /closed by remote host|connection reset|broken pipe|kex_exchange_identification/i;
+
+// Failure `stage` decides what can honestly be said about the remote: 'local'
+// = before the push began, 'push' = the push itself, 'published' = the push
+// succeeded, so the cut branch (and maybe a PR) exists.
+// One place that turns a failure between `git checkout -b` and the merge poll
+// into an operator-readable account: what failed, whether anything was
+// released, what state the controller checkout is in, and what to do next. The
+// original error's message (with git's exit code and stderr tail) is kept last.
+// `restored` is restoreControllerCheckoutAfterFailedCut's result, or null in
+// local mode where the controller checkout was never touched.
+function explainFailedCut(error, { stage, remote, branch, cutBranch, restored }) {
+  const original = String((error && error.message) || error);
+  const dropped = stage === 'push' && SSH_DROP_PATTERN.test(original);
+  const sentences = [];
+  if (stage === 'push') {
+    sentences.push(dropped
+      ? `auto-cut: the connection to ${remote} dropped during the release-cut push (not a gate rejection).`
+      : `auto-cut: the release-cut push to ${remote} was rejected. This is usually the repository's pre-push gate (its output is above, or in its lane-broker log if the gate runs in a lane).`);
+  } else if (stage === 'published') {
+    sentences.push(`auto-cut: the release cut failed after ${cutBranch} was pushed to ${remote}.`);
+  } else {
+    sentences.push('auto-cut: the release cut failed before anything was pushed.');
+  }
+  sentences.push(stage === 'published'
+    ? `Nothing was deployed, but ${cutBranch} (and possibly its PR) may still exist on ${remote}.`
+    : 'Nothing was released or deployed.');
+  if (!restored) {
+    sentences.push('The controller checkout was never touched (the cut ran in a temporary worktree).');
+  } else if (!restored.checkedOut) {
+    sentences.push(`Could not put the controller checkout back on ${branch} -- run git checkout ${branch} (it may still be on ${cutBranch}).`);
+  } else if (!restored.branchDeleted) {
+    sentences.push(`The controller checkout is back on ${branch}, but the local ${cutBranch} could not be deleted -- delete it with git branch -D ${cutBranch}.`);
+  } else {
+    sentences.push(`The controller checkout is back on ${branch} and the local ${cutBranch} was deleted.`);
+  }
+  if (stage === 'published') {
+    sentences.push(`Next: check ${cutBranch} and any PR on ${remote} (close the PR and delete the branch if abandoned), then re-run deploy-kit deploy.`);
+  } else if (stage === 'push' && !dropped) {
+    sentences.push('Next: fix the gate failure or, if it was a flaky or load-dependent test, re-run deploy-kit deploy.');
+  } else {
+    sentences.push('Next: fix the cause below, then re-run deploy-kit deploy.');
+  }
+  return new Error(`${sentences.join(' ')}\n${original}`, { cause: error });
 }
 
 // ---- main entry -------------------------------------------------------------
@@ -622,6 +669,7 @@ function autoCut(config, options = {}, ctx = {}) {
   let mergeState;
   let prNumber;
   let cutBranch = null;
+  let cutStage = 'local';
   try {
     if (isLocalMode) {
       const created = createLocalCutWorktree(runtime, rootDir, rootDir, baseTipX, { now, tmpdir: ctx.tmpdir });
@@ -715,7 +763,9 @@ function autoCut(config, options = {}, ctx = {}) {
       const cutSha = cutShaRes.output.trim();
 
       // 8. Merge with a pre-merge CAS.
+      cutStage = 'push';
       runLocal(runtime, cutCwd, `git push -u ${shQuote(config.remote)} ${shQuote(cutBranch)}`, { stream: true });
+      cutStage = 'published';
       const prTitle = `release: cut ${newVersion}`;
       runLocal(runtime, cutCwd, `gh pr create --base ${shQuote(config.branch)} --head ${shQuote(cutBranch)} --title ${shQuote(prTitle)} --body ${shQuote('Automated release cut by deploy-kit auto-cut.')}`);
       const prNumberRes = runLocal(runtime, cutCwd, `gh pr view ${shQuote(cutBranch)} --json number -q .number`);
@@ -750,10 +800,12 @@ function autoCut(config, options = {}, ctx = {}) {
         );
       }
     } catch (error) {
-      if (!isLocalMode) {
-        restoreControllerCheckoutAfterFailedCut(runtime, rootDir, config.branch, cutBranch);
-      }
-      throw error;
+      const restored = isLocalMode
+        ? null
+        : restoreControllerCheckoutAfterFailedCut(runtime, rootDir, config.branch, cutBranch);
+      throw explainFailedCut(error, {
+        stage: cutStage, remote: config.remote, branch: config.branch, cutBranch, restored,
+      });
     }
   } finally {
     if (tmpWorktreeDir) {
