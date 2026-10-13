@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { log: defaultLog } = require('./log');
+const { verifiedRefProblems } = require('./verified-ref');
 
 const CONFIG_FILENAME = '.deploy-kit.config.json';
 
@@ -96,6 +97,12 @@ const DEFAULT_CONFIG = {
   // `github:owner/repo#ref`, so without this gate a stale dependency ships under a
   // green deploy. Set false only for a target you accept cannot be verified.
   verifyPins: true,
+  // BRAIN-567: null (default) = deploy whatever `branch` resolves to. A branch
+  // name (the merge train's `green`) = production only ever receives a commit
+  // contained in that ref: a plain deploy ships its tip, `--sha` must be an
+  // ancestor of it, `--branch` is refused. Not combinable with autoCut; no
+  // override flag. Applies to both layouts and `deploy --on-host`.
+  requireVerifiedRef: null,
   // Deploy layout. null (default) = legacy in-place deploy on the live worktree —
   // exactly the behavior every app has today. An opt-in typed block switches an app
   // to artifact-first release deploys (SMH-112): each deploy builds an immutable
@@ -236,6 +243,7 @@ const KEY_TYPES = {
   onHost: 'object?',
   buildBeforeMigrate: 'boolean',
   verifyPins: 'boolean',
+  requireVerifiedRef: 'string?',
   layout: 'object?',
   monitor: 'object?',
   autoCut: 'object?',
@@ -703,6 +711,7 @@ function validateConfig(raw, { source = 'config' } = {}) {
   if (typeof raw.remote === 'string' && !isValidRefName(raw.remote)) {
     problems.push(`${source}: "remote" ("${raw.remote}") must be a valid git ref name (letters, digits, ".", "_", "-", "/"; no "..", no leading "-", no shell metacharacters)`);
   }
+  problems.push(...verifiedRefProblems(raw, source));
   if (typeof raw.localShell === 'string' && !raw.localShell.startsWith('/')) {
     problems.push(`${source}: "localShell" must be an absolute path (start with "/")`);
   }

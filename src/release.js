@@ -10,6 +10,9 @@ const { parsePm2List } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
 const { clearAutoCutPending } = require('./auto-cut');
 const { assertShaOptions } = require('./sha-options');
+const {
+  assertVerifiedRefOptions, verifiedRefLabel, resolveVerifiedTip, assertContainedInVerified,
+} = require('./verified-ref');
 const { atomicWriteCommand, writeLastDeployRecord } = require('./last-deploy');
 
 // Bump when the on-host layout changes shape. The host migration writes this
@@ -392,6 +395,7 @@ function deployRelease(config, options = {}, ctx = {}) {
   const log = ctx.log || defaultLog;
   const sleep = ctx.sleep || defaultSleep;
   const c = { ...ctx, log, sleep, runtime: ctx.runtime };
+  assertVerifiedRefOptions(config, options, c);
   const paths = releasePaths(config);
 
   // Populated inside the try block below, AFTER lock acquisition and target
@@ -748,7 +752,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // See the matching comment in deploy.js -- strict either/or provenance,
     // never a guess.
     const rFromAutoCut = R != null && autoCutResult.ran;
-    const rLabel = rFromAutoCut ? 'auto-cut release' : 'the --sha commit';
+    let rLabel = rFromAutoCut ? 'auto-cut release' : 'the --sha commit';
 
     const pointers = readPointers(config, paths, c);
     // A present current pointer must always be a valid release target (a corrupt
@@ -773,6 +777,21 @@ function deployRelease(config, options = {}, ctx = {}) {
     // gitDir through rather than relying on cwd having a `.git`.
     const branch = resolveBranch(config, c, { gitDir: paths.repoGit });
     st.branch = branch;
+    // requireVerifiedRef: no --sha means the verified ref's tip ships, never the
+    // branch tip. The heads:heads fetch above already mirrored it into the bare repo.
+    const verifiedRef = config.requireVerifiedRef;
+    const verifiedHead = `refs/heads/${verifiedRef}`;
+    const verifiedProbe = {
+      fetch: () => ({ ok: true }),
+      revParse: () => runInDir(paths.root, `git --git-dir=${paths.repoGit} rev-parse --verify --quiet ${shQuote(`${verifiedHead}^{commit}`)}`, config, c, { capture: true }),
+    };
+    let verifiedTip = null;
+    if (verifiedRef && !R) {
+      verifiedTip = resolveVerifiedTip(config, verifiedProbe);
+      R = verifiedTip;
+      rLabel = verifiedRefLabel(config);
+      log.info(`${rLabel}: deploying ${R.slice(0, 12)}`);
+    }
     // Resolve the exact SHA from `refs/heads/<branch>` FIRST — that is the ref the
     // explicit `+refs/heads/*:refs/heads/*` fetch above just force-updated, so it is
     // always current. A remote-tracking `origin/<branch>` (present if repo.git has a
@@ -810,6 +829,15 @@ function deployRelease(config, options = {}, ctx = {}) {
           + `-- refusing to deploy a commit that is not merged onto "${branch}". Merge it first, or check --sha `
           + 'for a typo.',
         );
+      }
+      if (verifiedRef && !verifiedTip) {
+        // `--sha` under requireVerifiedRef: also contained in the verified ref.
+        const tip = resolveVerifiedTip(config, verifiedProbe);
+        assertContainedInVerified(config, R, tip, () => runInDir(
+          paths.root,
+          `git --git-dir=${paths.repoGit} merge-base --is-ancestor ${shQuote(R)} ${shQuote(verifiedHead)}`,
+          config, c, { tolerate: true },
+        ).ok);
       }
     } else {
       const resolveSha = (ref) => capture(paths.root, `git --git-dir=${paths.repoGit} rev-parse ${ref}`, config, c);
