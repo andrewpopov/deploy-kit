@@ -14,6 +14,9 @@ const { onlineAppNames } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
 const { clearAutoCutPending } = require('./auto-cut');
 const { assertShaOptions } = require('./sha-options');
+const {
+  assertVerifiedRefOptions, verifiedRefLabel, resolveVerifiedTip, assertContainedInVerified,
+} = require('./verified-ref');
 const { writeLastDeployRecord } = require('./last-deploy');
 
 function defaultSleep(seconds) {
@@ -169,6 +172,7 @@ function deploy(config, options = {}, ctx = {}) {
   const sleep = ctx.sleep || defaultSleep;
   const runtime = ctx.runtime;
   const c = { ...ctx, log, sleep, runtime };
+  assertVerifiedRefOptions(config, options, c);
 
   const {
     skipDeps = false,
@@ -254,6 +258,14 @@ function deploy(config, options = {}, ctx = {}) {
   // the auto-cut call site below for why it must not run any earlier.
   let autoCutResult = { ran: false };
   let R = null;
+  let verifiedTip = null;
+  const verifiedRef = config.requireVerifiedRef;
+  const verifiedRefspec = `+refs/heads/${verifiedRef}:refs/remotes/${config.remote}/${verifiedRef}`;
+  const verifiedTrackingRef = `${config.remote}/${verifiedRef}`;
+  const verifiedProbe = {
+    fetch: () => runOnTarget(`git fetch ${shQuote(config.remote)} ${shQuote(verifiedRefspec)}`, config, { runtime }),
+    revParse: () => runOnTarget(`git rev-parse --verify --quiet ${shQuote(`${verifiedTrackingRef}^{commit}`)}`, config, { runtime, capture: true }),
+  };
 
   const release = acquireLock(config, c, { steal: stealLock });
   // DO NOT DELETE THIS AS DEAD CODE. `onSignal`'s body is in fact unreachable
@@ -322,6 +334,12 @@ function deploy(config, options = {}, ctx = {}) {
       // either auto-cut isn't configured at all or `--no-auto-cut` disabled it.
       R = options.sha;
       log.info(`--sha: deploying ${R.slice(0, 12)} exactly`);
+    } else if (config.requireVerifiedRef) {
+      // requireVerifiedRef: ship the tip of the train-verified ref, never the
+      // branch tip. Resolved before anything on the target is touched.
+      verifiedTip = resolveVerifiedTip(config, verifiedProbe);
+      R = verifiedTip;
+      log.info(`${verifiedRefLabel(config)}: deploying ${R.slice(0, 12)}`);
     }
 
     // Every message below that names R must say where R actually came from --
@@ -331,7 +349,7 @@ function deploy(config, options = {}, ctx = {}) {
     // what produced R; suggesting it on a `--sha` failure would send an
     // operator chasing a flag that was never in play.
     const rFromAutoCut = R != null && autoCutResult.ran;
-    const rLabel = rFromAutoCut ? 'auto-cut release' : 'the --sha commit';
+    const rLabel = rFromAutoCut ? 'auto-cut release' : (verifiedTip ? verifiedRefLabel(config) : 'the --sha commit');
     const autoCutHint = rFromAutoCut ? ' or pass --no-auto-cut' : '';
     // Auto-cut produced an immutable release `R` that this deploy must bring
     // the target to EXACTLY -- never the branch tip, and never silently follow
@@ -495,6 +513,14 @@ function deploy(config, options = {}, ctx = {}) {
           + `(${branchTip.slice(0, 12)}) at ${config.projectDir} -- refusing to deploy a commit that is not `
           + `merged onto "${branch}". Merge it first, or check --sha for a typo.`,
         );
+      }
+
+      if (verifiedRef && !verifiedTip) {
+        // `--sha` under requireVerifiedRef: also contained in the verified ref.
+        const tip = resolveVerifiedTip(config, verifiedProbe);
+        assertContainedInVerified(config, R, tip, () => runOnTarget(
+          `git merge-base --is-ancestor ${shQuote(R)} ${shQuote(tip)}`, config, { runtime },
+        ).ok);
       }
 
       const preMergeHeadRes = runOnTarget('git rev-parse HEAD', config, { runtime, capture: true });

@@ -177,6 +177,12 @@ export interface DeployConfig {
    * re-resolves a changed `github:owner/repo#ref`, so without this gate a stale
    * dependency ships under a green deploy. */
   verifyPins?: boolean;
+  /** Branch name (the merge train's `green`) that bounds what may ship. When set, a
+   * plain deploy ships that ref's tip instead of `branch`, `--sha` must be contained
+   * in it, and `--branch` is refused. Both layouts and `deploy --on-host` enforce it.
+   * Rollback is unaffected. Cannot be combined with `autoCut`; there is no override
+   * flag. Default `null` (off). */
+  requireVerifiedRef?: string | null;
   /** Opt-in artifact-first release layout (SMH-112). Absent/null = legacy in-place. */
   layout?: ReleaseLayout | null;
   /** Opt-in fleet monitoring + alerting (SMH-116). Absent/null = disabled. */

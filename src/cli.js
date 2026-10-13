@@ -281,6 +281,8 @@ function dryRunContext(config, options = {}) {
     // target is symbolically "on the deploy branch" for planning purposes.
     if (rendered.includes('symbolic-ref -q --short HEAD')) return config.branch || 'master';
     if (rendered.includes('rev-parse refs/heads/') || rendered.includes(`rev-parse '${config.remote}'/`)) return sha;
+    // `requireVerifiedRef`'s tip read (verified-ref.js): the planned sha IS the verified tip.
+    if (config.requireVerifiedRef && rendered.includes('rev-parse --verify --quiet')) return sha;
     if (rendered.includes('date -u +%Y%m%dT%H%M%SZ')) return timestamp;
     if (rendered.includes('git rev-parse HEAD')) return headSha;
     if (rendered.includes(`readlink ${config.projectDir}/current`)) return currentTarget;
