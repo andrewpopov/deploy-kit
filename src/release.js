@@ -2,7 +2,7 @@
 
 const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
 const { acquireLock } = require('./lock');
-const { log: defaultLog } = require('./log');
+const { log: defaultLog, logFailureOutput } = require('./log');
 const { backupIdFromOutput, isSafeBackupId, backupReferenceFromId } = require('./backup-reference');
 const { resolveBranch } = require('./branch');
 const { buildPinCheckProgram, PIN_CHECK_COMMAND } = require('./pin-gate');
@@ -954,7 +954,10 @@ function deployRelease(config, options = {}, ctx = {}) {
     if (!skipMigrate && config.hooks.backup) {
       log.step('Backing up the database (writers stopped)');
       const res = runInDir(st.releaseDir, config.hooks.backup, config, c, { capture: true });
-      if (!res.ok) throw new Error('Pre-migration database backup failed');
+      if (!res.ok) {
+        logFailureOutput('Backup hook', res, log);
+        throw new Error('Pre-migration database backup failed');
+      }
       // The backup hook must print a restorable id/path as its last non-empty stdout
       // line. Validate it to a safe charset before it is interpolated into restore.
       st.backupId = backupIdFromOutput(res.output, { log });
@@ -978,6 +981,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     if (migrateHookNeeded && config.hooks.pendingMigrations) {
       log.step('Checking for pending database migrations (writers stopped)');
       const probe = runInDir(st.releaseDir, config.hooks.pendingMigrations, config, c, { capture: true });
+      if (!probe.ok) logFailureOutput('Pending-migration probe', probe, log);
       const pending = parsePendingCount(probe);
       if (pending === 0) {
         st.migrationsPending = 0;

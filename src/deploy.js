@@ -7,7 +7,7 @@ const { buildPinCheckProgram, PIN_CHECK_COMMAND } = require('./pin-gate');
 const {
   lockDir, prevShaFile, ensureStateDir, acquireLock,
 } = require('./lock');
-const { log: defaultLog } = require('./log');
+const { log: defaultLog, logFailureOutput } = require('./log');
 const { backupIdFromOutput, backupReferenceFromId } = require('./backup-reference');
 const { resolveBranch } = require('./branch');
 const { onlineAppNames } = require('./pm2-state');
@@ -144,6 +144,7 @@ function gate(step, config, ctx, { onFail, capture = false } = {}) {
   ctx.log.step(step.message);
   const res = runOnTarget(step.command, config, { runtime: ctx.runtime, capture });
   if (!res.ok) {
+    if (capture) logFailureOutput(step.message, res, ctx.log);
     if (onFail) onFail();
     throw new Error(`Deploy aborted: ${step.message} failed`);
   }

@@ -22,7 +22,7 @@ const baseOptions = (over: Record<string, unknown> = {}) => ({ sha: SHA, autoCut
 
 const PREFLIGHT_LINES: Record<string, string> = {
   DK_USER: 'dkapp', DK_UID: '1000', DK_LINGER: 'yes', DK_USER_MANAGER: 'yes', DK_NODE: '/usr/bin/node', DK_NODE_MAJOR: '24', DK_ACTIVE_UNITS: '0',
-  DK_SHELL: '/bin/bash', DK_UMASK: '0027', DK_OOM: '100', DK_PATH: '/usr/local/bin:/usr/bin', DK_HOME: '/srv/dkapp', DK_LOGNAME: 'dkapp', ENV_LANG: 'C.UTF-8', ENVABSENT_PM2_HOME: '1', DK_END: '1',
+  DK_SHELL: '/bin/bash', DK_GID: '1000', DK_GROUPS: '1000 990 991', DK_GROUP_NAMES: 'dkapp docker backup', DK_MANAGER_GROUPS: '\t990\t991\t1000', DK_UMASK: '0027', DK_OOM: '100', DK_PATH: '/usr/local/bin:/usr/bin', DK_HOME: '/srv/dkapp', DK_LOGNAME: 'dkapp', ENV_LANG: 'C.UTF-8', ENVABSENT_PM2_HOME: '1', DK_END: '1',
 };
 const hex = (v: string) => Buffer.from(v, 'utf8').toString('hex');
 const preflight = (over: Record<string, string | null> = {}) => Object.entries({ ...PREFLIGHT_LINES, ...over })
@@ -93,6 +93,32 @@ describe('preflight parsing', () => {
     const cap = parsePreflight(preflight({ ENV_DATABASE_URL: 'pg://x', ENVABSENT_MISSING_ONE: '1' }), baseConfig({ onHost: { env: ['DATABASE_URL', 'MISSING_ONE'] } }), quietLog);
     expect(cap.env).toEqual({ LANG: 'C.UTF-8', DATABASE_URL: 'pg://x' });
     expect(cap.absentEnv).toEqual(['PM2_HOME', 'MISSING_ONE']);
+  });
+  describe('stale supplementary groups in the user manager (PKG-243)', () => {
+    it('refuses, naming the missing group and the fix, when the manager lacks a group the user has', () => {
+      const run = () => parsePreflight(preflight({ DK_MANAGER_GROUPS: '\t990\t1000' }), baseConfig(), quietLog);
+      expect(run).toThrow(/^ONHOST_STALE_GROUPS:/);
+      expect(run).toThrow(/backup \(991\)/);
+      expect(run).toThrow(/sudo systemctl restart user@1000\.service/);
+    });
+    it('does not require the primary group in the manager supplementary list', () => {
+      expect(() => parsePreflight(preflight({ DK_MANAGER_GROUPS: '990 991' }), baseConfig(), quietLog)).not.toThrow();
+    });
+    it('refuses when the manager holds no supplementary groups at all', () => {
+      expect(() => parsePreflight(preflight({ DK_MANAGER_GROUPS: '' }), baseConfig(), quietLog)).toThrow(/^ONHOST_STALE_GROUPS:.*docker \(990\), backup \(991\)/);
+    });
+    it('warns once and skips when the manager groups could not be read', () => {
+      const log = { warning: vi.fn() };
+      expect(() => parsePreflight(preflight({ DK_MANAGER_GROUPS: null }), baseConfig(), log)).not.toThrow();
+      expect(log.warning).toHaveBeenCalledTimes(1);
+      expect(log.warning.mock.calls[0][0]).toMatch(/could not read the supplementary groups of user@1000\.service/);
+    });
+    it('preflightScript reads id -G and the manager /proc status Groups line', () => {
+      const script = op.preflightScript(baseConfig());
+      expect(script).toContain('id -G');
+      expect(script).toContain('systemctl show "user@$uid.service" -p MainPID --value');
+      expect(script).toContain('/proc/$mgr_pid/status');
+    });
   });
   it('only warns when NODE_OPTIONS is set', () => {
     const log = { warning: vi.fn() };

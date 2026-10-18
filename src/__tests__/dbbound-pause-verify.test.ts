@@ -50,7 +50,7 @@ const baseConfig = mergeConfig(DEFAULT_CONFIG, {
 // fixtures that never modeled that file at all.
 const PLAUSIBLE_SHA = 'a'.repeat(40);
 
-function makeRuntime({ jlistResponses = [] as string[], fail = [] as string[] } = {}) {
+function makeRuntime({ jlistResponses = [] as string[], fail = [] as string[], failStderr = '', failStdout = '' } = {}) {
   const calls: string[] = [];
   let jlistIndex = 0;
   const execFileSync = (_file: string, args: string[]) => {
@@ -58,7 +58,8 @@ function makeRuntime({ jlistResponses = [] as string[], fail = [] as string[] } 
     calls.push(cmd);
     if (fail.some((f) => cmd.includes(f))) {
       const err: any = new Error(`fake failure: ${cmd}`);
-      err.stdout = '';
+      err.stdout = failStdout;
+      err.stderr = failStderr;
       err.status = 1;
       throw err;
     }
@@ -293,6 +294,32 @@ describe('deploy(): DB-bound app pause verification', () => {
     expect(resumePosition).toBeGreaterThan(jlistPositions[3]);
     expect(resumePosition).toBeLessThan(jlistPositions[4]);
     expect(calls.some((c) => c.includes('db:backup'))).toBe(false);
+  });
+
+  // PKG-243: the backup hook runs captured, so its stderr used to vanish and the deploy log said only
+  // "Pre-migration database backup failed". The tail must reach the log, redacted, before the throw.
+  it('(p) a failing backup hook logs the tail of its stderr and stdout, redacting the webhook URL', () => {
+    const webhook = 'https://discord.example/api/webhooks/123/secret-token';
+    const stderr = [...Array.from({ length: 60 }, (_, i) => `noise ${i}`), `EACCES: cannot write backup (posted to ${webhook})`].join('\n');
+    const { runtime } = makeRuntime({
+      fail: ['db:backup'], failStderr: stderr, failStdout: 'stdout line\n', jlistResponses: [onlineJlist('app'), stoppedJlist('app'), onlineJlist('app')],
+    });
+    const logged: string[] = [];
+    const log = { ...makeLogger(), header: () => {}, divider: () => {}, step: () => {}, info: () => {}, success: () => {}, warning: () => {}, error: (m: string) => logged.push(m) };
+    const previous = process.env.DISCORD_RELEASE_WEBHOOK;
+    process.env.DISCORD_RELEASE_WEBHOOK = webhook;
+    try {
+      expect(() => deploy(baseConfig, {}, ctxWith(runtime, { log }))).toThrow(/Pre-migration database backup failed/);
+    } finally {
+      if (previous === undefined) delete process.env.DISCORD_RELEASE_WEBHOOK; else process.env.DISCORD_RELEASE_WEBHOOK = previous;
+    }
+    const text = logged.join('\n');
+    expect(text).toContain('Pre-migration database backup stderr (last 40 of 61 lines)');
+    expect(text).toContain('EACCES: cannot write backup');
+    expect(text).not.toContain('noise 0\n');
+    expect(text).toContain('Pre-migration database backup stdout:');
+    expect(text).toContain('stdout line');
+    expect(text).not.toContain('secret-token');
   });
 
   it('(k) recovery resumes ONLY the apps observed running before the pause', () => {
