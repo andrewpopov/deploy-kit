@@ -87,6 +87,10 @@ function preflightScript(config) {
     'dk_emit DK_NODE_MAJOR "$(node -p \'process.versions.node.split(".")[0]\' 2>/dev/null)"',
     `dk_emit DK_ACTIVE_UNITS "$(systemctl --user list-units --all --no-legend --plain --state=activating,active,deactivating 'deploy-kit-*' 2>/dev/null | awk '{print $1}' | grep -Ec ${shQuote(unitPattern)})"`,
     'dk_emit DK_SHELL "$(getent passwd "$u" | cut -d: -f7)"',
+    'dk_emit DK_GROUPS "$(id -G)"; dk_emit DK_GROUP_NAMES "$(id -G -n)"; dk_emit DK_GID "$(id -g)"',
+    // The manager's groups are emitted only when readable, so an absent key means "could not read" (never "none").
+    'mgr_pid=$(systemctl show "user@$uid.service" -p MainPID --value 2>/dev/null) || true',
+    'case $mgr_pid in \'\'|0|*[!0-9]*) ;; *) mgr_line=$(grep \'^Groups:\' "/proc/$mgr_pid/status" 2>/dev/null) && dk_emit DK_MANAGER_GROUPS "${mgr_line#Groups:}" ;; esac',
     'dk_emit DK_UMASK "$(umask)"',
     'dk_emit DK_OOM "$(cat /proc/self/oom_score_adj)"',
     'dk_emit DK_PATH "$PATH"; dk_emit DK_HOME "$HOME"',
@@ -116,6 +120,33 @@ function parseKeyValues(output) {
   return values;
 }
 
+// A user's long-lived `systemd --user` manager keeps the supplementary groups it started with, and every
+// transient unit inherits them. A group added to the user later is therefore missing from the unit, and a
+// hook fails deep inside a deploy with the writers already stopped. Refuse before anything is touched.
+// An unreadable manager (key absent) warns and skips: that is a gap in the check, not evidence of a problem.
+function assertManagerHasUserGroups(kv, { user, uid }, log) {
+  const wanted = kv.get('DK_GROUPS');
+  const held = kv.get('DK_MANAGER_GROUPS');
+  if (wanted === undefined || held === undefined) {
+    log.warning(`could not read the supplementary groups of user@${uid}.service; skipping the stale-group check`);
+    return;
+  }
+  const split = (text) => text.split(/\s+/).filter(Boolean);
+  const names = split(kv.get('DK_GROUP_NAMES') || '');
+  const primary = kv.get('DK_GID');
+  const managerGroups = new Set(split(held));
+  const missing = split(wanted)
+    .map((gid, index) => ({ gid, name: names[index] }))
+    .filter(({ gid }) => gid !== primary && !managerGroups.has(gid));
+  if (!missing.length) return;
+  const list = missing.map(({ gid, name }) => (name ? `${name} (${gid})` : gid)).join(', ');
+  throw new OnHostError(
+    'ONHOST_STALE_GROUPS',
+    `the user manager user@${uid}.service was started before ${user} was added to: ${list}, so every on-host unit would miss it; `
+    + `run: sudo systemctl restart user@${uid}.service (apps under system-level pm2 units are unaffected), then redeploy`,
+  );
+}
+
 // Turns the preflight's KEY=VALUE reply into the capture the unit is built from, or throws
 // a named refusal. Pure: tests feed it text.
 function parsePreflight(output, config, log = defaultLog) {
@@ -142,6 +173,7 @@ function parsePreflight(output, config, log = defaultLog) {
   if (kv.get('DK_USER_MANAGER') !== 'yes') {
     throw new OnHostError('ONHOST_NO_USER_MANAGER', `\`systemctl --user\` does not work for ${user} over ssh (is the user manager running and XDG_RUNTIME_DIR /run/user/${uid} present?)`);
   }
+  assertManagerHasUserGroups(kv, { user, uid }, log);
   const node = kv.get('DK_NODE');
   const nodeMajor = Number(kv.get('DK_NODE_MAJOR'));
   if (!node || !SAFE_ABS_PATH_RE.test(node) || !Number.isInteger(nodeMajor) || nodeMajor < MIN_NODE_MAJOR) {

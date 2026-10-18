@@ -25,7 +25,8 @@ The operator config must have `layout.type === 'releases'`, `mode === 'ssh'`, `l
    - `loginctl show-user $USER -p Linger` ≠ yes (`ONHOST_NO_LINGER`);
    - `systemctl --user show-environment` fails, with `XDG_RUNTIME_DIR` defaulted (`ONHOST_NO_USER_MANAGER`);
    - `command -v node` missing or node < 20 (`ONHOST_NODE`);
-   - an active `deploy-kit-<lockId>-*` unit exists (`ONHOST_ALREADY_RUNNING`).
+   - an active `deploy-kit-<lockId>-*` unit exists (`ONHOST_ALREADY_RUNNING`);
+   - the user manager lacks a supplementary group the user has now: `id -G` vs the `Groups:` line of `/proc/<pid>/status`, pid from `systemctl show user@<uid>.service -p MainPID --value` (`ONHOST_STALE_GROUPS`, fix `sudo systemctl restart user@<uid>.service`). An unreadable manager warns and skips.
    It also captures:
    - the login shell from `getent passwd $USER | cut -d: -f7`;
    - `umask`;

@@ -163,4 +163,5 @@ module.exports = {
   formatDiscordMessage,
   postToDiscord,
   alertDiscord,
+  redact,
 };

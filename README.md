@@ -116,7 +116,7 @@ text or redirection filenames.
 | `requireVerifiedRef` | `string \| null` | `null` | both | 0.31 | Only ever deploy a commit the merge train's full suite verified, i.e. one contained in this ref (normally `green`). A plain deploy ships the ref's tip instead of `branch`; `--sha` must be an ancestor of it or the deploy aborts; `--branch` is refused. Enforced by the legacy and release layouts and by `deploy --on-host`; rollback is unchanged. A missing ref aborts before anything is touched. Config error with `autoCut`, a bad ref name, or a value equal to `branch`. No override flag. |
 | `hooks.install` | `string` | `npm ci --prefer-offline \|\| npm ci \|\| npm install` | both | 0.1 | Dependency install; offline-first so a GitHub outage can't break a no-dep-change deploy. |
 | `hooks.generate` | `string \| null` | `null` | both | unreleased | Codegen that writes into `node_modules` (e.g. `npx prisma generate`). Runs unconditionally right after install, before build. Keep this OUT of `hooks.build`: a build tool's own cache (Nx/Turbo) can replay a cache hit and skip the build command entirely, silently skipping a generator baked into it while `npm ci` has already wiped what it was supposed to regenerate. `null` = skip. |
-| `hooks.backup` | `string \| null` | `null` | both | 0.1 | Pre-migration backup **gate** — a failure aborts before any schema change. Preferred output contract: JSON on stdout with a top-level `backupId` (db-backup >= 0.18.0 emits this). Legacy fallbacks remain supported: `id`, `created.fullPath`, `created.fileName`, or a safe final-line id/path. The parsed id is correlated to `deliveryEvent` as a leaf-only `backupReference`; if nothing parses, deploy-kit logs a loud warning (restore correlation unavailable) but never fails the deploy over it. |
+| `hooks.backup` | `string \| null` | `null` | both | 0.1 | Pre-migration backup **gate** — a failure aborts before any schema change, and the tail (last 40 lines) of the hook's stderr and stdout is printed to the deploy log first (Discord webhook URLs redacted); the same applies to the `hooks.pendingMigrations` probe. Preferred output contract: JSON on stdout with a top-level `backupId` (db-backup >= 0.18.0 emits this). Legacy fallbacks remain supported: `id`, `created.fullPath`, `created.fileName`, or a safe final-line id/path. The parsed id is correlated to `deliveryEvent` as a leaf-only `backupReference`; if nothing parses, deploy-kit logs a loud warning (restore correlation unavailable) but never fails the deploy over it. |
 | `hooks.migrate` | `string \| null` | `null` | both | 0.1 | Migration command; runs with `dbBoundApps` paused. |
 | `hooks.pendingMigrations` | `string \| null` | `null` | release | unreleased | Read-only probe that lets a no-op migration skip `hooks.migrate`, so a later failure rolls code back without a DB restore. Runs in the candidate release after the backup, with writers stopped, right before `migrate`. Exit `0` and a last non-empty stdout line that is exactly a base-10 integer (the pending count); only a count of exactly `0` skips `migrate`. Anything else runs it as usual. Ignored under the legacy layout (`loadConfig` warns); skipped with `--skip-migrate`. Must be a non-empty command. See [Skipping a no-op migration](#skipping-a-no-op-migration). |
 | `hooks.build` | `string \| null` | `null` | both | 0.1 | Build command. |
@@ -797,6 +797,13 @@ on the host. The run id is `<YYYYMMDDTHHMMSSZ>-<sha12>-<8 hex>`; the unit is
 
 - **Linger**: `sudo loginctl enable-linger <user>` (`ONHOST_NO_LINGER`), so the user manager
   and its units outlive the ssh session. `systemctl --user` must work over ssh (`ONHOST_NO_USER_MANAGER`).
+- **Current supplementary groups in the user manager** (`ONHOST_STALE_GROUPS`). The long-lived
+  `systemd --user` manager keeps the groups it had when it started, and every unit inherits them, so a
+  group added to the user later (for example a backup or docker group) is missing from the hooks.
+  The preflight compares `id -G` with the `Groups:` line of the manager's `/proc/<pid>/status` and
+  refuses, before anything is stopped, naming the missing group(s). Fix:
+  `sudo systemctl restart user@<uid>.service` (apps under system-level pm2 units are unaffected).
+  If the manager's pid or status cannot be read, the check warns and is skipped.
 - **`KillUserProcesses=no`** in `logind.conf` (the Debian default; with `yes`, logind kills the
   user's processes at logout regardless of linger).
 - **node >= 20** on the ssh `PATH` (`ONHOST_NODE`).

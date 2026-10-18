@@ -35,7 +35,7 @@ function makeReleaseRuntime(over: any = {}) {
     fail: [] as string[],
     // A command that exits non-zero but still printed something (key = substring
     // of the command, value = the stdout it leaves behind; `code` is the error code).
-    failStdout: {} as Record<string, { stdout: string; code?: string }>,
+    failStdout: {} as Record<string, { stdout: string; stderr?: string; code?: string }>,
     ...over,
   };
   const calls: string[] = [];
@@ -53,6 +53,7 @@ function makeReleaseRuntime(over: any = {}) {
     if (failStdoutKey) {
       const err: any = new Error(`fake failure with output: ${cmd}`);
       err.stdout = cfg.failStdout[failStdoutKey].stdout;
+      err.stderr = cfg.failStdout[failStdoutKey].stderr;
       err.code = cfg.failStdout[failStdoutKey].code;
       err.status = 1;
       throw err;
@@ -825,6 +826,21 @@ describe('release deploy — failure recovery by phase', () => {
       expect(run(['run-backup']).some((m) => m.includes(SAFE))).toBe(false);
       expect(run(['run-migrate']).some((m) => m.includes(SAFE))).toBe(false);
     });
+  });
+
+  // PKG-243: the backup hook runs captured; its output used to be dropped, leaving only the fixed message.
+  it('a failing backup hook logs the tail of its stderr and stdout before the fixed error', () => {
+    const stderr = [...Array.from({ length: 50 }, (_, i) => `noise ${i}`), 'EACCES: backup dir not writable'].join('\n');
+    const { runtime } = makeReleaseRuntime({ failStdout: { 'run-backup': { stdout: 'partial stdout', stderr } } });
+    const errors: string[] = [];
+    const log = { ...kit.makeLogger(() => {}, () => {}), error: (m: string) => errors.push(m) };
+    expect(() => release.deployRelease(relConfig(), {}, { ...ctx(runtime), log })).toThrow(/Pre-migration database backup failed/);
+    const text = errors.join('\n');
+    expect(text).toContain('Backup hook stderr (last 40 of 51 lines)');
+    expect(text).toContain('EACCES: backup dir not writable');
+    expect(text).not.toContain('noise 0\n');
+    expect(text).toContain('Backup hook stdout:');
+    expect(text).toContain('partial stdout');
   });
 
   it('install failure: current keeps serving, apps never stopped, candidate quarantined', () => {
