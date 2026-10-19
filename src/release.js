@@ -38,6 +38,7 @@ const MIN_FREE_KIB = 512 * 1024;
 const RELEASE_ID_BODY = '[0-9a-f]{7,40}-\\d{8}T\\d{6}Z';
 const RELEASE_ID_RE = new RegExp(`^${RELEASE_ID_BODY}$`);
 const RELEASE_TARGET_RE = new RegExp(`^releases\\/${RELEASE_ID_BODY}$`);
+const IDENTICAL_CHECK_FAILURE_NOTE = 'check failed identically on both releases: likely the check or its environment, not the release';
 
 function defaultSleep(seconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, seconds * 1000);
@@ -445,6 +446,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     phase: 'preflight', dbAppsPaused: false, flipped: false, prevTarget: null,
     releaseDir: null, releaseId: null, sha: null, branch: null, backupId: null,
     migrated: false, migrationsPending: null, failedCheck: null, failurePolicy: null, recoveryOutcome: null,
+    recoveryNote: null,
   });
   const st = freshState();
   let recoveringInterrupted = false;
@@ -463,6 +465,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     migrated: st.migrated, ...migrationsPendingField(), flipped: st.flipped, prevTarget: st.prevTarget,
     failedCheck: st.failedCheck, failurePolicy: st.failurePolicy,
     recoveryOutcome: st.recoveryOutcome,
+    ...(st.recoveryNote ? { recoveryNote: st.recoveryNote } : {}),
   }, c);
 
   // After a SUCCESSFUL recovery, overwrite the journaled disruptive phase so the
@@ -490,6 +493,20 @@ function deployRelease(config, options = {}, ctx = {}) {
     // a zero-exit `pm2 start` is not proof (Codex).
     runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
     return verifyActivation(config, paths, null, `${paths.root}/${st.prevTarget}`, c);
+  };
+
+  // The rollback target is restored (DB and pointer) but did not verify. It must still
+  // end up RUNNING: a rollback that cannot prove health is a reason to alert, never a
+  // reason to leave the service stopped. Starts the apps again only when one is not online.
+  const ensureRollbackTargetRunning = () => {
+    const online = () => {
+      const snap = readPm2(config, paths, c);
+      return Boolean(snap) && config.appNames.every((n) => snap[n] && snap[n].online);
+    };
+    if (online()) return true;
+    log.warning('Rollback target is not fully online after its verification failed; starting its apps again');
+    runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
+    return online();
   };
 
   const restoreDb = () => {
@@ -562,13 +579,31 @@ function deployRelease(config, options = {}, ctx = {}) {
         + 'restarted; manually confirm the pointer and running process',
       );
     }
-    if (!resumePrevious().ok) fail('the previous release did not come back healthy after DB/symlink recovery');
+    const resumed = resumePrevious();
+    if (!resumed.ok) {
+      const appsOnline = ensureRollbackTargetRunning();
+      fail(
+        `the previous release did not come back healthy after DB/symlink recovery (${resumed.reason}); `
+        + `its apps were left ${appsOnline ? 'running' : 'NOT online'}`,
+        { rollbackTargetRestored: true, appsOnline },
+      );
+    }
+  };
+
+  // Re-run the failed post-deploy check against the rolled-back release. The same
+  // check failing on both releases points at the check or its environment, not the release.
+  const failedCheckAlsoFailsOnPrevious = () => {
+    const check = config.postDeployChecks.find((candidate) => candidate.name === st.failedCheck);
+    if (!check) return false;
+    return !runInDir(paths.root, check.command, config, c, { tolerate: true }).ok;
   };
 
   // Phase-appropriate recovery. Returns nothing; throws a distinct MANUAL RECOVERY
   // error if it cannot restore a known-good running release (never a routine abort).
   const recover = (err) => {
-    const fail = (msg) => { throw new Error(`MANUAL RECOVERY REQUIRED — ${msg}. Original: ${err && err.message}`); };
+    const fail = (msg, details = {}) => {
+      throw Object.assign(new Error(`MANUAL RECOVERY REQUIRED — ${msg}. Original: ${err && err.message}`), details);
+    };
     log.error(`Deploy failed in phase "${st.phase}": ${err && err.message}`);
     switch (st.phase) {
       case 'preflight':
@@ -637,11 +672,26 @@ function deployRelease(config, options = {}, ctx = {}) {
             recovery: { policy: st.failurePolicy, outcome: st.recoveryOutcome, verified: true },
           });
         } catch (recoveryError) {
+          // Two distinct failures. Restore/pointer/writer failures leave the apps NOT
+          // restarted (old code on an unknown schema may be wrong). A rollback target
+          // that restored cleanly but failed verification is left RUNNING.
+          const targetRunning = recoveryError.rollbackTargetRestored === true && recoveryError.appsOnline === true;
           st.phase = 'post-deploy-rollback-failed';
-          st.recoveryOutcome = 'rollback-failed';
+          st.recoveryOutcome = targetRunning ? 'rollback-failed-running' : 'rollback-failed';
+          if (recoveryError.rollbackTargetRestored === true && failedCheckAlsoFailsOnPrevious()) {
+            st.recoveryNote = IDENTICAL_CHECK_FAILURE_NOTE;
+          }
           try { journal(); } catch { /* original recovery error remains primary */ }
+          log.error(
+            targetRunning
+              ? `ALERT: deploy and automatic rollback both failed verification; ${st.prevTarget} is left RUNNING and needs manual review`
+              : 'ALERT: deploy failed and the automatic rollback could not restore a known-good release; the apps were NOT restarted and the service may be DOWN',
+          );
+          if (st.recoveryNote) log.error(st.recoveryNote);
           emitDeliveryEvent('failed', {
-            ...eventBase,
+            ...(targetRunning ? { failedCheck: st.failedCheck, activeRelease: st.prevTarget } : eventBase),
+            appsState: targetRunning ? 'running' : 'not-restarted',
+            ...(st.recoveryNote ? { note: st.recoveryNote } : {}),
             recovery: { policy: st.failurePolicy, outcome: st.recoveryOutcome, verified: false },
           });
           throw recoveryError;

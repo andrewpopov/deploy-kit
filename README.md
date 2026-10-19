@@ -310,8 +310,21 @@ command fails:
 
 - `rollback` stops and confirms DB writers when a migration ran, flips `current`
   to the prior release, restores the pre-migration backup, restarts, and verifies
-  the prior release. If any recovery gate fails, traffic is not blindly resumed
-  and the command escalates to `MANUAL RECOVERY REQUIRED`.
+  the prior release. If any recovery gate fails, the command escalates to
+  `MANUAL RECOVERY REQUIRED` and the journal moves to `post-deploy-rollback-failed`,
+  which blocks the next deploy until reconciled. The two ways it can fail are kept
+  distinct in `recoveryOutcome` and in the event's `appsState`:
+  - `rollback-failed-running` (`appsState: running`): the pointer and DB were
+    restored but the prior release did not pass verification. The prior release's
+    apps are left **running** (deploy-kit starts them again if they are not online)
+    and an alert fires. A stopped service is never the outcome of this case.
+  - `rollback-failed` (`appsState: not-restarted`): the DB restore, the pointer
+    flip-back, or the writer stop could not be confirmed. The apps stay stopped,
+    because old code on an unknown schema may be wrong, and the alert says so.
+  When the rollback target restored cleanly, deploy-kit re-runs the failed
+  post-deploy check against it. If that fails too, the state's `recoveryNote` and the
+  event's `note` read "check failed identically on both releases: likely the check or
+  its environment, not the release" (an expired smoke key, for example).
 - `remain-active` keeps the already activation-verified candidate serving but
   records the deployment as degraded.
 - `manual` also leaves the verified candidate serving, records a failed deployment,
@@ -321,6 +334,10 @@ The on-host journal is written at failure, before rollback, and at the terminal
 outcome. A configured `deliveryEvent.command` then receives a `failed` or
 `degraded` event with the failed check, attempted revision, active release or
 revision, recovery policy/outcome, and only the redacted backup leaf reference.
+A failed rollback is also logged as an `ALERT:` error line and delivered as the
+same `failed` event (with `appsState` and `note`), which `announce-discord`
+renders as a distinct "automatic rollback failed" message; without a
+`deliveryEvent.command` only the log line and the journal record it.
 A failed event sink is warned but cannot change the chosen recovery action; the
 journal remains the durable local record. A hard interruption during post-deploy
 rollback is recognized on the next invocation and blocks a new deploy until

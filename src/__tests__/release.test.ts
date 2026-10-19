@@ -1712,3 +1712,87 @@ describe('PKG-212: the restore hook is run exactly as before (no capture, no wra
     expect(restore.options.maxBuffer).toBeUndefined();
   });
 });
+
+describe('PKG-258: a rollback whose own verification fails leaves the rollback target running', () => {
+  const smoke = { name: 'public-smoke', command: 'run-smoke', onFailure: 'rollback' };
+  const IDENTICAL = 'check failed identically on both releases: likely the check or its environment, not the release';
+  const journalsOf = (calls: string[]) => calls
+    .filter((cmd) => cmd.includes('.deploy-kit-state.json.tmp'))
+    .map((cmd) => JSON.parse(/printf '%s' '(.*?)' > /.exec(cmd)![1]));
+  const events = (inputs: Array<{ command: string; input: string | undefined }>) => inputs
+    .filter(({ command }) => command.includes('emit-event')).map(({ input }) => JSON.parse(input ?? '{}'));
+
+  // Smoke key expired: run-smoke fails on every release. After the flip-back the rollback
+  // target also fails verification (health never 200). `dropFirstRestart` makes the first
+  // post-rollback `pm2 startOrRestart` not take, so apps stay stopped until deploy-kit retries.
+  function rollbackVerifyFailsRuntime({ dropFirstRestart = false, smokeFailsOnPrevious = true } = {}) {
+    const rt = makeReleaseRuntime({ fail: ['run-smoke'] });
+    const flipBack = `ln -s ${rt.cfg.currentLink} /srv/app/.dk-swap.$$.current`;
+    let flippedBack = false;
+    let dropped = !dropFirstRestart;
+    const inner = rt.runtime.execFileSync;
+    const execFileSync = (file: string, args: string[], options: any) => {
+      const cmd = args[args.length - 1];
+      if (cmd.includes(flipBack)) flippedBack = true;
+      if (flippedBack && cmd.includes('curl')) { rt.calls.push(cmd); const err: any = new Error('fake failure: curl'); err.stdout = ''; throw err; }
+      if (flippedBack && !smokeFailsOnPrevious && cmd.includes('run-smoke')) { rt.calls.push(cmd); return ''; }
+      if (flippedBack && !dropped && /pm2 startOrRestart/.test(cmd)) { dropped = true; rt.calls.push(cmd); return ''; }
+      return inner(file, args, options);
+    };
+    return { ...rt, runtime: { execFileSync } };
+  }
+
+  const run = (rt: ReturnType<typeof makeReleaseRuntime>) => {
+    const config = relConfig({ postDeployChecks: [smoke], deliveryEvent: { command: 'emit-event' } });
+    expect(() => release.deployRelease(config, {}, ctx(rt.runtime))).toThrow(/MANUAL RECOVERY REQUIRED/);
+  };
+
+  it('restarts the rollback target, stays a manual-recovery phase, alerts, and records the identical-failure line', () => {
+    const rt = rollbackVerifyFailsRuntime();
+    run(rt);
+    const last = journalsOf(rt.calls).at(-1);
+    expect(last).toMatchObject({
+      phase: 'post-deploy-rollback-failed', recoveryOutcome: 'rollback-failed-running', recoveryNote: IDENTICAL,
+    });
+    const flip = rt.calls.findIndex((cmd) => cmd.includes(`ln -s ${rt.cfg.currentLink} /srv/app/.dk-swap.$$.current`));
+    const lastStop = rt.calls.reduce((n, cmd, i) => (cmd.includes('pm2 stop') ? i : n), -1);
+    const lastStart = rt.calls.reduce((n, cmd, i) => (cmd.includes('pm2 startOrRestart') ? i : n), -1);
+    expect(lastStop).toBeLessThan(flip);
+    expect(lastStart).toBeGreaterThan(flip);
+    const [event] = events(rt.inputs).slice(-1);
+    expect(event).toMatchObject({
+      status: 'failed', appsState: 'running', activeRelease: rt.cfg.currentLink, note: IDENTICAL,
+      recovery: { policy: 'rollback', outcome: 'rollback-failed-running', verified: false },
+    });
+  });
+
+  it('starts the apps again when the first post-rollback start did not take', () => {
+    const rt = rollbackVerifyFailsRuntime({ dropFirstRestart: true });
+    run(rt);
+    const flip = rt.calls.findIndex((cmd) => cmd.includes(`ln -s ${rt.cfg.currentLink} /srv/app/.dk-swap.$$.current`));
+    expect(rt.calls.slice(flip).filter((cmd) => cmd.includes('pm2 startOrRestart'))).toHaveLength(2);
+    expect(journalsOf(rt.calls).at(-1)).toMatchObject({ recoveryOutcome: 'rollback-failed-running' });
+  });
+
+  it('omits the identical-failure line when the check passes on the previous release', () => {
+    const rt = rollbackVerifyFailsRuntime({ smokeFailsOnPrevious: false });
+    run(rt);
+    const last = journalsOf(rt.calls).at(-1)!;
+    expect(last.recoveryOutcome).toBe('rollback-failed-running');
+    expect(last.recoveryNote).toBeUndefined();
+    expect(events(rt.inputs).at(-1).note).toBeUndefined();
+  });
+
+  it('keeps the apps stopped and alerts loudly, with a distinct state, when the DB restore itself failed', () => {
+    const rt = makeReleaseRuntime({ fail: ['run-smoke', 'run-restore'] });
+    run(rt);
+    const last = journalsOf(rt.calls).at(-1);
+    expect(last).toMatchObject({ phase: 'post-deploy-rollback-failed', recoveryOutcome: 'rollback-failed' });
+    expect(last.recoveryNote).toBeUndefined();
+    const lastStop = rt.calls.reduce((n, cmd, i) => (cmd.includes('pm2 stop') ? i : n), -1);
+    expect(rt.calls.slice(lastStop).filter((cmd) => cmd.includes('pm2 startOrRestart'))).toHaveLength(0);
+    expect(events(rt.inputs).at(-1)).toMatchObject({
+      status: 'failed', appsState: 'not-restarted', recovery: { outcome: 'rollback-failed', verified: false },
+    });
+  });
+});

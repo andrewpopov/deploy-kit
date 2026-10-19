@@ -37,6 +37,13 @@ function formatDiscordMessage(event, { service = DEFAULT_SERVICE } = {}) {
   if (event?.status === 'degraded') {
     return `⚠️ \`${service}\` deployment \`${branch}@${shortSha}\` is degraded after \`${event.failedCheck || 'post-deploy check'}\` at ${when}`;
   }
+  if (event?.status === 'failed' && String(event.recovery?.outcome).startsWith('rollback-failed')) {
+    const apps = event.appsState === 'running'
+      ? `apps are left running on \`${event.activeRelease || 'the previous release'}\``
+      : 'apps were NOT restarted and the service may be down';
+    const note = event.note ? ` ${event.note}.` : '';
+    return `🚨 \`${service}\` deployment \`${branch}@${shortSha}\` failed after \`${event.failedCheck || 'post-deploy check'}\` and its automatic rollback failed (\`${event.recovery.outcome}\`): ${apps}. Manual recovery required.${note} at ${when}`;
+  }
   if (event?.status === 'failed') {
     const outcome = event.recovery?.outcome || 'failed';
     return `❌ \`${service}\` deployment \`${branch}@${shortSha}\` failed (\`${outcome}\`) after \`${event.failedCheck || 'post-deploy check'}\` at ${when}`;
