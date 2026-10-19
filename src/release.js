@@ -1,5 +1,7 @@
 'use strict';
 
+const path = require('path');
+const { execFileSync: nodeExecFileSync } = require('child_process');
 const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
 const { acquireLock } = require('./lock');
 const { log: defaultLog, logFailureOutput } = require('./log');
@@ -10,6 +12,7 @@ const { parsePm2List } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
 const { clearAutoCutPending } = require('./auto-cut');
 const { assertShaOptions } = require('./sha-options');
+const { DEFAULT_WEBHOOK_ENV: ALERT_WEBHOOK_ENV } = require('./alert-discord');
 const {
   assertVerifiedRefOptions, verifiedRefLabel, resolveVerifiedTip, assertContainedInVerified,
 } = require('./verified-ref');
@@ -166,20 +169,10 @@ function waitForRunningSha(config, paths, sha, ctx) {
   return { ok: false, running };
 }
 
-// Full activation verification (Codex's five conditions). A deploy "succeeds" only
-// when ALL hold, so an old process answering 200 can't mask a failed flip.
-//   1. health endpoint(s) return 200
-//   2. every managed PID's /proc/<pid>/cwd resolves to the new release
-//   3. the running app reports the deployed SHA (if runningShaCommand is set —
-//      retried across the health window, but still only ever satisfied by
-//      actually observing the expected SHA)
-//   4. PM2 reports every app online
-//   5. restart counts stay flat across the settling window
-// Returns { ok, reason }.
-function verifyActivation(config, paths, sha, releaseDir, ctx) {
-  const log = ctx.log;
-  if (!waitForHealth(config, ctx)) return { ok: false, reason: 'health endpoint never returned 200' };
-
+// Every managed app is online under PM2 with a cwd inside `releaseDir` (the release
+// IDENTITY, so an old process still online from another release cannot pass). Shared
+// by verifyActivation and the rollback recovery. Returns { ok, reason }.
+function appsRunFromRelease(config, paths, releaseDir, ctx) {
   const pm2 = readPm2(config, paths, ctx);
   if (!pm2) return { ok: false, reason: 'could not read `pm2 jlist`' };
 
@@ -199,6 +192,25 @@ function verifyActivation(config, paths, sha, releaseDir, ctx) {
       return { ok: false, reason: `${name} (pid ${proc.pid}) cwd is ${cwd || '<unknown>'}, not under ${canonicalRelease}` };
     }
   }
+  return { ok: true };
+}
+
+// Full activation verification (Codex's five conditions). A deploy "succeeds" only
+// when ALL hold, so an old process answering 200 can't mask a failed flip.
+//   1. health endpoint(s) return 200
+//   2. every managed PID's /proc/<pid>/cwd resolves to the new release
+//   3. the running app reports the deployed SHA (if runningShaCommand is set —
+//      retried across the health window, but still only ever satisfied by
+//      actually observing the expected SHA)
+//   4. PM2 reports every app online
+//   5. restart counts stay flat across the settling window
+// Returns { ok, reason }.
+function verifyActivation(config, paths, sha, releaseDir, ctx) {
+  const log = ctx.log;
+  if (!waitForHealth(config, ctx)) return { ok: false, reason: 'health endpoint never returned 200' };
+
+  const fromRelease = appsRunFromRelease(config, paths, releaseDir, ctx);
+  if (!fromRelease.ok) return fromRelease;
 
   // SHA assertion only applies to a forward deploy (a known target SHA). Recovery
   // and rollback verify the PREVIOUS release with sha=null and skip this check.
@@ -499,14 +511,11 @@ function deployRelease(config, options = {}, ctx = {}) {
   // end up RUNNING: a rollback that cannot prove health is a reason to alert, never a
   // reason to leave the service stopped. Starts the apps again only when one is not online.
   const ensureRollbackTargetRunning = () => {
-    const online = () => {
-      const snap = readPm2(config, paths, c);
-      return Boolean(snap) && config.appNames.every((n) => snap[n] && snap[n].online);
-    };
-    if (online()) return true;
-    log.warning('Rollback target is not fully online after its verification failed; starting its apps again');
+    const runsFromTarget = () => appsRunFromRelease(config, paths, `${paths.root}/${st.prevTarget}`, c).ok;
+    if (runsFromTarget()) return true;
+    log.warning('Rollback target is not fully online (or an app still runs from another release); starting its apps again');
     runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
-    return online();
+    return runsFromTarget();
   };
 
   const restoreDb = () => {
@@ -598,6 +607,38 @@ function deployRelease(config, options = {}, ctx = {}) {
     return !runInDir(paths.root, check.command, config, c, { tolerate: true }).ok;
   };
 
+  const noteIdenticalCheckFailure = () => {
+    if (failedCheckAlsoFailsOnPrevious()) st.recoveryNote = IDENTICAL_CHECK_FAILURE_NOTE;
+  };
+
+  // Delivery events usually reach only the app's own release channel, which is how a
+  // dead service went unnoticed for hours. A failed rollback therefore also posts one
+  // message straight to the fleet alert webhook when it is set in THIS process's
+  // environment. alert-discord's own CLI does the send: the URL travels in the child's
+  // env, never argv or a log line, and a failure here only warns.
+  const postFleetAlert = (message) => {
+    const env = c.env || process.env;
+    if (!env[ALERT_WEBHOOK_ENV]) return;
+    const event = {
+      eventId: `deploy-rollback-failed-${st.releaseId || 'unknown'}`,
+      createdAtMs: c.now ? c.now() : Date.now(),
+      host: config.host || 'local',
+      alerts: [{ id: 'deploy-rollback-failed', kind: 'alert', status: 'crit', message }],
+    };
+    const args = [path.join(__dirname, 'cli.js'), 'alert-discord'];
+    const service = path.basename(config.projectDir || '');
+    if (service) args.push('--service', service);
+    try {
+      const send = (c.runtime && c.runtime.execFileSync) || nodeExecFileSync;
+      send(process.execPath, args, {
+        input: JSON.stringify(event), env, stdio: ['pipe', 'ignore', 'ignore'], timeout: 15000,
+      });
+      log.info('Posted the failed-rollback alert to the fleet alert webhook');
+    } catch {
+      log.warning('Could not post the failed-rollback alert to the fleet alert webhook; the journal and delivery event still record it');
+    }
+  };
+
   // Phase-appropriate recovery. Returns nothing; throws a distinct MANUAL RECOVERY
   // error if it cannot restore a known-good running release (never a routine abort).
   const recover = (err) => {
@@ -665,35 +706,41 @@ function deployRelease(config, options = {}, ctx = {}) {
           rollbackToPrevious(fail);
           st.phase = 'post-deploy-rolled-back';
           st.recoveryOutcome = 'rolled-back';
+          noteIdenticalCheckFailure();
           journal();
           emitDeliveryEvent('failed', {
             failedCheck: st.failedCheck,
             activeRelease: st.prevTarget,
+            ...(st.recoveryNote ? { note: st.recoveryNote } : {}),
             recovery: { policy: st.failurePolicy, outcome: st.recoveryOutcome, verified: true },
           });
         } catch (recoveryError) {
-          // Two distinct failures. Restore/pointer/writer failures leave the apps NOT
-          // restarted (old code on an unknown schema may be wrong). A rollback target
-          // that restored cleanly but failed verification is left RUNNING.
-          const targetRunning = recoveryError.rollbackTargetRestored === true && recoveryError.appsOnline === true;
+          // Restoration (DB + pointer) and startup are tracked separately. Not restored:
+          // the apps are deliberately NOT restarted (old code on an unknown schema may be
+          // wrong). Restored: the target is left RUNNING if it is, else it is a distinct
+          // not-started outcome. Either restored case names the rollback target, never the candidate.
+          const restored = recoveryError.rollbackTargetRestored === true;
+          const running = restored && recoveryError.appsOnline === true;
+          const outcome = running ? 'rollback-failed-running' : (restored ? 'rollback-failed-not-started' : 'rollback-failed');
+          const appsState = running ? 'running' : (restored ? 'not-running' : 'not-restarted');
           st.phase = 'post-deploy-rollback-failed';
-          st.recoveryOutcome = targetRunning ? 'rollback-failed-running' : 'rollback-failed';
-          if (recoveryError.rollbackTargetRestored === true && failedCheckAlsoFailsOnPrevious()) {
-            st.recoveryNote = IDENTICAL_CHECK_FAILURE_NOTE;
-          }
+          st.recoveryOutcome = outcome;
+          if (restored) noteIdenticalCheckFailure();
           try { journal(); } catch { /* original recovery error remains primary */ }
-          log.error(
-            targetRunning
-              ? `ALERT: deploy and automatic rollback both failed verification; ${st.prevTarget} is left RUNNING and needs manual review`
-              : 'ALERT: deploy failed and the automatic rollback could not restore a known-good release; the apps were NOT restarted and the service may be DOWN',
-          );
+          const alertText = {
+            'rollback-failed-running': `deploy and automatic rollback both failed verification; ${st.prevTarget} is left RUNNING and needs manual review`,
+            'rollback-failed-not-started': `deploy failed and the rollback restored ${st.prevTarget}, but its apps are NOT confirmed running; the service may be DOWN`,
+            'rollback-failed': 'deploy failed and the automatic rollback could not restore a known-good release; the apps were NOT restarted and the service may be DOWN',
+          }[outcome];
+          log.error(`ALERT: ${alertText}`);
           if (st.recoveryNote) log.error(st.recoveryNote);
           emitDeliveryEvent('failed', {
-            ...(targetRunning ? { failedCheck: st.failedCheck, activeRelease: st.prevTarget } : eventBase),
-            appsState: targetRunning ? 'running' : 'not-restarted',
+            ...(restored ? { failedCheck: st.failedCheck, activeRelease: st.prevTarget } : eventBase),
+            appsState,
             ...(st.recoveryNote ? { note: st.recoveryNote } : {}),
-            recovery: { policy: st.failurePolicy, outcome: st.recoveryOutcome, verified: false },
+            recovery: { policy: st.failurePolicy, outcome, verified: false },
           });
+          postFleetAlert(`${alertText} (${outcome}).${st.recoveryNote ? ` ${st.recoveryNote}.` : ''}`);
           throw recoveryError;
         }
         return;

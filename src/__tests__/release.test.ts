@@ -1796,3 +1796,151 @@ describe('PKG-258: a rollback whose own verification fails leaves the rollback t
     });
   });
 });
+
+describe('PKG-258 round 2: rollback identity, restoration vs startup, identical-failure note, fleet alert', () => {
+  const smoke = { name: 'public-smoke', command: 'run-smoke', onFailure: 'rollback' };
+  const WEBHOOK = 'https://discord.example/api/webhooks/SECRET-TOKEN';
+  const IDENTICAL = 'check failed identically on both releases: likely the check or its environment, not the release';
+  const journalsOf = (calls: string[]) => calls
+    .filter((cmd) => cmd.includes('.deploy-kit-state.json.tmp'))
+    .map((cmd) => JSON.parse(/printf '%s' '(.*?)' > /.exec(cmd)![1]));
+  const eventsOf = (inputs: Array<{ command: string; input: string | undefined }>) => inputs
+    .filter(({ command }) => command.includes('emit-event')).map(({ input }) => JSON.parse(input ?? '{}'));
+
+  // `dropRestarts`: how many post-flip-back `pm2 startOrRestart` calls do nothing.
+  // `curlFailsAfterFlip`: the rollback target fails health verification.
+  // Process identity is modelled: a process keeps the cwd of the release it was started from,
+  // so a candidate process that stays online after a dropped restart still reads as the candidate.
+  function rollbackRuntime({ dropRestarts = 0, curlFailsAfterFlip = false, smokeFailsOnPrevious = true, alertSendFails = false } = {}) {
+    const rt = makeReleaseRuntime({ fail: ['run-smoke'] });
+    const prevDir = `/srv/app/${rt.cfg.currentLink}`;
+    const flipBack = `ln -s ${rt.cfg.currentLink} /srv/app/.dk-swap.$$.current`;
+    let flippedBack = false;
+    let dropsLeft = dropRestarts;
+    let procCwd = rt.cfg.canonical;
+    const alertSends: Array<{ file: string; args: string[]; options: any }> = [];
+    const inner = rt.runtime.execFileSync;
+    const execFileSync = (file: string, args: string[], options: any) => {
+      if (file === process.execPath) {
+        alertSends.push({ file, args, options });
+        if (alertSendFails) throw new Error('send failed');
+        return '';
+      }
+      const cmd = args[args.length - 1];
+      if (cmd.includes(flipBack)) flippedBack = true;
+      if (flippedBack && curlFailsAfterFlip && cmd.includes('curl')) { rt.calls.push(cmd); const err: any = new Error('fake failure: curl'); err.stdout = ''; throw err; }
+      if (flippedBack && !smokeFailsOnPrevious && cmd.includes('run-smoke')) { rt.calls.push(cmd); return ''; }
+      if (flippedBack && /pm2 startOrRestart/.test(cmd)) {
+        if (dropsLeft > 0) { dropsLeft -= 1; rt.calls.push(cmd); return ''; }
+        procCwd = prevDir;
+      }
+      if (cmd.includes('readlink -f /proc/')) { rt.calls.push(cmd); return procCwd; }
+      if (cmd.includes(`readlink -f ${prevDir}`)) { rt.calls.push(cmd); return prevDir; }
+      return inner(file, args, options);
+    };
+    return { ...rt, alertSends, runtime: { execFileSync } };
+  }
+
+  const run = (rt: ReturnType<typeof rollbackRuntime>, { env = {}, options = {} }: { env?: Record<string, string>; options?: any } = {}) => {
+    const config = relConfig({ postDeployChecks: [smoke], deliveryEvent: { command: 'emit-event' } });
+    const warnings: string[] = [];
+    const log = { ...kit.makeLogger(() => {}, () => {}), warning: (m: string) => warnings.push(m) };
+    let thrown: Error | undefined;
+    try { release.deployRelease(config, options, { ...ctx(rt.runtime), log, env }); } catch (e) { thrown = e as Error; }
+    return { thrown, warnings };
+  };
+
+  it('P1: candidate processes that stay online do not count as the rollback target running', () => {
+    const rt = rollbackRuntime({ dropRestarts: 99, curlFailsAfterFlip: true });
+    run(rt, { options: { skipMigrate: true } });
+    const last = journalsOf(rt.calls).at(-1);
+    expect(last).toMatchObject({ phase: 'post-deploy-rollback-failed', recoveryOutcome: 'rollback-failed-not-started' });
+    expect(eventsOf(rt.inputs).at(-1)).toMatchObject({ appsState: 'not-running', activeRelease: rt.cfg.currentLink });
+  });
+
+  it('P1: counts as running once every app is online from the rollback target', () => {
+    const rt = rollbackRuntime({ dropRestarts: 1, curlFailsAfterFlip: true });
+    run(rt, { options: { skipMigrate: true } });
+    expect(journalsOf(rt.calls).at(-1)).toMatchObject({ recoveryOutcome: 'rollback-failed-running' });
+    expect(eventsOf(rt.inputs).at(-1)).toMatchObject({ appsState: 'running' });
+  });
+
+  it('P2: a rollback that verifies cleanly still records the identical-failure note and stays rolled-back', () => {
+    const rt = rollbackRuntime();
+    const { thrown } = run(rt);
+    expect(thrown?.message).toMatch(/public-smoke/);
+    const last = journalsOf(rt.calls).at(-1);
+    expect(last).toMatchObject({ phase: 'post-deploy-rolled-back', recoveryOutcome: 'rolled-back', recoveryNote: IDENTICAL });
+    expect(eventsOf(rt.inputs).at(-1)).toMatchObject({
+      note: IDENTICAL, recovery: { outcome: 'rolled-back', verified: true },
+    });
+    expect(rt.alertSends).toHaveLength(0);
+  });
+
+  it('P2: no note when the check passes on the rollback target', () => {
+    const rt = rollbackRuntime({ smokeFailsOnPrevious: false });
+    run(rt);
+    expect(journalsOf(rt.calls).at(-1).recoveryNote).toBeUndefined();
+    expect(eventsOf(rt.inputs).at(-1).note).toBeUndefined();
+  });
+
+  it('P3: a restored target whose restart stays offline is its own outcome and names the rollback target', () => {
+    // verify must fail for the recovery to throw: health fails after the flip-back
+    const failing = rollbackRuntime({ dropRestarts: 99, curlFailsAfterFlip: true });
+    run(failing);
+    const last = journalsOf(failing.calls).at(-1);
+    expect(last).toMatchObject({ recoveryOutcome: 'rollback-failed-not-started', recoveryNote: IDENTICAL });
+    const event = eventsOf(failing.inputs).at(-1);
+    expect(event).toMatchObject({
+      appsState: 'not-running', activeRelease: failing.cfg.currentLink,
+      recovery: { outcome: 'rollback-failed-not-started', verified: false },
+    });
+    expect(event.activeRevision).toBeUndefined();
+  });
+
+  describe('P4: fleet alert webhook', () => {
+    const cases: Array<[string, () => ReturnType<typeof rollbackRuntime>, any]> = [
+      ['rollback-failed-running', () => rollbackRuntime({ curlFailsAfterFlip: true }), {}],
+      ['rollback-failed-not-started', () => rollbackRuntime({ dropRestarts: 99, curlFailsAfterFlip: true }), {}],
+    ];
+    it.each(cases)('posts once for %s, URL only in the env', (outcome, make, options) => {
+      const rt = make();
+      run(rt, { env: { DISCORD_ALERT_WEBHOOK: WEBHOOK }, options });
+      expect(journalsOf(rt.calls).at(-1).recoveryOutcome).toBe(outcome);
+      expect(rt.alertSends).toHaveLength(1);
+      const [send] = rt.alertSends;
+      expect(send.args).toContain('alert-discord');
+      expect(JSON.stringify(send.args)).not.toContain('SECRET-TOKEN');
+      expect(send.options.env.DISCORD_ALERT_WEBHOOK).toBe(WEBHOOK);
+      expect(JSON.parse(send.options.input).alerts[0]).toMatchObject({ status: 'crit', message: expect.stringContaining(outcome) });
+      expect(send.options.input).not.toContain('SECRET-TOKEN');
+    });
+
+    it('posts for rollback-failed (restore failed) too', () => {
+      const base = makeReleaseRuntime({ fail: ['run-smoke', 'run-restore'] });
+      const sends: any[] = [];
+      const runtime = { execFileSync: (f: string, a: string[], o: any) => (f === process.execPath ? (sends.push({ a, o }), '') : base.runtime.execFileSync(f, a, o)) };
+      const config = relConfig({ postDeployChecks: [smoke] });
+      expect(() => release.deployRelease(config, {}, { ...ctx(runtime), env: { DISCORD_ALERT_WEBHOOK: WEBHOOK } })).toThrow(/MANUAL RECOVERY/);
+      expect(sends).toHaveLength(1);
+      expect(JSON.parse(sends[0].o.input).alerts[0].message).toContain('rollback-failed');
+    });
+
+    it('is skipped when the webhook env is unset', () => {
+      const rt = rollbackRuntime({ curlFailsAfterFlip: true });
+      run(rt, { env: {} });
+      expect(rt.alertSends).toHaveLength(0);
+    });
+
+    it('a send failure only warns: same outcome, same thrown error, no URL in the log', () => {
+      const ok = rollbackRuntime({ curlFailsAfterFlip: true });
+      const okRun = run(ok, { env: { DISCORD_ALERT_WEBHOOK: WEBHOOK } });
+      const bad = rollbackRuntime({ curlFailsAfterFlip: true, alertSendFails: true });
+      const badRun = run(bad, { env: { DISCORD_ALERT_WEBHOOK: WEBHOOK } });
+      expect(badRun.thrown?.message).toBe(okRun.thrown?.message);
+      expect(journalsOf(bad.calls).at(-1).recoveryOutcome).toBe('rollback-failed-running');
+      expect(badRun.warnings.some((m) => /fleet alert webhook/.test(m))).toBe(true);
+      expect(badRun.warnings.join('\n')).not.toContain('SECRET-TOKEN');
+    });
+  });
+});

@@ -315,16 +315,20 @@ command fails:
   which blocks the next deploy until reconciled. The two ways it can fail are kept
   distinct in `recoveryOutcome` and in the event's `appsState`:
   - `rollback-failed-running` (`appsState: running`): the pointer and DB were
-    restored but the prior release did not pass verification. The prior release's
-    apps are left **running** (deploy-kit starts them again if they are not online)
-    and an alert fires. A stopped service is never the outcome of this case.
+    restored but the prior release did not pass verification. Every app is online
+    from the prior release (deploy-kit starts them again if one is offline or still
+    running from the failed candidate) and an alert fires.
+  - `rollback-failed-not-started` (`appsState: not-running`): the target was
+    restored but its apps are still not confirmed running from it, or PM2 could not be
+    read. The event names the rollback target as the active release, not the candidate.
   - `rollback-failed` (`appsState: not-restarted`): the DB restore, the pointer
     flip-back, or the writer stop could not be confirmed. The apps stay stopped,
     because old code on an unknown schema may be wrong, and the alert says so.
-  When the rollback target restored cleanly, deploy-kit re-runs the failed
-  post-deploy check against it. If that fails too, the state's `recoveryNote` and the
-  event's `note` read "check failed identically on both releases: likely the check or
-  its environment, not the release" (an expired smoke key, for example).
+  Whenever the rollback target restored cleanly, including a rollback that verified
+  and ends `rolled-back`, deploy-kit re-runs the failed post-deploy check against it.
+  If that fails too, the state's `recoveryNote` and the event's `note` read "check
+  failed identically on both releases: likely the check or its environment, not the
+  release" (an expired smoke key, for example). The outcome is unchanged.
 - `remain-active` keeps the already activation-verified candidate serving but
   records the deployment as degraded.
 - `manual` also leaves the verified candidate serving, records a failed deployment,
@@ -337,7 +341,12 @@ revision, recovery policy/outcome, and only the redacted backup leaf reference.
 A failed rollback is also logged as an `ALERT:` error line and delivered as the
 same `failed` event (with `appsState` and `note`), which `announce-discord`
 renders as a distinct "automatic rollback failed" message; without a
-`deliveryEvent.command` only the log line and the journal record it.
+`deliveryEvent.command` only the log line and the journal record it. Because most
+apps route that event to their own release channel, any `rollback-failed*` outcome
+also posts one message straight to the fleet alert webhook when `DISCORD_ALERT_WEBHOOK`
+is set in deploy-kit's own environment, using the `alert-discord` sender. The URL is
+passed to it through the environment, never argv or a log line, and a send failure
+only warns: it never changes the outcome or the thrown error.
 A failed event sink is warned but cannot change the chosen recovery action; the
 journal remains the durable local record. A hard interruption during post-deploy
 rollback is recognized on the next invocation and blocks a new deploy until

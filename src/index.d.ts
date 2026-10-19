@@ -593,7 +593,7 @@ export function runCairnOperations(config: DeployConfig, options?: {
  * a terminal deployment outcome — see `DeployConfig['deliveryEvent']`. */
 export interface DeliveryRecovery {
   policy: PostDeployFailurePolicy;
-  outcome: 'rolled-back' | 'remained-active' | 'manual-decision-required' | 'rollback-failed' | 'rollback-failed-running';
+  outcome: 'rolled-back' | 'remained-active' | 'manual-decision-required' | 'rollback-failed' | 'rollback-failed-running' | 'rollback-failed-not-started';
   verified: boolean;
 }
 
@@ -610,10 +610,12 @@ export interface DeliveryEvent {
   activeRevision?: string;
   activeRelease?: string;
   recovery?: DeliveryRecovery;
-  /** Set on a failed automatic rollback: `running` when the rollback target was restored and left
-   * online (`rollback-failed-running`), `not-restarted` when the restore or pointer flip failed and
-   * the apps were deliberately not started (`rollback-failed`). */
-  appsState?: 'running' | 'not-restarted';
+  /** Set on a failed automatic rollback. `running`: the rollback target restored and every app is
+   * online from it (`rollback-failed-running`). `not-running`: it restored but the apps are not
+   * confirmed running from it (`rollback-failed-not-started`). `not-restarted`: the restore or
+   * pointer flip failed and the apps were deliberately not started (`rollback-failed`). On a
+   * `rolled-back` event `note` may still be set. */
+  appsState?: 'running' | 'not-running' | 'not-restarted';
   /** Operator-facing note, e.g. the same post-deploy check failed on both releases. */
   note?: string;
   /** Opaque backup label, never the host-local backup path. Present when a backup hook emits a usable id. */
