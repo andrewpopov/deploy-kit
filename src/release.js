@@ -706,8 +706,16 @@ function deployRelease(config, options = {}, ctx = {}) {
           rollbackToPrevious(fail);
           st.phase = 'post-deploy-rolled-back';
           st.recoveryOutcome = 'rolled-back';
-          noteIdenticalCheckFailure();
+          // Persist the verified rollback before the diagnostic re-run: a re-run that hangs or
+          // throws must neither leave a recovered host looking mid-rollback nor turn it into a
+          // failed rollback.
           journal();
+          try {
+            noteIdenticalCheckFailure();
+            if (st.recoveryNote) journal();
+          } catch (noteError) {
+            log.warning(`Could not re-run the failed check on the rollback target: ${noteError.message}`);
+          }
           emitDeliveryEvent('failed', {
             failedCheck: st.failedCheck,
             activeRelease: st.prevTarget,
