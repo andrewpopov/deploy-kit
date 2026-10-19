@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.31.1
+
+- a failed backup hook now prints its stderr, and deploy --on-host refuses when the user manager has stale groups
+  A captured hook that failed (the backup gate in both layouts, and the pending-migrations probe) used to leave only a fixed message such as "Pre-migration database backup failed". deploy-kit now prints the last 40 lines of its stderr and stdout to the deploy log first, with Discord webhook URLs redacted. The thrown message is unchanged. Separately, `deploy --on-host` now compares the user's groups (`id -G`) with those of the `systemd --user` manager, which keeps the groups it started with, and refuses before anything is stopped when one is missing (`ONHOST_STALE_GROUPS`), naming it and the fix `sudo systemctl restart user@<uid>.service`. If the manager's groups cannot be read the check warns and is skipped.
+- a rollback whose own verification fails now leaves the previous release running and alerts, instead of leaving the service stopped
+  When a release-layout post-deploy check failed and the automatic rollback's verification then failed too, the apps were left as they were after the writer stop with only a `post-deploy-rollback-failed` journal and no alert. The rollback target is now left running (started again if it is not online) with `recoveryOutcome: rollback-failed-running`, while a failed DB restore, pointer flip-back or writer stop keeps the apps stopped as `rollback-failed`. Both still block the next deploy. The failed check is re-run on the rollback target, and when it also fails the journal's `recoveryNote` and the delivery event's `note` say "check failed identically on both releases: likely the check or its environment, not the release". The `failed` delivery event gains `appsState` and `note`, deploy-kit logs an `ALERT:` line, and `announce-discord` renders a distinct failed-rollback message.
+
 ## 0.31.0
 
 - requireVerifiedRef limits production deploys to commits the merge train's full suite verified

@@ -41,6 +41,19 @@ describe('formatDiscordMessage', () => {
     expect(msg).toMatch(/^🚀 `app` deployed/);
   });
 
+  it('renders a failed rollback loudly, naming whether the apps are running', () => {
+    const base = { ...SAMPLE_EVENT, status: 'failed', failedCheck: 'public-smoke' };
+    expect(formatDiscordMessage({
+      ...base, appsState: 'running', activeRelease: 'releases/abc', note: 'check failed identically on both releases',
+      recovery: { policy: 'rollback', outcome: 'rollback-failed-running', verified: false },
+    }, { service: 'smarthome' })).toBe(
+      '🚨 `smarthome` deployment `main@abc1234` failed after `public-smoke` and its automatic rollback failed (`rollback-failed-running`): apps are left running on `releases/abc`. Manual recovery required. check failed identically on both releases. at 2026-07-11 18:30:00 UTC',
+    );
+    expect(formatDiscordMessage({
+      ...base, appsState: 'not-restarted', recovery: { policy: 'rollback', outcome: 'rollback-failed', verified: false },
+    })).toMatch(/^🚨 .*apps were NOT restarted and the service may be down/);
+  });
+
   it('renders degraded and failed recovery outcomes distinctly', () => {
     expect(formatDiscordMessage({
       ...SAMPLE_EVENT, status: 'degraded', failedCheck: 'public-smoke',
