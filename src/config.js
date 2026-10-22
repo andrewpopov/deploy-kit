@@ -164,6 +164,9 @@ const DEFAULT_CONFIG = {
   // receives structured deployment JSON on stdin; failures are reported but do
   // not turn a healthy deployment into a rollback.
   deliveryEvent: null,
+  // Release-layout transition authority (PKG-266): null (default) = not configured.
+  // { command, scope, timeoutSeconds? } — see TransitionAuthorityConfig in index.d.ts.
+  transitionAuthority: null,
   // The framework-specific seams. Each is a shell command run on the target.
   hooks: {
     // Prefer the offline cache first so a GitHub outage can't break a deploy that
@@ -248,6 +251,7 @@ const KEY_TYPES = {
   monitor: 'object?',
   autoCut: 'object?',
   deliveryEvent: 'object?',
+  transitionAuthority: 'object?',
   hooks: 'object',
 };
 
@@ -411,6 +415,33 @@ function validateDeliveryEvent(de, source) {
   const problems = rejectUnknownKeys(de, DELIVERY_EVENT_KEYS, source, 'deliveryEvent');
   if (typeof de.command !== 'string' || !de.command.trim()) {
     problems.push(`${source}: "deliveryEvent.command" must be a non-empty string`);
+  }
+  return problems;
+}
+
+const TRANSITION_AUTHORITY_KEYS = ['command', 'scope', 'timeoutSeconds'];
+const MAX_TRANSITION_COMMAND_UNITS = 4096;
+const MAX_TRANSITION_SCOPE_UNITS = 256;
+const MAX_TRANSITION_TIMEOUT_SECONDS = 300;
+const CONTROL_CHAR_RE = /\p{Cc}/u;
+
+function isBoundedText(v, maxUnits) {
+  return typeof v === 'string' && v.length > 0 && v.length <= maxUnits && !CONTROL_CHAR_RE.test(v);
+}
+
+// Validate the opt-in `transitionAuthority` block (mirrors the internal transport's
+// checks, src/transition-authority.js). Messages never echo configured values.
+function validateTransitionAuthority(ta, source) {
+  const problems = rejectUnknownKeys(ta, TRANSITION_AUTHORITY_KEYS, source, 'transitionAuthority');
+  if (!isBoundedText(ta.command, MAX_TRANSITION_COMMAND_UNITS)) {
+    problems.push(`${source}: "transitionAuthority.command" must be a non-empty string of at most ${MAX_TRANSITION_COMMAND_UNITS} UTF-16 units with no control characters`);
+  }
+  if (!isBoundedText(ta.scope, MAX_TRANSITION_SCOPE_UNITS)) {
+    problems.push(`${source}: "transitionAuthority.scope" must be a non-empty string of at most ${MAX_TRANSITION_SCOPE_UNITS} UTF-16 units with no control characters`);
+  }
+  if ('timeoutSeconds' in ta
+    && !(Number.isInteger(ta.timeoutSeconds) && ta.timeoutSeconds >= 1 && ta.timeoutSeconds <= MAX_TRANSITION_TIMEOUT_SECONDS)) {
+    problems.push(`${source}: "transitionAuthority.timeoutSeconds" must be an integer from 1 to ${MAX_TRANSITION_TIMEOUT_SECONDS} when present`);
   }
   return problems;
 }
@@ -720,6 +751,9 @@ function validateConfig(raw, { source = 'config' } = {}) {
   }
   if (raw.deliveryEvent != null && typeof raw.deliveryEvent === 'object' && !Array.isArray(raw.deliveryEvent)) {
     problems.push(...validateDeliveryEvent(raw.deliveryEvent, source));
+  }
+  if (raw.transitionAuthority != null && typeof raw.transitionAuthority === 'object' && !Array.isArray(raw.transitionAuthority)) {
+    problems.push(...validateTransitionAuthority(raw.transitionAuthority, source));
   }
   return problems;
 }

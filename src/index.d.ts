@@ -199,8 +199,68 @@ export interface DeployConfig {
    * hook can record what it already announced there. Unset (not empty) when the
    * layout has no shared directory. */
   deliveryEvent?: { command: string } | null;
+  /** Opt-in transition authority (PKG-266). Absent/null = not configured. When
+   * configured it is mandatory for release-layout v1 only. Dry-run is not authority. */
+  transitionAuthority?: TransitionAuthorityConfig | null;
   hooks: DeployHooks;
 }
+
+/** Trusted operator shell command; requests travel only as JSON on its stdin.
+ * Host-owned external contracts (not enforced here): lifetime exclusion,
+ * idempotence, and the current head. `command` ≤ 4096 and `scope` ≤ 256 UTF-16
+ * units, non-empty, no Unicode Cc controls (no normalization is claimed; receipts
+ * are bounded separately at 2048 UTF-8 bytes). */
+export interface TransitionAuthorityConfig {
+  command: string;
+  scope: string;
+  /** Integer 1..300; omitted defaults to 30 at the transport. */
+  timeoutSeconds?: number;
+}
+
+export interface TransitionEffects {
+  stop: boolean;
+  migrate: boolean;
+  pointerSwap: boolean;
+  restart: boolean;
+  databaseRestore: boolean;
+}
+
+export type TransitionKind =
+  | 'deploy'
+  | 'manual-rollback'
+  | 'automatic-recovery'
+  | 'interrupted-recovery'
+  | 'recovery-restart';
+
+export interface TransitionRequestBase {
+  protocolVersion: 1;
+  scope: string;
+  operationId: string;
+  parentOperationId: string | null;
+  targetSha: string;
+  targetRelease: string;
+  priorPointer: string | null;
+  effects: TransitionEffects;
+  kind: TransitionKind;
+}
+
+export type TransitionRequest =
+  | (TransitionRequestBase & { action: 'begin' })
+  | (TransitionRequestBase & { action: 'complete'; receipt: string; observedSha: string; verified: true })
+  | (TransitionRequestBase & { action: 'abandon'; receipt: string; reason: 'FAILED' | 'UNKNOWN' });
+
+export interface TransitionAckBase {
+  protocolVersion: 1;
+  scope: string;
+  operationId: string;
+  requestDigest: string;
+  receipt: string;
+}
+
+export type TransitionAck =
+  | (TransitionAckBase & { action: 'begin'; state: 'AUTHORIZED' })
+  | (TransitionAckBase & { action: 'complete'; state: 'COMPLETED' })
+  | (TransitionAckBase & { action: 'abandon'; state: 'ABANDONED' });
 
 export interface DeployOptions {
   skipDeps?: boolean;
