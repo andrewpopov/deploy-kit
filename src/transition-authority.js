@@ -12,7 +12,7 @@ const DEFAULT_TIMEOUT_SECONDS = 30;
 const MAX_TIMEOUT_SECONDS = 300;
 const MAX_ACK_BYTES = 8192;
 const MAX_RECEIPT_BYTES = 2048;
-const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+const CONTROL = /\p{Cc}/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const ACTIONS = ['begin', 'complete', 'abandon'];
@@ -59,6 +59,7 @@ function readExactData(value, keys, code, message) {
 
 const isText = (value, maxLength) => typeof value === 'string' && value.length > 0
   && value.length <= maxLength && !CONTROL.test(value);
+const matches = (value, pattern) => typeof value === 'string' && pattern.exec(value)?.[0] === value;
 const isReceipt = (value) => isText(value, MAX_RECEIPT_BYTES)
   && Buffer.byteLength(value, 'utf8') <= MAX_RECEIPT_BYTES;
 
@@ -92,13 +93,13 @@ function normalizeRequest(request, scope) {
   const keys = [...BASE_KEYS, ...EXTRA_KEYS[action]];
   const r = readExactData(request, keys, 'REQUEST_INVALID', 'transition authority request is invalid');
   const effects = readExactData(r.effects, EFFECTS, 'REQUEST_INVALID', 'transition authority request is invalid');
-  if (r.protocolVersion !== 1 || r.scope !== scope || !UUID.test(r.operationId)
-    || !(r.parentOperationId === null || UUID.test(r.parentOperationId))
-    || !KINDS.includes(r.kind) || !FULL_SHA.test(r.targetSha) || !isText(r.targetRelease, 512)
+  if (r.protocolVersion !== 1 || r.scope !== scope || !matches(r.operationId, UUID)
+    || !(r.parentOperationId === null || matches(r.parentOperationId, UUID))
+    || !KINDS.includes(r.kind) || !matches(r.targetSha, FULL_SHA) || !isText(r.targetRelease, 512)
     || !(r.priorPointer === null || isText(r.priorPointer, 4096))
     || EFFECTS.some((key) => typeof effects[key] !== 'boolean')) bad();
   if (action !== 'begin' && !isReceipt(r.receipt)) bad();
-  if (action === 'complete' && (!FULL_SHA.test(r.observedSha) || r.verified !== true)) bad();
+  if (action === 'complete' && (!matches(r.observedSha, FULL_SHA) || r.verified !== true)) bad();
   if (action === 'abandon' && !ABANDON_REASONS.includes(r.reason)) bad();
   const normalized = {};
   for (const key of keys) normalized[key] = key === 'effects' ? Object.fromEntries(EFFECTS.map((e) => [e, effects[e]])) : r[key];
