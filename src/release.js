@@ -17,6 +17,7 @@ const {
   assertVerifiedRefOptions, verifiedRefLabel, resolveVerifiedTip, assertContainedInVerified,
 } = require('./verified-ref');
 const { atomicWriteCommand, writeLastDeployRecord } = require('./last-deploy');
+const { assertTransitionAuthorityEntryPoint } = require('./transition-authority');
 
 // Bump when the on-host layout changes shape. The host migration writes this
 // version into .deploy-kit-layout; a release deploy refuses a host whose marker
@@ -400,6 +401,7 @@ function readInterruptedDeploy(config, paths, ctx) {
 // every phase records enough state that recover() can restore a known-good running
 // release, and the ONLY disruptive window is stop → backup → migrate → flip.
 function deployRelease(config, options = {}, ctx = {}) {
+  assertTransitionAuthorityEntryPoint(config, { supported: true, options });
   // `--sha`'s format and its exclusivity with `--branch` -- checked here too,
   // before ANYTHING else: `deployRelease()` is itself exported and callable
   // directly (not just via deploy()'s layout delegation), so the CLI's
@@ -1313,6 +1315,7 @@ function recoverFailedRollback(config, paths, originalCurrent, c, reason) {
 // restart. NO reinstall/rebuild (the previous release is already built). Data is NOT
 // touched — a schema rollback is a data-loss decision the operator makes explicitly.
 function rollbackRelease(config, options = {}, ctx = {}) {
+  assertTransitionAuthorityEntryPoint(config, { supported: true, options });
   const log = ctx.log || defaultLog;
   const sleep = ctx.sleep || defaultSleep;
   const c = { ...ctx, log, sleep, runtime: ctx.runtime };

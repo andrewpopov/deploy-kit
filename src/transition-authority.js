@@ -135,4 +135,17 @@ function sendTransitionAuthority(config, request, { runtime } = {}) {
   };
 }
 
-module.exports = { sendTransitionAuthority, TransitionAuthorityError };
+// Early entrypoint guard. ANY non-null/undefined transitionAuthority counts as
+// configured (a malformed value must not bypass it). The existing TTL lock is only
+// an operational helper here; host lifetime exclusion is the host adapter's job.
+function assertTransitionAuthorityEntryPoint(config, { supported = false, options } = {}) {
+  if (!config || config.transitionAuthority === undefined || config.transitionAuthority === null) return;
+  if (!supported) {
+    fail('UNSUPPORTED', 'this entrypoint does not support a configured transitionAuthority');
+  }
+  if (config.lock === false || (options && options.stealLock)) {
+    fail('OPTIONS_INVALID', 'a configured transitionAuthority requires the lock and forbids stealLock');
+  }
+}
+
+module.exports = { sendTransitionAuthority, assertTransitionAuthorityEntryPoint, TransitionAuthorityError };
