@@ -210,6 +210,10 @@ const DEFAULT_CONFIG = {
     // output) is "unknown" and runs `migrate` exactly as if this hook were
     // absent. See README "Skipping a no-op migration". null = disabled.
     pendingMigrations: null,
+    // true = nothing else migrates this database between the probe and the flip (BRAIN-636 D7), so
+    // `pendingMigrations` runs FIRST, read-only, with the writers up: an exact 0 skips the writer
+    // stop, the backup and migrate, and recovery is code-only. See README "Skipping a no-op migration".
+    migrationsExclusive: false,
     build: null, // e.g. 'npm run build'. null = skip.
     // Override the app (re)start command. null → the ecosystemFile-aware
     // start-or-restart idiom (see pm2StartOrRestart). Set this only when a repo
@@ -365,6 +369,7 @@ const HOOKS_TYPES = {
   backup: 'string?',
   migrate: 'string?',
   pendingMigrations: 'string?',
+  migrationsExclusive: 'boolean',
   build: 'string?',
   restart: 'string?',
   restore: 'string?',

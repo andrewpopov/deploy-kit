@@ -26,6 +26,7 @@ const BUILT_IN_STEPS = {
   'recover-interrupted': 'live', // an interrupted deploy's journal exists: production state is uncertain
   'stop-writers': 'live',
   backup: 'live',
+  'pending-migrations-probe': 'read-only', // probe-first (D7): writers still up, reads only
   'pending-migrations': 'live', // runs with the writers stopped
   migrate: 'live',
   'previous-pointer': 'live',

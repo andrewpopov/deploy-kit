@@ -122,6 +122,7 @@ text or redirection filenames.
 | `hooks.backup` | `string \| null` | `null` | both | 0.1 | Pre-migration backup **gate** — a failure aborts before any schema change, and the tail (last 40 lines) of the hook's stderr and stdout is printed to the deploy log first (Discord webhook URLs redacted); the same applies to the `hooks.pendingMigrations` probe. Preferred output contract: JSON on stdout with a top-level `backupId` (db-backup >= 0.18.0 emits this). Legacy fallbacks remain supported: `id`, `created.fullPath`, `created.fileName`, or a safe final-line id/path. The parsed id is correlated to `deliveryEvent` as a leaf-only `backupReference`; if nothing parses, deploy-kit logs a loud warning (restore correlation unavailable) but never fails the deploy over it. |
 | `hooks.migrate` | `string \| null` | `null` | both | 0.1 | Migration command; runs with `dbBoundApps` paused. |
 | `hooks.pendingMigrations` | `string \| null` | `null` | release | unreleased | Read-only probe that lets a no-op migration skip `hooks.migrate`, so a later failure rolls code back without a DB restore. Runs in the candidate release after the backup, with writers stopped, right before `migrate`. Exit `0` and a last non-empty stdout line that is exactly a base-10 integer (the pending count); only a count of exactly `0` skips `migrate`. Anything else runs it as usual (unconfigured: an invalid or failing probe falls back to `migrate`; with `transitionAuthority` configured, a non-zero exit is a protected hook-running failure handled as manual recovery, with no stopped auto-recovery). Ignored under the legacy layout (`loadConfig` warns); skipped with `--skip-migrate`. Must be a non-empty command. See [Skipping a no-op migration](#skipping-a-no-op-migration). |
+| `hooks.migrationsExclusive` | `boolean` | `false` | release | unreleased | Declares exclusive migration ownership and, together with `hooks.pendingMigrations` and `hooks.migrate`, turns on probe-first. Nothing else may migrate this database between the probe and the flip. See [Probe first](#probe-first-migrationsexclusive). |
 | `hooks.build` | `string \| null` | `null` | both | 0.1 | Build command. |
 | `hooks.restart` | `string \| null` | `null` | both | 0.3 | Override the app (re)start command. `null` → the `ecosystemFile`-aware start-or-restart idiom. |
 | `hooks.restore` | `string \| null` | `null` | both | 0.7 | Restore the pre-migration DB backup during release-layout recovery (gets `DEPLOY_KIT_BACKUP_ID`). `null` = no auto-restore. |
@@ -301,6 +302,22 @@ tool, needs its own coordination covering that interval.
 
 The probe is read at the release layout only; the legacy pipeline has no migrated
 marker or restore to protect, ignores the hook; `loadConfig` logs a warning saying so.
+
+#### Probe first (`migrationsExclusive`)
+
+With `hooks.migrationsExclusive: true`, `hooks.pendingMigrations` and `hooks.migrate` set, the probe runs
+**first**: after the build and release checks, in the candidate, read-only, with `dbBoundApps` still running
+(step `pending-migrations-probe`, class `read-only`). It is parsed exactly as above.
+
+- **Exactly `0`:** the writer stop, the backup and `migrate` are skipped. `migrated` stays `false`,
+  `migrationsPending` is `0`, and the deploy flips and restarts. Recovery is code-only: `flip-back`, never a restore.
+- **Unknown (failed probe, even one that printed `0`, or unparseable output) or a count above `0`:** the usual
+  stop, backup, migrate and restore-on-failure path. The probe is not run a second time.
+
+Without `migrationsExclusive` the order is unchanged (stop, backup, probe, migrate).
+
+**Precondition.** Nothing else may migrate this database between the probe and the flip: no migrate-on-boot,
+no manual migration. If one does, a code-only rollback can meet a schema the previous release does not understand.
 
 #### Post-deploy failure policy
 

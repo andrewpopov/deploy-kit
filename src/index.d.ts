@@ -14,6 +14,9 @@ export interface DeployHooks {
    * base-10 integer = pending migrations. Exactly 0 skips `migrate`; anything
    * else runs it as usual. null = disabled. */
   pendingMigrations?: string | null;
+  /** Release layout only. true = nothing else migrates the database between the probe and the flip, so
+   * `pendingMigrations` runs first, read-only, before the writer stop; an exact 0 skips stop, backup and migrate. */
+  migrationsExclusive?: boolean;
   build?: string | null;
   restart?: string | null;
   /** Restore the pre-migration DB backup during release-layout recovery. Receives

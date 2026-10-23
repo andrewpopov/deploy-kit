@@ -1417,6 +1417,36 @@ function deployRelease(config, options = {}, ctx = {}) {
       }
     }
 
+    // Probe first (BRAIN-636 D7), only under exclusive migration ownership: ask with the writers still up,
+    // read-only. An exact 0 skips the writer stop, the backup and migrate, so recovery is code-only. Null
+    // (unknown) or a count takes today's path below, without asking a second time.
+    const probeFirst = !skipMigrate && config.hooks.migrationsExclusive === true
+      && Boolean(config.hooks.migrate) && Boolean(config.hooks.pendingMigrations);
+    let provenNoMigration = false;
+    if (probeFirst) {
+      stepStart('pending-migrations-probe');
+      log.step('Checking for pending database migrations (writers still running)');
+      const probe = runInDir(st.releaseDir, config.hooks.pendingMigrations, config, c, { capture: true });
+      if (!probe.ok) logFailureOutput('Pending-migration probe', probe, log);
+      const pending = parsePendingCount(probe);
+      if (pending === 0) {
+        st.migrationsPending = 0;
+        journal();
+        provenNoMigration = true;
+        steps.push('migrate-skipped');
+        log.success('No pending database migrations; skipping the writer stop, backup and migrate');
+      } else if (pending === null) {
+        log.warning(
+          `Pending-migration probe ${probe.ok ? 'printed no usable count' : 'failed'}; treating the result as unknown `
+          + 'and taking the full migration path',
+        );
+      } else {
+        st.migrationsPending = pending;
+        log.info(`${pending} pending database migration${pending === 1 ? '' : 's'}`);
+      }
+    }
+    const runMigrationPath = !skipMigrate && !provenNoMigration;
+
     // ================= disruptive window opens =================
     // From here a failure can leave production stopped or the schema changed, so we
     // MUST have a validated known-good release to fall back to. Refuse to proceed if
@@ -1424,7 +1454,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     const opensDisruptive = !skipMigrate && (config.dbBoundApps.length || config.hooks.migrate);
     if (opensDisruptive) assertSafeTarget(st.prevTarget, 'current (known-good)');
 
-    if (!skipMigrate && config.dbBoundApps.length) {
+    if (runMigrationPath && config.dbBoundApps.length) {
       // Codex ordering: stop writers FIRST, THEN back up (consistent snapshot), THEN
       // migrate. The stop is GATED and verified — writers left online would corrupt
       // the backup and defeat the consistent-snapshot guarantee.
@@ -1435,7 +1465,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       if (!stopWritersConfirmed()) throw new Error(`Could not confirm DB-bound apps (${config.dbBoundApps.join(', ')}) stopped before backup/migrate`);
       st.dbAppsPaused = true;
     }
-    if (!skipMigrate && config.hooks.backup) {
+    if (runMigrationPath && config.hooks.backup) {
       stepStart('backup');
       beginProtectedHook();
       log.step('Backing up the database (writers stopped)');
@@ -1463,8 +1493,8 @@ function deployRelease(config, options = {}, ctx = {}) {
     // to the migrate block below unchanged. Writers are stopped and the backup is
     // taken, so the answer cannot move under us (given exclusive migration
     // ownership -- see README "Skipping a no-op migration").
-    let migrateHookNeeded = !skipMigrate && Boolean(config.hooks.migrate);
-    if (migrateHookNeeded && config.hooks.pendingMigrations) {
+    let migrateHookNeeded = runMigrationPath && Boolean(config.hooks.migrate);
+    if (migrateHookNeeded && config.hooks.pendingMigrations && !probeFirst) {
       stepStart('pending-migrations');
       beginProtectedHook();
       log.step('Checking for pending database migrations (writers stopped)');
