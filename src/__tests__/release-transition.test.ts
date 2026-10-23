@@ -177,7 +177,7 @@ function makeTarget(events: string[], over: { builtSha?: string; stateRead?: Sta
     if (cmd.includes('curl')) return '200';
     return '';
   };
-  return { t, execFileSync };
+  return { t, execFileSync, phaseFs };
 }
 
 interface ConfigOver {
@@ -432,12 +432,132 @@ describe('protected forward automatic recovery', () => {
       expect(host.runtimeEvents(), step).not.toContain('target:restart');
       expect(rb.s, step).toMatchObject({ restarts: 0, online: true });
       expect(target.t.lastDeploy, step).toBeNull();
-      // The retry still refuses on MUTATING (interrupted recovery is a later slice): no new begin, abandon or effect.
+      // The NEXT invocation assesses what actually became durable. A failed file fsync left no valid phase
+      // record (manual); a failed parent fsync can leave the renamed, valid versioned stopped record (recovery).
       const mark = host.events.length;
-      expect(() => host.deploy(target), step).toThrow(/MUTATING operation requires recovery assessment/);
-      expect(host.authority.actions, step).toEqual(['begin']);
-      expect(host.runtimeEvents(mark), step).toEqual([]);
+      if (step === 'fsync-file') {
+        expect(() => host.deploy(target), step).toThrow(/recovery assessment/);
+        expect(host.authority.actions, step).toEqual(['begin']);
+        expect(host.runtimeEvents(mark), step).toEqual([]);
+      } else {
+        expect(() => host.deploy(target), step).toThrow(/recovered/);
+        expect(host.authority.actions, step).toEqual(['begin', 'abandon', 'begin', 'complete']);
+        expect(host.runtimeEvents(mark), step).toEqual(['target:restart']);
+      }
     }
+  });
+
+  describe('interrupted stop recovery (real producer: phase fsync fault after pm2 stop)', () => {
+    const interrupted = (hostOpts: Parameters<typeof makeHost>[0] = {}) => {
+      const host = makeHost(hostOpts);
+      const rbOpts: RollbackOpts = {};
+      const rb = makeRollbackHost(rbOpts);
+      let fault: (p: Phase) => string | undefined = (p) => (p.phase === 'hook-running' && !rb.s.online ? 'fsync-file' : undefined);
+      let onCmd: (cmd: string) => void = () => {};
+      const target = makeTarget(host.events, { rb, phaseFault: (p) => fault(p), onCommand: (cmd) => onCmd(cmd) });
+      let thrown: unknown;
+      try { host.deploy(target); } catch (e) { thrown = e; }
+      const codes = thrown instanceof Error ? [Reflect.get(thrown, 'code'), Reflect.get(Object(thrown.cause), 'code')] : [];
+      expect(codes).toContain('JOURNAL_FAILED');
+      expect(host.authority.actions).toEqual(['begin']);
+      expect(host.journal().operations.map((o) => o.state)).toEqual(['MUTATING']);
+      expect(host.runtimeEvents()).toContain('target:stop');
+      for (const tag of ['backup', 'migrate', 'flip', 'restart']) expect(host.runtimeEvents()).not.toContain(`target:${tag}`);
+      expect(rb.s).toMatchObject({ online: false, restarts: 0, current: ORIG_DIR });
+      const getPhase = (): Record<string, unknown> => JSON.parse(String(target.phaseFs.files.get(STATE_FILE)));
+      const setPhase = (p: Record<string, unknown>) => { target.phaseFs.files.set(STATE_FILE, Buffer.from(JSON.stringify(p))); };
+      expect(getPhase()).toMatchObject({ phase: 'stopped', operationId: host.journal().operations[0].operationId, targetSha: SHA });
+      fault = () => undefined;
+      return { host, rb, rbOpts, target, getPhase, setPhase, setFault: (f: typeof fault) => { fault = f; }, setOnCmd: (f: typeof onCmd) => { onCmd = f; }, mark: host.events.length };
+    };
+    const reqs = (host: ReturnType<typeof makeHost>) => host.authority.requests.map((r) => JSON.parse(r));
+
+    it('INTERRUPTED_STOP_FRESH_CHILD_ENDS: the retry abandons the old op, runs a fenced child at the previous release and ends the invocation', () => {
+      const { host, rb, target, getPhase, setPhase, mark } = interrupted();
+      const oldStopped = getPhase();
+      const oldId = host.journal().operations[0].operationId;
+      expect(() => host.deploy(target)).toThrow(/recovered.*start a new invocation/);
+      expect(host.authority.actions).toEqual(['begin', 'abandon', 'begin', 'complete']);
+      const [, abandon, child, complete] = reqs(host);
+      expect(abandon).toMatchObject({ operationId: oldId, reason: 'UNKNOWN' });
+      expect(child).toMatchObject({ kind: 'interrupted-recovery', parentOperationId: oldId, targetSha: ORIG_FULL, targetRelease: ORIG_DIR, priorPointer: ORIG_DIR });
+      expect(complete.operationId).toBe(child.operationId);
+      expect(host.journal().operations.map((o) => o.state)).toEqual(['ABANDONED', 'COMPLETED']);
+      expect(host.events.slice(mark).filter((e) => /^(send:|storage:MUTATING|target:)/.test(e)))
+        .toEqual(['send:abandon', 'send:begin', 'storage:MUTATING', 'target:state:interrupted-recovery', 'target:restart', 'send:complete', 'target:state:recovered']);
+      expect(phases(target).slice(-2)).toEqual(['interrupted-recovery', 'recovered']);
+      expect(getPhase()).toMatchObject({ phase: 'recovered', operationId: child.operationId, targetSha: ORIG_FULL, sha: ORIG_FULL });
+      expect(rb.s).toMatchObject({ current: ORIG_DIR, running: ORIG_DIR, online: true, restarts: 1, probeCalls: 2 });
+      expect(target.t.lastDeploy).toBeNull();
+      // Replaying the old stopped record after recovery completed is denied: no remote authority mutation.
+      setPhase(oldStopped);
+      expect(() => host.deploy(target)).toThrow(/requires recovery under transition authority/);
+      expect(host.authority.actions).toEqual(['begin', 'abandon', 'begin', 'complete']);
+      expect(rb.s.restarts).toBe(1);
+    });
+
+    type Ctx = ReturnType<typeof interrupted>;
+    const mutate = (k: string, v: unknown) => (x: Ctx) => { const p = x.getPhase(); if (v === undefined) delete p[k]; else p[k] = v; x.setPhase(p); };
+    it.each<[string, (x: Ctx) => void]>([
+      ['phase version missing', mutate('phaseJournalVersion', undefined)],
+      ['layout version wrong', mutate('layoutVersion', 2)],
+      ['operationId', mutate('operationId', '00000000-0000-4000-8000-0000000000ff')],
+      ['targetSha', mutate('targetSha', OTHER_SHA)],
+      ['sha', mutate('sha', OTHER_SHA)],
+      ['releaseId', mutate('releaseId', '0000b2c3d4e5-20260710T090000Z')],
+      ['prevTarget', mutate('prevTarget', PREV_DIR)],
+      ['phase migrated', mutate('phase', 'migrated')],
+      ['migrated flag', mutate('migrated', true)],
+      ['flipped flag', mutate('flipped', true)],
+      ['current readlink exits nonzero with valid stdout', (x) => x.setOnCmd((cmd) => { if (/(?:^|&& )readlink \/srv\/app\/current(?:\s|$)/.test(cmd)) throw execFailure(ORIG_DIR); })],
+      ['previous HEAD read exits nonzero with full SHA', (x) => { x.rbOpts.headFails = (dir) => dir === ORIG_DIR; }],
+    ])('INTERRUPTED_BINDING_REFUSAL: %s refuses with zero new authority or runtime effect', (_name, corrupt) => {
+      const x = interrupted();
+      corrupt(x);
+      const journalBefore = x.host.durable.store.text;
+      expect(() => x.host.deploy(x.target)).toThrow();
+      expect(x.host.authority.actions).toEqual(['begin']);
+      expect(x.host.durable.store.text).toBe(journalBefore);
+      expect(x.host.runtimeEvents(x.mark)).toEqual([]);
+      expect(x.rb.s).toMatchObject({ restarts: 0, online: false });
+    });
+
+    it('INTERRUPTED_BINDING_REFUSAL: manual rollback on a matching stopped record has zero effects', () => {
+      const x = interrupted();
+      const journalBefore = x.host.durable.store.text;
+      expect(() => x.host.rollback(x.target)).toThrow(/MUTATING operation requires recovery assessment/);
+      expect(x.host.authority.actions).toEqual(['begin']);
+      expect(x.host.durable.store.text).toBe(journalBefore);
+      expect(x.host.runtimeEvents(x.mark)).toEqual([]);
+      expect(x.rb.s).toMatchObject({ restarts: 0, online: false, flips: [] });
+    });
+
+    it.each<[string, string, string[], string, number]>([
+      ['abandon refused', 'abandon', ['begin', 'abandon'], 'ABANDON_PENDING', 0],
+      ['child begin refused', 'begin', ['begin', 'abandon', 'begin'], 'BEGIN_PENDING', 0],
+      ['complete ACK lost', 'complete', ['begin', 'abandon', 'begin', 'complete'], 'COMPLETE_PENDING', 1],
+    ])('INTERRUPTED_ACK_UNCERTAINTY: %s leaves the pending state with no further mutation', (_name, failAction, actions, state, restarts) => {
+      const x = interrupted({ authorityFails: (action, count) => action === failAction && (action !== 'begin' || count === 2) });
+      expect(() => x.host.deploy(x.target)).toThrow();
+      expect(x.host.authority.actions).toEqual(actions);
+      const ops = x.host.journal().operations;
+      expect(ops[ops.length - 1].state).toBe(state);
+      expect(x.rb.s.restarts).toBe(restarts);
+      expect(x.getPhase().phase).not.toBe('recovered');
+    });
+
+    it('INTERRUPTED_PHASE_WRITE_UNCERTAINTY: a child phase fsync failure keeps the child MUTATING and starts nothing further', () => {
+      const x = interrupted();
+      x.setFault((p) => (p.phase === 'interrupted-recovery' ? 'fsync-file' : undefined));
+      expect(() => x.host.deploy(x.target)).toThrow();
+      expect(x.host.authority.actions).toEqual(['begin', 'abandon', 'begin']);
+      expect(x.host.journal().operations.map((o) => o.state)).toEqual(['ABANDONED', 'MUTATING']);
+      expect(x.rb.s.restarts).toBe(0);
+      x.setFault(() => undefined);
+      expect(() => x.host.deploy(x.target)).toThrow(/recovery assessment/);
+      expect(x.host.authority.actions).toEqual(['begin', 'abandon', 'begin']);
+      expect(x.rb.s.restarts).toBe(0);
+    });
   });
 
   it.each([
