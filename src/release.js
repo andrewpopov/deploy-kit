@@ -871,39 +871,118 @@ function deployRelease(config, options = {}, ctx = {}) {
     const reason = failure.cause?.message || failure.message;
     const rollbackPhase = ['migrated', 'flipped', 'verify'].includes(failedPhase)
       || (failedPhase === 'post-deploy-failed' && st.failurePolicy === 'rollback');
-    if (failedPhase !== 'stopped' && !rollbackPhase) {
+    const policyPhase = failedPhase === 'post-deploy-failed' && ['remain-active', 'manual'].includes(st.failurePolicy);
+    const postDeploy = failedPhase === 'post-deploy-failed';
+    if (failedPhase !== 'stopped' && !rollbackPhase && !policyPhase) {
       throw recoveryRequired(`forward operation failed in phase "${failedPhase}" (${reason}) and was abandoned UNKNOWN; manual recovery assessment required`, failure);
     }
-    let previousSha;
+    const candidateTarget = `releases/${st.releaseId}`;
+    let targetSha;
     let actualCurrent;
     try {
-      if (!st.prevTarget) throw new Error('no previous release recorded');
+      if (!policyPhase && !st.prevTarget) throw new Error('no previous release recorded');
       actualCurrent = readPointers(config, paths, c).current;
       assertSafeTarget(actualCurrent, 'current');
-      previousSha = resolveReleaseSha(config, paths, st.prevTarget, 'previous', c);
-      const candidateTarget = `releases/${st.releaseId}`;
-      if (failedPhase === 'stopped' ? actualCurrent !== st.prevTarget : ![st.prevTarget, candidateTarget].includes(actualCurrent)) {
-        throw new Error(`current points to ${actualCurrent}, which does not match the failed ${failedPhase} phase`);
-      }
+      targetSha = resolveReleaseSha(config, paths, policyPhase ? actualCurrent : st.prevTarget, policyPhase ? 'current' : 'previous', c);
+      const mismatch = policyPhase ? actualCurrent !== candidateTarget
+        : (failedPhase === 'stopped' ? actualCurrent !== st.prevTarget : ![st.prevTarget, candidateTarget].includes(actualCurrent));
+      if (mismatch) throw new Error(`current points to ${actualCurrent}, which does not match the failed ${failedPhase} phase`);
     } catch (assessErr) {
       throw recoveryRequired(`forward operation failed (${reason}) and no safe previous release could be assessed; manual recovery required`, assessErr);
     }
-    if (failedPhase !== 'stopped') st.flipped = actualCurrent !== st.prevTarget;
-    const begun = manager.begin({
-      kind: 'automatic-recovery', targetSha: previousSha, targetRelease: st.prevTarget, priorPointer: actualCurrent,
-      effects: { ...CONSERVATIVE_EFFECTS }, parentOperationId: failedOperationId,
-    });
-    operationIdentity = { operationId: begun.operationId, targetSha: previousSha };
-    const withFacts = (error) => Object.assign(error, { childOperationId: begun.operationId, failedOperationId });
-    let observation;
-    try {
-      observation = manager.run(begun.handle, () => {
+    if (failedPhase !== 'stopped' && !policyPhase) st.flipped = actualCurrent !== st.prevTarget;
+    const previousSha = targetSha;
+    const withFacts = (error, childOperationId) => Object.assign(error, { childOperationId, failedOperationId });
+    // One fenced child: begin + identity before any effect; settle exactly once (verified -> complete,
+    // otherwise FAILED; a callback runtime error -> UNKNOWN). Terminal RPC errors propagate untouched.
+    const runChild = (spec, body) => {
+      const begun = manager.begin({ ...spec, effects: { ...CONSERVATIVE_EFFECTS }, parentOperationId: spec.parentOperationId });
+      operationIdentity = { operationId: begun.operationId, targetSha: spec.targetSha };
+      let observation;
+      try {
+        observation = manager.run(begun.handle, body);
+      } catch (err) {
+        if (!(err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED')) throw err;
+        try {
+          manager.abandon(begun.handle, 'UNKNOWN');
+        } catch (abandonErr) {
+          throw withFacts(recoveryRequired('forward recovery failed and abandon was not acknowledged; recovery assessment required', abandonErr), begun.operationId);
+        }
+        return { operationId: begun.operationId, runtimeFailure: err };
+      }
+      const verified = observation.verified === true;
+      if (verified) manager.complete(begun.handle, observation); else manager.abandon(begun.handle, 'FAILED');
+      return { operationId: begun.operationId, verified };
+    };
+    const targetDir = `${paths.root}/${st.prevTarget}`;
+    // Journal + announce the post-deploy rollback outcome; always called inside a MUTATING callback.
+    const reportRollbackOutcome = (outcome, restored) => {
+      const rolledBack = outcome === 'rolled-back';
+      st.phase = rolledBack ? 'post-deploy-rolled-back' : 'post-deploy-rollback-failed';
+      st.recoveryOutcome = outcome;
+      if (restored) {
+        try { noteIdenticalCheckFailure(); } catch (noteError) {
+          log.warning(`Could not re-run the failed check on the rollback target: ${noteError.message}`);
+        }
+      }
+      journal();
+      const appsState = { 'rolled-back': 'running', 'rollback-failed-running': 'running', 'rollback-failed-not-started': 'not-running' }[outcome] || 'not-restarted';
+      const alertText = {
+        'rollback-failed-running': `deploy and automatic rollback both failed verification; ${st.prevTarget} is left RUNNING and needs manual review`,
+        'rollback-failed-not-started': `deploy failed and the rollback restored ${st.prevTarget}, but its apps are NOT confirmed running; the service may be DOWN`,
+        'rollback-failed': 'deploy failed and the automatic rollback could not restore a known-good release; the apps were NOT restarted and the service may be DOWN',
+      }[outcome];
+      if (alertText) log.error(`ALERT: ${alertText}`);
+      if (st.recoveryNote) log.error(st.recoveryNote);
+      emitDeliveryEvent('failed', {
+        failedCheck: st.failedCheck,
+        ...(restored ? { activeRelease: st.prevTarget } : { activeRevision: st.sha, activeRelease: candidateTarget }),
+        ...(rolledBack ? {} : { appsState }),
+        ...(st.recoveryNote ? { note: st.recoveryNote } : {}),
+        recovery: { policy: st.failurePolicy, outcome, verified: rolledBack },
+      });
+      if (alertText) postFleetAlert(`${alertText} (${outcome}).${st.recoveryNote ? ` ${st.recoveryNote}.` : ''}`);
+    };
+    const settledFailure = (child, message) => {
+      throw withFacts(recoveryRequired(`forward deployment failed (${reason}); ${message}`, failure), child.operationId);
+    };
+    const concludeVerified = (child) => {
+      journal({ phase: 'recovered', sha: previousSha });
+      log.success(`Restored the previous release ${st.prevTarget}`);
+      return settledFailure(child, `previous release ${st.prevTarget} recovered`);
+    };
+    const concludeUnverified = (child) => {
+      if (!policyPhase) {
+        st.phase = postDeploy ? 'post-deploy-rollback-failed' : 'forward-recovery-failed';
+        if (postDeploy && st.recoveryOutcome === 'rolled-back') st.recoveryOutcome = 'rollback-failed-running';
+        journal();
+      }
+      return settledFailure(child, policyPhase
+        ? `post-deploy policy "${st.failurePolicy}" left the candidate active; manual review required`
+        : 'recovery did not verify the previous release; manual recovery required');
+    };
+
+    const firstBody = () => {
+      if (policyPhase) {
+        const degraded = st.failurePolicy === 'remain-active';
+        st.phase = degraded ? 'post-deploy-degraded' : 'post-deploy-manual-decision';
+        st.recoveryOutcome = degraded ? 'remained-active' : 'manual-decision-required';
+        journal();
+        emitDeliveryEvent(degraded ? 'degraded' : 'failed', {
+          failedCheck: st.failedCheck, activeRevision: targetSha, activeRelease: actualCurrent,
+          recovery: { policy: st.failurePolicy, outcome: st.recoveryOutcome, verified: false },
+        });
+        return { observedSha: targetSha, verified: false };
+      }
+      if (postDeploy) { st.phase = 'post-deploy-rollback'; st.recoveryOutcome = 'pending'; journal(); } else {
         journal({ phase: 'forward-recovery', sha: previousSha });
+      }
+      try {
         if (failedPhase === 'stopped') {
           if (!resumePrevious(previousSha).ok) {
             throw Object.assign(new Error('failed to bring the previous release back online after aborting pre-migration'), {
               rollbackTargetRestored: !st.migrated,
-              appsOnline: appsRunFromRelease(config, paths, `${paths.root}/${st.prevTarget}`, c).ok,
+              appsOnline: appsRunFromRelease(config, paths, targetDir, c).ok,
             });
           }
         } else {
@@ -911,21 +990,54 @@ function deployRelease(config, options = {}, ctx = {}) {
             throw Object.assign(new Error(`MANUAL RECOVERY REQUIRED — ${msg}. Original: ${reason}`), details);
           }, previousSha);
         }
-        return { observedSha: previousSha, verified: true };
-      });
-    } catch (err) {
-      if (!(err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED')) throw err;
-      try {
-        manager.abandon(begun.handle, 'UNKNOWN');
-      } catch (abandonErr) {
-        throw withFacts(recoveryRequired('forward recovery failed and abandon was not acknowledged; recovery assessment required', abandonErr));
+      } catch (rollbackError) {
+        // Restored-but-unhealthy defers its report to the restart child; anything unproven reports here.
+        if (postDeploy && rollbackError.rollbackTargetRestored !== true) reportRollbackOutcome('rollback-failed', false);
+        throw rollbackError;
       }
-      throw withFacts(recoveryRequired('forward recovery failed and was abandoned UNKNOWN; recovery assessment required', err));
+      if (!postDeploy) return { observedSha: previousSha, verified: true };
+      reportRollbackOutcome('rolled-back', true);
+      return { observedSha: previousSha, verified: verifyActivation(config, paths, previousSha, targetDir, c).ok };
+    };
+
+    const first = runChild({
+      kind: 'automatic-recovery', targetSha, targetRelease: policyPhase ? actualCurrent : st.prevTarget,
+      priorPointer: actualCurrent, parentOperationId: failedOperationId,
+    }, firstBody);
+    if (!first.runtimeFailure) {
+      return first.verified ? concludeVerified(first) : concludeUnverified(first);
     }
-    manager.complete(begun.handle, observation);
-    journal({ phase: 'recovered', sha: previousSha });
-    log.success(`Restored the previous release ${st.prevTarget}`);
-    throw withFacts(recoveryRequired(`forward deployment failed (${reason}); previous release ${st.prevTarget} recovered`, failure));
+
+    const facts = first.runtimeFailure.cause;
+    if (policyPhase || facts?.rollbackTargetRestored !== true) {
+      throw withFacts(recoveryRequired('forward recovery failed and was abandoned UNKNOWN; recovery assessment required', first.runtimeFailure), first.operationId);
+    }
+    // Restoration (pointer + DB) was proven but the target did not verify: one fresh restart child, no retry after it.
+    try {
+      if (readPointers(config, paths, c).current !== st.prevTarget
+        || resolveReleaseSha(config, paths, st.prevTarget, 'previous', c) !== previousSha) {
+        throw new Error('restored release pointer or HEAD no longer matches the recovery target');
+      }
+    } catch (proofErr) {
+      throw withFacts(recoveryRequired('forward recovery was abandoned UNKNOWN and the restored release could not be re-proven; recovery assessment required', proofErr), first.operationId);
+    }
+    const restart = runChild({
+      kind: 'recovery-restart', targetSha: previousSha, targetRelease: st.prevTarget,
+      priorPointer: st.prevTarget, parentOperationId: first.operationId,
+    }, () => {
+      journal({ phase: 'forward-recovery-restart', sha: previousSha });
+      if (facts.appsOnline !== true) ensureRollbackTargetRunning();
+      if (postDeploy) {
+        const running = appsRunFromRelease(config, paths, targetDir, c).ok;
+        const healthy = running && verifyActivation(config, paths, previousSha, targetDir, c).ok;
+        reportRollbackOutcome(healthy ? 'rolled-back' : (running ? 'rollback-failed-running' : 'rollback-failed-not-started'), true);
+      }
+      return { observedSha: previousSha, verified: verifyActivation(config, paths, previousSha, targetDir, c).ok };
+    });
+    if (restart.runtimeFailure) {
+      throw withFacts(recoveryRequired('recovery restart failed and was abandoned UNKNOWN; recovery assessment required', restart.runtimeFailure), restart.operationId);
+    }
+    return restart.verified ? concludeVerified(restart) : concludeUnverified(restart);
   }
 
   const release = acquireLock(config, c, { steal: stealLock });
