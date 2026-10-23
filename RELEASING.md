@@ -25,8 +25,10 @@ format.
    bumps `package.json`, and archives the consumed fragments.
 4. **Commit the result**, open the reviewed pull request, and merge it.
 5. **Create the annotated tag:** `git tag -a vX.Y.Z -m vX.Y.Z` matching the
-   version `release:cut` produced, and push it. The `release-guard` CI job
-   checks the tag against `package.json` and the `## X.Y.Z` CHANGELOG heading.
+   version `release:cut` produced. Before pushing, verify its target tree equals
+   the reviewed, gated merged tree and its version matches `package.json` and
+   the `## X.Y.Z` CHANGELOG heading. The committed pre-push hook verifies the
+   package on the tag push; hosted GitHub Actions are disabled.
 
 When npm publishing is enabled, publish only from that tag with an account
 protected by 2FA. Use npm provenance only after a trusted-publishing path is
