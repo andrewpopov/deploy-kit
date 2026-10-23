@@ -21,6 +21,7 @@ const { log: defaultLog } = require('../log');
 const { FULL_SHA_RE } = require('../sha-options');
 const { OnHostError, listFiles, sha256File } = require('./host-run');
 const { RUN_ID_RE } = require('./outcome');
+const { REQUEST_ID_RE } = require('./status');
 const { appendReceipt, SAFE_ABS_PATH_RE } = require('./receipts');
 const { attachReceipt, EXIT_TRANSPORT_LOST } = require('./attach');
 
@@ -58,11 +59,44 @@ function validateOnHostRequest(config, options) {
     refuse('ONHOST_PROJECT_DIR', `config projectDir ${JSON.stringify(config.projectDir)} must be a plain absolute path (the systemd unit does not expand $HOME or ~)`);
   }
   if (!Array.isArray(config.appNames)) refuse('ONHOST_CONFIG', 'config appNames must be an array');
+  requestMeta(config, options);
   if (config.onHost != null) {
     // One rule: the same validator config.js runs at load time (a caller can bypass load-time validation).
     const problems = validateConfig({ onHost: config.onHost }, { source: 'config' });
     if (problems.length) refuse('ONHOST_ENV', problems.join('; '));
   }
+}
+
+// BRAIN-636 D4a: the request flags (--kind --request --epoch --not-after --expect-reservation) become
+// meta.json fields. All five or none; an onHost.required app must pass all five. The parent fields stay null
+// until rollback/recover are dispatched (D6/D8). -> the meta fields, or null when no request was given.
+function requestMeta(config, options) {
+  const refuse = (why) => { throw new OnHostError('ONHOST_REQUEST', why); };
+  const given = ['kind', 'request', 'epoch', 'notAfter', 'expectReservation'].filter((key) => options[key] !== undefined);
+  const required = Boolean(config.onHost && config.onHost.required);
+  if (given.length === 0 && !required) return null;
+  if (given.length < 5) refuse('--kind, --request, --epoch, --not-after and --expect-reservation must all be given together (and are required for an onHost.required app)');
+  if (!['deploy', 'rollback', 'recover'].includes(options.kind)) refuse('--kind must be deploy, rollback or recover');
+  if (!REQUEST_ID_RE.test(options.request)) refuse('--request must match [A-Za-z0-9_.-]+');
+  const integer = (name, text) => {
+    if (!/^(0|[1-9][0-9]{0,14})$/.test(text)) refuse(`${name} must be a non-negative integer`);
+    return Number(text);
+  };
+  let expectReservation;
+  try {
+    expectReservation = JSON.parse(options.expectReservation);
+  } catch {
+    refuse('--expect-reservation must be JSON');
+  }
+  return {
+    kind: options.kind,
+    requestId: options.request,
+    parentRequestId: null,
+    parentRunId: null,
+    epoch: integer('--epoch', options.epoch),
+    notAfter: integer('--not-after', options.notAfter),
+    expectReservation,
+  };
 }
 
 // ---- 2. preflight -------------------------------------------------------------------
@@ -218,7 +252,7 @@ function jsYamlRoot() {
 
 // Stage bundleDir/{kit/, config.json, meta.json, manifest.sha256}. Everything is a real file
 // (symlinks dereferenced); tests and the host-run cannot tell it from a hand-copied tree.
-function buildBundle(bundleDir, { kitRoot, jsYamlDir, config, meta }) {
+function buildBundle(bundleDir, { kitRoot, jsYamlDir, config, meta, withKitArtifact = false }) {
   const kitDir = path.join(bundleDir, 'kit');
   const copy = (from, to, filter) => fs.cpSync(from, to, { recursive: true, dereference: true, filter });
   fs.mkdirSync(kitDir, { recursive: true });
@@ -226,6 +260,11 @@ function buildBundle(bundleDir, { kitRoot, jsYamlDir, config, meta }) {
   copy(path.join(kitRoot, 'src'), path.join(kitDir, 'src'), (src) => path.basename(src) !== '__tests__');
   copy(jsYamlDir, path.join(kitDir, 'node_modules', 'js-yaml'));
   fs.writeFileSync(path.join(bundleDir, 'config.json'), `${JSON.stringify(config, null, 2)}\n`);
+  // The kit's identity: its version plus one digest over every file under kit/ (D8 replaces this with ARTIFACT.json).
+  if (withKitArtifact) {
+    const lines = listFiles(kitDir, bundleDir).sort().map((rel) => `${sha256File(path.join(bundleDir, rel))}  ${rel}\n`);
+    meta.kitArtifact = { version: meta.operatorVersion, sha256: crypto.createHash('sha256').update(lines.join('')).digest('hex') };
+  }
   fs.writeFileSync(path.join(bundleDir, 'meta.json'), `${JSON.stringify(meta, null, 2)}\n`);
   const files = [...listFiles(kitDir, bundleDir), 'config.json', 'meta.json'].sort();
   const manifest = files.map((rel) => `${sha256File(path.join(bundleDir, rel))}  ${rel}\n`).join('');
@@ -332,9 +371,11 @@ function onHostDeploy(config, options, deps = {}) {
 
     const resolvedConfig = { ...config, mode: 'local', localShell: capture.shell };
     delete resolvedConfig.host;
+    const request = requestMeta(config, options);
     const meta = {
       runId,
       sha: options.sha,
+      ...request,
       options: {
         skipBuild: options.skipBuild === true,
         skipDeps: options.skipDeps === true,
@@ -349,7 +390,9 @@ function onHostDeploy(config, options, deps = {}) {
         path: capture.path, umask: capture.umask, oomScoreAdj: capture.oomScoreAdj, shell: capture.shell, env: capture.env, absentEnv: capture.absentEnv,
       },
     };
-    buildBundle(bundleRoot, { kitRoot, jsYamlDir, config: resolvedConfig, meta });
+    buildBundle(bundleRoot, {
+      kitRoot, jsYamlDir, config: resolvedConfig, meta, withKitArtifact: request !== null,
+    });
     const tarball = tarBundle(bundleRoot);
 
     // Receipt BEFORE any byte reaches the host: a lost acknowledgement must still be attachable.
@@ -387,5 +430,5 @@ function onHostDeploy(config, options, deps = {}) {
 }
 
 module.exports = {
-  onHostDeploy, validateOnHostRequest, preflightScript, parsePreflight, parseKeyValues, buildBundle, buildSubmitArgv, quoteArgv, newRunId, systemdEscape, jsYamlRoot,
+  onHostDeploy, validateOnHostRequest, requestMeta, preflightScript, parsePreflight, parseKeyValues, buildBundle, buildSubmitArgv, quoteArgv, newRunId, systemdEscape, jsYamlRoot,
 };

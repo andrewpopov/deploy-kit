@@ -14,6 +14,8 @@ const { execFileSync } = require('child_process');
 const { log: defaultLog } = require('../log');
 const { FULL_SHA_RE } = require('../sha-options');
 const { RUN_ID_RE } = require('./outcome');
+const { REQUEST_ID_RE } = require('./status');
+const { runAccepted, writeRefused, targetFiles } = require('./accept');
 
 const INVOCATION_ID_RE = /^[0-9a-f]{32}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
@@ -106,6 +108,51 @@ function validateMeta(meta, runId) {
     if (typeof cap[key] !== 'string') throw bad(`meta.capture.${key} must be a string`);
   }
   if (!isObject(cap.env)) throw bad('meta.capture.env must be an object');
+}
+
+// BRAIN-636 D4a: the request a controller attaches to a run. All-or-nothing: an app with
+// onHost.required must carry every field; any other app carries all of them or none (none = the
+// pre-request flow, unchanged). Returns the validated request, or null for the pre-request flow.
+const REQUEST_FIELDS = ['kind', 'requestId', 'parentRequestId', 'parentRunId', 'epoch', 'notAfter', 'expectReservation', 'kitArtifact'];
+const REQUEST_KINDS = ['deploy', 'rollback', 'recover'];
+const isCount = (v) => Number.isSafeInteger(v) && v >= 0;
+
+function validateRequestMeta(meta, config) {
+  const bad = (why) => new OnHostError('ONHOST_META', why);
+  const missing = REQUEST_FIELDS.filter((key) => !(key in meta));
+  const required = Boolean(config.onHost && config.onHost.required);
+  if (missing.length === REQUEST_FIELDS.length && !required) return null;
+  if (missing.length > 0) throw bad(`meta.${missing.join(', meta.')} missing: ${required ? 'an onHost.required app' : 'a request'} needs every request field`);
+  if (!REQUEST_KINDS.includes(meta.kind)) throw bad(`meta.kind must be one of ${REQUEST_KINDS.join(', ')}`);
+  if (typeof meta.requestId !== 'string' || !REQUEST_ID_RE.test(meta.requestId)) throw bad('meta.requestId must be a request id');
+  if (meta.parentRequestId !== null && !(typeof meta.parentRequestId === 'string' && REQUEST_ID_RE.test(meta.parentRequestId))) {
+    throw bad('meta.parentRequestId must be a request id or null');
+  }
+  if (meta.parentRunId !== null && !(typeof meta.parentRunId === 'string' && RUN_ID_RE.test(meta.parentRunId))) {
+    throw bad('meta.parentRunId must be a run id or null');
+  }
+  if (!isCount(meta.epoch)) throw bad('meta.epoch must be a non-negative integer');
+  if (!Number.isInteger(meta.notAfter) || meta.notAfter <= 0) throw bad('meta.notAfter must be a positive integer (unix seconds)');
+  const expect = meta.expectReservation;
+  if (!isObject(expect)) throw bad('meta.expectReservation must be an object');
+  const expectOk = (expect.state === 'none' && expect.runId === null && expect.gen === 0)
+    || (expect.state === 'clean-abort' && typeof expect.runId === 'string' && RUN_ID_RE.test(expect.runId) && Number.isSafeInteger(expect.gen) && expect.gen >= 1);
+  if (!expectOk) throw bad('meta.expectReservation must be {state:"none",runId:null,gen:0} or {state:"clean-abort",runId:<run id>,gen:>=1}');
+  const artifact = meta.kitArtifact;
+  if (!isObject(artifact) || typeof artifact.version !== 'string' || artifact.version === '' || !SHA256_RE.test(artifact.sha256)) {
+    throw bad('meta.kitArtifact must be {version:<string>, sha256:<64 hex>}');
+  }
+  return {
+    kind: meta.kind,
+    requestId: meta.requestId,
+    parentRequestId: meta.parentRequestId,
+    parentRunId: meta.parentRunId,
+    epoch: meta.epoch,
+    notAfter: meta.notAfter,
+    expectReservation: expect,
+    kitArtifact: artifact,
+    sha: meta.sha,
+  };
 }
 
 function validateConfig(config) {
@@ -215,11 +262,27 @@ function hostRun(runDir, deps = {}) {
     validateMeta(meta, runId);
     const config = readJson(runDir, 'config.json', 'ONHOST_CONFIG');
     validateConfig(config);
+    const request = validateRequestMeta(meta, config);
+    if (request && !path.isAbsolute(env.HOME || '')) throw new OnHostError('ONHOST_HOME', 'HOME must be an absolute path');
     assertOomParity(meta, readOomScoreAdj);                             // 6
 
     const allowlisted = {};
     for (const key of OPTION_ALLOWLIST) if (key in meta.options) allowlisted[key] = meta.options[key];
     const options = { ...allowlisted, sha: meta.sha, autoCut: false, stealLock: false };  // enforced values last
+    if (request) {                                                      // 7-9, see accept.js
+      deployed = true; // every pre-acceptance failure is handled (and recorded) inside runAccepted
+      const code = runAccepted({
+        runDir, runId, request, config, options, deps: { ...deps, deployRelease, env, log, now },
+      });
+      if (code === 0) warnIfPm2NotSystemService({ env, log, readFile, run });
+      return code;
+    }
+    // A fenced target (it has an epoch) takes no run that carries no epoch: no exemption for the pre-request flow.
+    if (typeof env.HOME === 'string' && fs.existsSync(targetFiles(config, env.HOME).epoch)) {
+      log.error('epoch-mismatch: this target is fenced and the run carries no epoch');
+      writeRefused(runDir, runId, 'epoch-mismatch');
+      return 1;
+    }
     let ok = true;
     let failure;
     try {

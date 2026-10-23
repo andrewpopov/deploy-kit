@@ -23,6 +23,7 @@ const KNOWN_FLAGS = [
   '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
   '--dir', '--json', '--local', '--branch', '--no-auto-cut', '--guard-config', '--sha', '--on-host',
+  '--kind', '--request', '--epoch', '--not-after', '--expect-reservation',
 ];
 
 // Flags that take a following positional value. Kept in sync with the arity
@@ -32,7 +33,7 @@ const KNOWN_FLAGS = [
 // a used flag; parseOptions consumes it as --service's value).
 const VALUE_FLAGS = new Set([
   '--lines', '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env', '--dir', '--branch',
-  '--guard-config', '--sha',
+  '--guard-config', '--sha', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation',
 ]);
 
 // The set of flags each command actually reads. KNOWN_FLAGS above is only
@@ -50,7 +51,7 @@ const COMMAND_FLAGS = {
   'verify-tunnel-config': ['--dir', '--guard-config', '--json'],
   'verify-no-secrets': ['--dir', '--guard-config', '--json'],
   'clear-pending-release': ['--dir', '--json'],
-  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut', '--sha', '--on-host'],
+  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut', '--sha', '--on-host', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation'],
   rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock'],
   monitor: ['--steal-lock', '--no-lock', '--local'],
   status: [],
@@ -97,6 +98,11 @@ function validateCommandFlags(command, args) {
   const hint = COMMAND_HINTS[command] ? ` ${COMMAND_HINTS[command]}` : '';
   return `${command} does not support: ${bad.join(', ')}\n${command} supports: ${list}${hint}`;
 }
+
+// On-host request flags (BRAIN-636 D4a): raw strings here, validated by on-host/operator.js.
+const REQUEST_FLAGS = {
+  '--kind': 'kind', '--request': 'request', '--epoch': 'epoch', '--not-after': 'notAfter', '--expect-reservation': 'expectReservation',
+};
 
 const PORT_RE = /^[0-9]+$/;
 
@@ -150,6 +156,7 @@ function parseOptions(args) {
       options.sha = args[i + 1];
       i += 1;
     }
+    else if (REQUEST_FLAGS[a] && args[i + 1]) { options[REQUEST_FLAGS[a]] = args[i + 1]; i += 1; }
     else if (a === '--guard-config' && args[i + 1]) { options.guardConfig = args[i + 1]; i += 1; }
     else if (a === '--json') { options.json = true; }
     else if (a === '--local') { options.local = true; }
@@ -255,6 +262,9 @@ Commands:
                                            lock owner; refuses lock-held, never waits)
   epoch set <n>                            raise the target's epoch fence (refuses to lower it)
   request cancel <requestId>               tombstone an unstarted deploy request; exit 3 not-cancellable <reason>
+  resolve --request <requestId> --reason <text>
+                                           clear the app's unresolved record after assessing production (locked, as
+                                           a session lock owner); exit 3 not-unresolved / request-mismatch
   target-state --json [--request <id>]     read-only: live sha, journal class, hold, epoch, reservation, lock owners
   attach <run-id>                          follow an --on-host run from the local receipts file
                                             (~/.deploy-kit/on-host-runs.jsonl); same exit codes
@@ -506,7 +516,7 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   }
 
   // Target-state commands (BRAIN-636 D3): holds, the epoch fence, request cancel, and the read-only state.
-  if (['hold', 'epoch', 'request', 'target-state'].includes(command)) {
+  if (['hold', 'epoch', 'request', 'resolve', 'target-state'].includes(command)) {
     let targetConfig;
     try {
       targetConfig = loadConfig({ cwd });

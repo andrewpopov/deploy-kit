@@ -181,5 +181,5 @@ function onHostStatus(config, runId, { requestId, runtime } = {}) {
 }
 
 module.exports = {
-  onHostStatus, classifyStatus, statusCommand, STATES, readRecord, validateReservation, validateTerminal,
+  onHostStatus, classifyStatus, statusCommand, STATES, REQUEST_ID_RE, readRecord, validateReservation, validateTerminal,
 };

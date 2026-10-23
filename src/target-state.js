@@ -44,6 +44,8 @@ function stateFiles(config) {
     base,
     hold: `${base}/deploy-kit-${lockId(config)}.hold.json`,
     epoch: `${base}/.last-epoch`,
+    unresolved: `${base}/deploy-kit-${lockId(config)}.unresolved.json`,
+    resolved: `${base}/resolved`,
     requests: `${base}/requests`,
     runs: `${base}/runs`,
   };
@@ -255,6 +257,35 @@ function cancelRequest(config, requestId, { now = new Date(), runtime, pauseFifo
   return runSession(config, runtime, sessionScript(config, { purpose: 'request-cancel', body, pauseFifo }));
 }
 
+// Clears the app's unresolved.json (written by host-run after a failure that may have changed production)
+// once an operator has assessed it. The record is moved into resolved/ next to a resolution record that
+// carries the operator's reason; nothing else removes it. A record naming a different request is refused;
+// one that names none (unreadable) is archived, since the operator is the one vouching for production.
+function resolveRequest(config, requestId, reason, { now = new Date(), runtime, pauseFifo } = {}) {
+  if (typeof requestId !== 'string' || !REQUEST_ID_RE.test(requestId)) {
+    throw new Error(`deploy-kit: ${JSON.stringify(requestId)} is not a request id`);
+  }
+  if (typeof reason !== 'string' || reason.trim() === '') throw new Error('deploy-kit: resolve needs a non-empty --reason');
+  const { unresolved, resolved } = stateFiles(config);
+  const at = now.toISOString();
+  const archive = `${resolved}/${at.replace(/[:.]/g, '')}-${requestId}`;
+  const body = String.raw`
+  rid=${shQuote(requestId)}
+  uf="${unresolved}"
+  if [ ! -e "$uf" ]; then echo "not-unresolved"; return ${EXIT_REFUSED}; fi
+  c=$(tr -d ' 	
+' < "$uf")
+  named=$(printf '%s' "$c" | sed -n 's/.*"requestId":"\([^"]*\)".*/\1/p' | head -n 1)
+  if [ -n "$named" ] && [ "$named" != "$rid" ]; then echo "request-mismatch $named"; return ${EXIT_REFUSED}; fi
+  mkdir -p -m 700 "${resolved}" || return 2
+  printf '{"requestId":"%s","reason":%s,"at":"%s"}
+' "$rid" ${shQuote(JSON.stringify(reason))} ${shQuote(at)} > "${archive}.resolution.json" || return 2
+  mv "$uf" "${archive}.unresolved.json" || return 2
+  echo "resolved $rid"
+`;
+  return runSession(config, runtime, sessionScript(config, { purpose: 'resolve', body, pauseFifo }));
+}
+
 // ---- read-only state ----------------------------------------------------------------------------
 
 const emitFile = (name, file) => `printf 'DK_FILE %s\\n' ${name}; if [ -e ${file} ]; then head -c 65536 ${file}; printf '\\nDK_PRESENT\\n'; else printf 'DK_ABSENT\\n'; fi`;
@@ -380,6 +411,7 @@ const USAGE = {
   hold: 'Usage: deploy-kit hold set --reason <text> [--until <iso>] | deploy-kit hold clear',
   epoch: 'Usage: deploy-kit epoch set <n>',
   request: 'Usage: deploy-kit request cancel <requestId>',
+  resolve: 'Usage: deploy-kit resolve --request <requestId> --reason <text>',
   'target-state': 'Usage: deploy-kit target-state --json [--request <id>]',
 };
 
@@ -416,6 +448,11 @@ function runCommand(command, args, config, { log, out = console.log, runtime, no
     if (command === 'hold' && sub === 'clear' && rest.length === 0) return report(clearHold(config, { runtime }));
     if (command === 'epoch' && sub === 'set' && rest.length === 1) return report(setEpoch(config, rest[0], { runtime }));
     if (command === 'request' && sub === 'cancel' && rest.length === 1) return report(cancelRequest(config, rest[0], { runtime, now }));
+    if (command === 'resolve') {
+      const parsed = parseFlags(args, ['--request', '--reason']);
+      if (!parsed || parsed.positional.length > 0 || !parsed.flags['--request'] || !parsed.flags['--reason']) return usage();
+      return report(resolveRequest(config, parsed.flags['--request'], parsed.flags['--reason'], { runtime, now }));
+    }
     if (command === 'target-state') {
       const parsed = parseFlags(args, ['--request']);
       if (!parsed || parsed.positional.length > 0 || !parsed.flags['--json']) return usage();
@@ -430,5 +467,6 @@ function runCommand(command, args, config, { log, out = console.log, runtime, no
 }
 
 module.exports = {
-  setHold, clearHold, setEpoch, cancelRequest, readTargetState, classifyJournal, classifyTargetState, runCommand,
+  setHold, clearHold, setEpoch, cancelRequest, resolveRequest, readTargetState, classifyJournal, classifyHold, classifyEpoch,
+  classifyTargetState, stateFiles, runCommand,
 };
