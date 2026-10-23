@@ -168,10 +168,18 @@ function waitForHealth(config, ctx) {
 function waitForRunningSha(config, paths, sha, ctx) {
   const { attempts, delaySeconds } = config.health;
   const expected = sha.slice(0, 12);
+  // Protected non-dry-run: only a successful probe whose stdout is exactly the full SHA counts.
+  const exact = config.transitionAuthority != null && ctx.runtime?.dryRun !== true;
   let running = '';
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    running = capture(paths.root, config.layout.runningShaCommand, config, ctx);
-    if (running && running.slice(0, 12) === expected) return { ok: true, running };
+    if (exact) {
+      const res = runOnTarget(config.layout.runningShaCommand, { ...config, projectDir: paths.root }, { capture: true, runtime: ctx.runtime });
+      running = (res.output || '').trim();
+      if (res.ok && /^[0-9a-f]{40}$/.test(running) && running === sha) return { ok: true, running };
+    } else {
+      running = capture(paths.root, config.layout.runningShaCommand, config, ctx);
+      if (running && running.slice(0, 12) === expected) return { ok: true, running };
+    }
     if (attempt < attempts) ctx.sleep(delaySeconds);
   }
   return { ok: false, running };
@@ -1247,8 +1255,10 @@ function deployRelease(config, options = {}, ctx = {}) {
       log.info('[dry-run] transition authority would be required: begin/run/complete around the candidate; none performed');
       return executeCandidate();
     }
-    const candidateSha = capture(st.releaseDir, 'git rev-parse HEAD', config, c);
-    if (candidateSha !== st.sha) throw recoveryRequired(`Candidate SHA ${candidateSha} != resolved ${st.sha}; refusing authority begin`);
+    const candidateRead = runOnTarget('git rev-parse HEAD', { ...config, projectDir: st.releaseDir }, { capture: true, runtime: c.runtime });
+    if (!candidateRead.ok) throw recoveryRequired(`Candidate SHA read failed in ${st.releaseDir}; refusing authority begin`);
+    const candidateSha = (candidateRead.output || '').trim();
+    if (!/^[0-9a-f]{40}$/.test(candidateSha) || candidateSha !== st.sha) throw recoveryRequired(`Candidate SHA ${candidateSha} != resolved ${st.sha}; refusing authority begin`);
     const begun = manager.begin({
       kind: 'deploy', targetSha: st.sha, targetRelease: `releases/${releaseId}`, priorPointer: st.prevTarget,
       effects: { ...CONSERVATIVE_EFFECTS }, parentOperationId: null,
@@ -1331,7 +1341,9 @@ function inspectTransitionAuthority(config, paths, c, ctx) {
 // Read-only: the ACTUAL full commit of a release worktree (never inferred from the directory name).
 function resolveReleaseSha(config, paths, target, label, c) {
   assertSafeTarget(target, label);
-  const sha = capture(`${paths.root}/${target}`, 'git rev-parse HEAD', config, c, { readOnly: true });
+  const res = runOnTarget('git rev-parse HEAD', { ...config, projectDir: `${paths.root}/${target}` }, { capture: true, runtime: c.runtime, readOnly: true });
+  if (!res.ok) throw recoveryRequired(`${label} ${target} SHA read failed`);
+  const sha = (res.output || '').trim();
   if (!/^[0-9a-f]{40}$/.test(sha)) throw recoveryRequired(`${label} ${target} did not resolve to a full 40-hex commit SHA`);
   return sha;
 }
