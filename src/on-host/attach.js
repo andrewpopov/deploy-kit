@@ -52,9 +52,9 @@ function stateCommand(runDir, unit) {
   ].join('\n');
 }
 
-// -> { started, outcome, result, resultUnstarted, activeState, subState } (record values are raw
-// text, null when absent), or undefined when the reply is incomplete and the poll must be retried.
-function parseState(output) {
+// Splits a DK_FILE/DK_PRESENT/DK_ABSENT ... DK_UNIT ... DK_END reply into { records, unitLines } (record
+// values are raw text, null when absent), or undefined when the reply is incomplete or lacks a name.
+function parseFramedReply(output, names) {
   const records = {};
   const unitLines = [];
   let current = null;
@@ -76,9 +76,21 @@ function parseState(output) {
       buffer.push(line);
     }
   }
-  if (!ended || RECORD_FILES.some((name) => !(name in records))) return undefined;
-  const unitProp = (key) => unitLines.map((l) => new RegExp(`^${key}=(.*)$`).exec(l)).find(Boolean)?.[1];
-  const activeState = unitProp('ActiveState');
+  if (!ended || names.some((name) => !(name in records))) return undefined;
+  return { records, unitLines };
+}
+
+function unitProperty(unitLines, key) {
+  return unitLines.map((l) => new RegExp(`^${key}=(.*)$`).exec(l)).find(Boolean)?.[1];
+}
+
+// -> { started, outcome, result, resultUnstarted, activeState, subState }, or undefined when the reply
+// is incomplete and the poll must be retried.
+function parseState(output) {
+  const framed = parseFramedReply(output, RECORD_FILES);
+  if (!framed) return undefined;
+  const { records, unitLines } = framed;
+  const activeState = unitProperty(unitLines, 'ActiveState');
   if (activeState === undefined) return undefined;
   return {
     started: records.started,
@@ -86,7 +98,7 @@ function parseState(output) {
     result: records['result.json'],
     resultUnstarted: records['result-unstarted.json'],
     activeState,
-    subState: unitProp('SubState'),
+    subState: unitProperty(unitLines, 'SubState'),
   };
 }
 
@@ -180,6 +192,7 @@ function attachRun(runId, config, deps = {}) {
 }
 
 module.exports = {
-  attachRun, attachReceipt, parseState, parseLogChunk, logChunkCommand, stateCommand,
+  attachRun, attachReceipt, parseState, parseFramedReply, unitProperty, parseLogChunk, logChunkCommand, stateCommand,
+  LIVE_STATES, REMOTE_CALL_TIMEOUT_SECONDS,
   EXIT_TRANSPORT_LOST, POLL_SECONDS, RETRY_BACKOFF_SECONDS, INACTIVE_GRACE_MS,
 };

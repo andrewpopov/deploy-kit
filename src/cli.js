@@ -230,6 +230,9 @@ Commands:
                                             succeeded, 1 failed/refused, 70 outcome unknown, 75
                                             transport lost or submission unacknowledged (do NOT
                                             redeploy; attach). See README "On-host deploys".
+  on-host-status <run-id> [--request <id>] --json
+                                           read-only: classify an --on-host run on the host (absent|staged|
+                                           claimed|refused|accepted-running|terminal|unknown); exit 75 = transport lost
   attach <run-id>                          follow an --on-host run from the local receipts file
                                             (~/.deploy-kit/on-host-runs.jsonl); same exit codes
   rollback [--skip-build|--skip-deps] [--dry-run] [--steal-lock] [--no-lock]
@@ -413,6 +416,35 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
       return 1;
     }
     return require('./on-host/attach').attachRun(rest[0], attachConfig);
+  }
+
+  // on-host-status takes a positional <run-id> like attach; read-only, always prints JSON.
+  if (command === 'on-host-status') {
+    const rest = argv.slice(1);
+    const positional = [];
+    let requestId;
+    let usage = false;
+    for (let i = 0; i < rest.length; i += 1) {
+      if (rest[i] === '--json') continue;
+      if (rest[i] === '--request') {
+        i += 1;
+        requestId = rest[i];
+        if (requestId === undefined || requestId.startsWith('-')) usage = true;
+      } else if (rest[i].startsWith('-')) usage = true;
+      else positional.push(rest[i]);
+    }
+    if (usage || positional.length !== 1) {
+      log.error('Usage: deploy-kit on-host-status <run-id> [--request <id>] --json');
+      return 1;
+    }
+    try {
+      const status = require('./on-host/status').onHostStatus(loadConfig({ cwd }), positional[0], { requestId });
+      console.log(JSON.stringify(status, null, 2));
+      return status.transport === 'lost' ? 75 : 0;
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
   }
 
   // lock takes a positional subcommand, so it is dispatched before parseOptions
