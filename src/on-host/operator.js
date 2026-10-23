@@ -88,9 +88,16 @@ function requestMeta(config, options) {
   } catch {
     refuse('--expect-reservation must be JSON');
   }
+  if (options.kind === 'rollback') {
+    if (typeof options.rollbackTo !== 'string' || !FULL_SHA_RE.test(options.rollbackTo)) refuse('--to must be the 40 lowercase hex characters of the release to return to');
+    if (options.rollbackTo !== options.sha) refuse('a rollback request carries its target as the run sha');
+  } else if (options.rollbackTo !== undefined) {
+    refuse('--to is only valid for a rollback');
+  }
   return {
     kind: options.kind,
     requestId: options.request,
+    ...(options.kind === 'rollback' ? { rollbackTo: options.rollbackTo } : {}),
     parentRequestId: null,
     parentRunId: null,
     epoch: integer('--epoch', options.epoch),
@@ -429,6 +436,22 @@ function onHostDeploy(config, options, deps = {}) {
   }
 }
 
+// `deploy-kit rollback --on-host --to <sha> ...`: the same submission path as a deploy. The run's sha is the
+// release it returns to, so the run id, the staged bundle and the host's meta checks need no second shape.
+function onHostRollback(config, options, deps = {}) {
+  const refuse = (why) => { throw new OnHostError('ONHOST_REQUEST', why); };
+  try {
+    if (options.kind !== undefined && options.kind !== 'rollback') refuse('rollback --on-host takes no --kind other than rollback');
+    if (options.to === undefined || !FULL_SHA_RE.test(options.to)) refuse('--to <40-hex> is required: the sha of the release `previous` must be');
+  } catch (error) {
+    (deps.log || defaultLog).error(error.message);
+    return 1;
+  }
+  return onHostDeploy(config, {
+    ...options, kind: 'rollback', rollbackTo: options.to, sha: options.to, autoCut: false,
+  }, deps);
+}
+
 module.exports = {
-  onHostDeploy, validateOnHostRequest, requestMeta, preflightScript, parsePreflight, parseKeyValues, buildBundle, buildSubmitArgv, quoteArgv, newRunId, systemdEscape, jsYamlRoot,
+  onHostDeploy, onHostRollback, validateOnHostRequest, requestMeta, preflightScript, parsePreflight, parseKeyValues, buildBundle, buildSubmitArgv, quoteArgv, newRunId, systemdEscape, jsYamlRoot,
 };

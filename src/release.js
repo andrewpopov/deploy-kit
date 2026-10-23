@@ -1547,6 +1547,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       activateSymlink(config, paths, st.prevTarget, c, { link: paths.previousLink });
     }
     stepStart('current-pointer');
+    writeReleaseRecord(config, st, c);
     activateSymlink(config, paths, `releases/${releaseId}`, c);
     st.flipped = true;
     steps.push('flip');
@@ -1783,6 +1784,19 @@ function resolveReleaseSha(config, paths, target, label, c) {
   return sha;
 }
 
+// BRAIN-636 D6: whether this release ever ran a migration, recorded durably INSIDE the release directory just
+// before it becomes `current`. A manual on-host rollback reads it (src/on-host/accept.js): a release with no
+// record, or an unreadable one, is treated as migrated, so the rollback refuses (fail closed).
+const RELEASE_RECORD = '.deploy-kit-release.json';
+
+function writeReleaseRecord(config, st, c) {
+  const record = {
+    sha: st.sha, migrated: st.migrated === true, migrationsPending: st.migrationsPending ?? null, backupId: st.backupId ?? null,
+  };
+  const file = `${st.releaseDir}/${RELEASE_RECORD}`;
+  runInDir(st.releaseDir, `printf '%s\\n' ${shQuote(JSON.stringify(record))} > ${file}.tmp && mv -f ${file}.tmp ${file}`, config, c);
+}
+
 // Atomic symlink swap: create a uniquely-named temp symlink in the same directory,
 // then GNU `mv -T` renames it over the target (a single namespace op on ext4 —
 // readers see the old or new link, never a missing one). Relative target so the
@@ -1923,12 +1937,15 @@ function rollbackRelease(config, options = {}, ctx = {}) {
     );
   }
 
+  // BRAIN-636 D6: each step is reported (ctx.onStep) BEFORE it runs, like deployRelease's, so the effects ledger shows it.
+  const reportStep = (step) => { if (typeof c.onStep === 'function') c.onStep({ step, class: stepClass(config, step) }); };
   const rollbackFacts = {
     stage: 'rollback', liveBefore: null, migrated: false, migrationsPending: null, backupId: null, liveAfter: null,
   };
   log.header(`⏪ Rolling back [release layout] (${config.mode}${config.host ? ` → ${config.host}` : ''})`);
   const release = acquireOrAdoptLock(config, c, { steal: options.stealLock === true });
   try {
+    reportStep('preflight');
     preflight(config, paths, c);
     const fenced = config.transitionAuthority != null && c.runtime?.dryRun !== true;
     const manager = fenced ? inspectTransitionAuthority(config, paths, c, ctx).manager : null;
@@ -1948,10 +1965,12 @@ function rollbackRelease(config, options = {}, ctx = {}) {
     // fenced (failures then throw into the authority runtime, never unfenced recovery).
     const executeRollback = (targetSha) => {
       log.step(`Flipping current back to ${pointers.previous}`);
+      reportStep('current-pointer');
       activateSymlink(config, paths, pointers.previous, c);
       // Pre-restart checks: gated, run IMMEDIATELY BEFORE the pm2 restart, same as
       // the forward deploy. `current` has ALREADY been flipped, so a failing check must
       // not throw straight out (PKG-135 Finding 5) when unfenced.
+      if (config.preRestartChecks.length) reportStep('preRestartChecks');
       for (const check of config.preRestartChecks) {
         log.step(`Pre-restart check: ${check.name}`);
         try {
@@ -1962,6 +1981,7 @@ function rollbackRelease(config, options = {}, ctx = {}) {
           recoverFailedRollback(config, paths, originalCurrent, c, reason);
         }
       }
+      reportStep('pm2-restart');
       runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
       runInDir(paths.root, 'pm2 save 2>/dev/null || true', config, c, { tolerate: true });
 
@@ -2061,6 +2081,7 @@ module.exports = {
   LAYOUT_VERSION,
   isReleaseLayout,
   releasePaths,
+  RELEASE_RECORD,
   deployRelease,
   rollbackRelease,
   verifyActivation,

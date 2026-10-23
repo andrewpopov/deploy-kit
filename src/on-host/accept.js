@@ -20,7 +20,7 @@ const { runOnTarget } = require('../exec');
 const {
   NO_RECOVERY, deployed, failureFromError, pickDeployResult,
 } = require('../deploy-result');
-const { releasePaths } = require('../release');
+const { releasePaths, RELEASE_RECORD } = require('../release');
 const { stepClass } = require('../effects');
 const {
   stateFiles, classifyHold, classifyEpoch, classifyJournal,
@@ -117,6 +117,8 @@ const defaultGit = {
     if (!fs.lstatSync(paths.currentLink, { throwIfNoEntry: false })) return null;
     return execFileSync('git', ['-C', paths.currentLink, 'rev-parse', 'HEAD'], GIT_OPTIONS).trim();
   },
+  // The actual commit of a release directory (never inferred from its name).
+  readReleaseSha: (dir) => execFileSync('git', ['-C', dir, 'rev-parse', 'HEAD'], GIT_OPTIONS).trim(),
   isAncestor: (paths, ancestor, sha) => {
     try {
       execFileSync('git', ['--git-dir', paths.repoGit, 'merge-base', '--is-ancestor', ancestor, sha], GIT_OPTIONS);
@@ -150,6 +152,49 @@ function takeLocks({ config, request, runId, nowSec, deps }) {
     if (error.code === 'held') throw new Refusal('lock-held', error.message);
     throw new Refusal('lock-error', error.message);
   }
+}
+
+// -> the target of a release pointer (`releases/<id>`), or null when it is absent.
+function readPointer(link) {
+  try {
+    return fs.readlinkSync(link);
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'EINVAL') return null;
+    throw error;
+  }
+}
+
+// Plan section 4.1, `rollback`: `previous` must be the release the request names, and the release being left
+// (`current`) must never have migrated. A release record that is missing, unreadable or says anything but
+// `migrated: false` counts as migrated: the refusal fails closed (the record is written by deployRelease).
+function checkRollback({ request, paths, git }) {
+  const target = (link) => {
+    const pointer = readPointer(link);
+    return pointer === null ? null : path.join(paths.root, pointer);
+  };
+  const previousDir = target(paths.previousLink);
+  if (previousDir === null) throw new Refusal('rollback-target-mismatch', 'no previous release is recorded');
+  let previousSha;
+  try {
+    previousSha = git.readReleaseSha(previousDir);
+  } catch (error) {
+    throw new Refusal('rollback-target-mismatch', `previous release unreadable: ${error.message}`);
+  }
+  if (previousSha !== request.rollbackTo) throw new Refusal('rollback-target-mismatch', `previous is ${previousSha}, the request names ${request.rollbackTo}`);
+  const currentDir = target(paths.currentLink);
+  if (currentDir === null) throw new Refusal('live-unreadable', 'no current release');
+  let migrated = true;
+  let why = 'no release record';
+  const raw = readIfPresent(path.join(currentDir, RELEASE_RECORD));
+  if (raw !== null) {
+    try {
+      migrated = JSON.parse(raw).migrated !== false;
+      why = 'the current release migrated';
+    } catch {
+      why = 'unreadable release record';
+    }
+  }
+  if (migrated) throw new Refusal('rollback-across-migration', `${why}; a manual rollback would run the previous code against a migrated schema`);
 }
 
 function stageObjects({ config, request, paths, nowSec, git, ledger }) {
@@ -217,16 +262,14 @@ function checkKind({ request, paths, git }) {
     throw new Refusal('kind-unsupported', 'recover has no pipeline entry yet');
   }
   if (journal.class === 'interrupted') throw new Refusal('recovery-pending', `journal phase ${journal.phase}`);
-  if (request.kind === 'rollback') {
-    // TODO(D6): previous sha == --to, current release migrated:false, then rollbackRelease().
-    throw new Refusal('kind-unsupported', 'rollback has no pipeline entry yet');
-  }
+  if (request.kind === 'rollback') checkRollback({ request, paths, git });
   let live;
   try {
     live = git.readLive(paths);
   } catch (error) {
     throw new Refusal('live-unreadable', error.message);
   }
+  if (request.kind === 'rollback') return live;
   if (live === null) return null;
   if (live === request.sha) throw new Refusal('already-live', live);
   let forward;
@@ -313,7 +356,8 @@ function execute({
     const ctx = {
       ownedLocks: handle, recoverInterrupted: 'refuse', onStep: ledger.record, notAfter: request.notAfter, ...(deps.runtime ? { runtime: deps.runtime } : {}),
     };
-    result = resultOf(deps.deployRelease(config, options, ctx));
+    const pipeline = request.kind === 'rollback' ? deps.rollbackRelease : deps.deployRelease;
+    result = resultOf(pipeline(config, options, ctx));
   } catch (error) {
     deps.log.error(error instanceof Error ? error.message : String(error));
     result = resultOf(undefined, error);
@@ -351,7 +395,8 @@ function runAccepted({ runDir, runId, request, config, options, deps }) {
     crashAt('after-lock');
     fs.mkdirSync(runDir, { recursive: true });
     ledger = openLedger(path.join(runDir, 'effects.jsonl'));
-    stageObjects({ config, request, paths, nowSec, git: deps.git || defaultGit, ledger });
+    // A rollback fetches nothing: its target is the release already on the host.
+    if (request.kind !== 'rollback') stageObjects({ config, request, paths, nowSec, git: deps.git || defaultGit, ledger });
     crashAt('after-staging');
     const { plan, liveBefore } = checkGates({ files, request, runId, paths, nowSec, deps });
     if (request.kind === 'deploy') runPreDeployChecks({ config, paths, deps });

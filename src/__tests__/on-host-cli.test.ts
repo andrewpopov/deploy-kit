@@ -54,12 +54,23 @@ describe('deploy --on-host routing', () => {
     expect(out).toContain('ONHOST_LAYOUT');
   });
 
-  it('--on-host is a deploy-only flag', () => {
+  it('rollback --on-host needs --to, a full sha; --skip-migrate is not a rollback flag', () => {
     spies();
     inProject({}, (cwd) => {
       expect(cli.run(['rollback', '--on-host'], { cwd })).toBe(1);
+      expect(out).toContain('--to <40-hex> is required');
+      expect(cli.run(['rollback', '--on-host', '--to', 'abc123'], { cwd })).toBe(1);
+      expect(cli.run(['rollback', '--skip-migrate'], { cwd })).toBe(1);
     });
-    expect(out).toContain('rollback does not support: --on-host');
+    expect(out).toContain('rollback does not support: --skip-migrate');
+  });
+
+  it('--to without --on-host is refused rather than ignored (a legacy rollback goes to previous, whatever it is)', () => {
+    spies();
+    inProject({}, (cwd) => {
+      expect(cli.run(['rollback', '--to', SHA], { cwd })).toBe(1);
+    });
+    expect(out).toContain('only apply with --on-host');
   });
 });
 

@@ -106,17 +106,24 @@ export function makeTarget() {
 
   interface GoOptions {
     pipeline?: (cfg: any, opts: any, ctx: any) => unknown;
+    rollbackPipeline?: (cfg: any, opts: any, ctx: any) => unknown;
     crashAt?: string;
     env?: Record<string, string | undefined>;
     git?: Record<string, unknown>;
     deps?: Record<string, unknown>;
   }
-  function go(runId: string, { pipeline, crashAt, env, git, deps }: GoOptions = {}) {
+  function go(runId: string, { pipeline, rollbackPipeline, crashAt, env, git, deps }: GoOptions = {}) {
     const deployRelease = vi.fn((cfg: any, opts: any, ctx: any) => {
       events.push('pipeline');
       snap('pipeline', runId);
       if (ctx) lock.validateOwnedLocks(cfg, { runtime }, ctx.ownedLocks); // the handle must be live and whole
       return pipeline ? pipeline(cfg, opts, ctx) : undefined;
+    });
+    const rollbackRelease = vi.fn((cfg: any, opts: any, ctx: any) => {
+      events.push('rollback-pipeline');
+      snap('rollback-pipeline', runId);
+      if (ctx) lock.validateOwnedLocks(cfg, { runtime }, ctx.ownedLocks);
+      return rollbackPipeline ? rollbackPipeline(cfg, opts, ctx) : undefined;
     });
     const fakeGit = {
       stage: vi.fn(() => { events.push('stage'); snap('stage', runId); }),
@@ -125,7 +132,7 @@ export function makeTarget() {
       ...git,
     };
     const code = hostRun(runDirOf(runId), {
-      deployRelease, git: fakeGit, runtime, sleep: () => advance(60),
+      deployRelease, rollbackRelease, git: fakeGit, runtime, sleep: () => advance(60),
       crash: () => { throw new CrashSeam('crash'); },
       runCheck: () => ({ ok: true }),
       env: {
@@ -133,7 +140,7 @@ export function makeTarget() {
       },
       log: logs, readOomScoreAdj: () => '100\n', readFile: () => '42', run: () => '42', now: () => new Date(clock), ...deps,
     });
-    return { code, deployRelease, git: fakeGit };
+    return { code, deployRelease, rollbackRelease, git: fakeGit };
   }
   const status = (runId: string, requestId: string | undefined = REQUEST_ID) => onHostStatus(
     { mode: 'ssh', host: 'dkapp@host', projectDir: config.projectDir, appNames: config.appNames, stepTimeoutSeconds: 60 },

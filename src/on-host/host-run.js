@@ -142,6 +142,11 @@ function validateRequestMeta(meta, config) {
   if (!isObject(artifact) || typeof artifact.version !== 'string' || artifact.version === '' || !SHA256_RE.test(artifact.sha256)) {
     throw bad('meta.kitArtifact must be {version:<string>, sha256:<64 hex>}');
   }
+  // A rollback names the release it returns to (the full sha, equal to meta.sha); no other kind carries one.
+  const rollbackTo = meta.rollbackTo ?? null;
+  if (meta.kind === 'rollback' ? !(typeof rollbackTo === 'string' && FULL_SHA_RE.test(rollbackTo) && rollbackTo === meta.sha) : rollbackTo !== null) {
+    throw bad('meta.rollbackTo must be the 40-hex meta.sha for a rollback and absent for any other kind');
+  }
   return {
     kind: meta.kind,
     requestId: meta.requestId,
@@ -152,6 +157,7 @@ function validateRequestMeta(meta, config) {
     expectReservation: expect,
     kitArtifact: artifact,
     sha: meta.sha,
+    rollbackTo,
   };
 }
 
@@ -239,6 +245,7 @@ function warnIfPm2NotSystemService({ env, log, readFile, run }) {
 function hostRun(runDir, deps = {}) {
   const {
     deployRelease = (...args) => require('../release').deployRelease(...args),
+    rollbackRelease = (...args) => require('../release').rollbackRelease(...args),
     env = process.env,
     uid = process.getuid(),
     log = defaultLog,
@@ -272,7 +279,7 @@ function hostRun(runDir, deps = {}) {
     if (request) {                                                      // 7-9, see accept.js
       deployed = true; // every pre-acceptance failure is handled (and recorded) inside runAccepted
       const code = runAccepted({
-        runDir, runId, request, config, options, deps: { ...deps, deployRelease, env, log, now },
+        runDir, runId, request, config, options, deps: { ...deps, deployRelease, rollbackRelease, env, log, now },
       });
       if (code === 0) warnIfPm2NotSystemService({ env, log, readFile, run });
       return code;

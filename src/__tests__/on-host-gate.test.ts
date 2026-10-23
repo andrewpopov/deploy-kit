@@ -217,17 +217,12 @@ describeWithFlock('host-run request protocol: refusals', () => {
     expect(first.git.isAncestor).not.toHaveBeenCalled();
   });
 
-  it('rollback and recover pass their journal gates and then refuse kind-unsupported (D6/D8 add the pipelines)', () => {
-    t.stage(runIdN(1), requestMeta({ kind: 'rollback' }));
-    expectRefused(runIdN(1), 'kind-unsupported', t.go(runIdN(1)));
+  it('recover passes its journal gate and then refuses kind-unsupported (D8 adds the pipeline)', () => {
     fs.writeFileSync(path.join(t.config.projectDir, '.deploy-kit-state.json'), JSON.stringify({ phase: 'stopped', releaseId: 'r1' }));
-    t.stage(runIdN(2), requestMeta({ kind: 'rollback' }));
-    t.go(runIdN(2));
-    expect(t.readJson(`runs/${runIdN(2)}/refused.json`).code).toBe('recovery-pending');
-    t.stage(runIdN(3), requestMeta({ kind: 'recover', parentRunId: runIdN(2) }));
-    t.go(runIdN(3));
-    expect(t.readJson(`runs/${runIdN(3)}/refused.json`).code).toBe('kind-unsupported');
-    expect(t.has(`runs/${runIdN(3)}/accepted.json`)).toBe(false);
+    t.stage(runIdN(1), requestMeta({ kind: 'recover', parentRunId: runIdN(2) }));
+    t.go(runIdN(1));
+    expect(t.readJson(`runs/${runIdN(1)}/refused.json`).code).toBe('kind-unsupported');
+    expect(t.has(`runs/${runIdN(1)}/accepted.json`)).toBe(false);
   });
 
   it('recover with nothing interrupted refuses nothing-to-recover; a corrupt journal refuses journal-corrupt', () => {

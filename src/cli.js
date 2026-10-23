@@ -23,7 +23,7 @@ const KNOWN_FLAGS = [
   '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
   '--dir', '--json', '--local', '--branch', '--no-auto-cut', '--guard-config', '--sha', '--on-host',
-  '--kind', '--request', '--epoch', '--not-after', '--expect-reservation',
+  '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--to',
 ];
 
 // Flags that take a following positional value. Kept in sync with the arity
@@ -33,7 +33,7 @@ const KNOWN_FLAGS = [
 // a used flag; parseOptions consumes it as --service's value).
 const VALUE_FLAGS = new Set([
   '--lines', '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env', '--dir', '--branch',
-  '--guard-config', '--sha', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation',
+  '--guard-config', '--sha', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--to',
 ]);
 
 // The set of flags each command actually reads. KNOWN_FLAGS above is only
@@ -52,7 +52,7 @@ const COMMAND_FLAGS = {
   'verify-no-secrets': ['--dir', '--guard-config', '--json'],
   'clear-pending-release': ['--dir', '--json'],
   deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut', '--sha', '--on-host', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation'],
-  rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock'],
+  rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock', '--on-host', '--to', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation'],
   monitor: ['--steal-lock', '--no-lock', '--local'],
   status: [],
   health: [],
@@ -156,6 +156,7 @@ function parseOptions(args) {
       options.sha = args[i + 1];
       i += 1;
     }
+    else if (a === '--to' && args[i + 1]) { options.to = args[i + 1]; i += 1; }
     else if (REQUEST_FLAGS[a] && args[i + 1]) { options[REQUEST_FLAGS[a]] = args[i + 1]; i += 1; }
     else if (a === '--guard-config' && args[i + 1]) { options.guardConfig = args[i + 1]; i += 1; }
     else if (a === '--json') { options.json = true; }
@@ -271,6 +272,9 @@ Commands:
   rollback [--skip-build|--skip-deps] [--dry-run] [--steal-lock] [--no-lock]
                                             (NOT --skip-migrate or --no-stash — rollback
                                             never reads them)
+  rollback --on-host --to <40-hex> --request <id> --epoch <n> --not-after <unix> --expect-reservation <json>
+                                            the controller-driven rollback: refuses unless previous is the --to
+                                            release and the current release never migrated
   monitor [--steal-lock] [--no-lock]       run fleet checks + alert on transitions (cron)
     [--local]                               force mode:'local' for this run — every check
                                             and the alert sink execute on this machine, no
@@ -739,6 +743,16 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
 
   if (command === 'deploy' && options.onHost) {
     return require('./on-host/operator').onHostDeploy(config, options, { cwd });
+  }
+  if (command === 'rollback' && !options.onHost) {
+    const requestFlags = ['to', 'kind', 'request', 'epoch', 'notAfter', 'expectReservation'].filter((key) => options[key] !== undefined);
+    if (requestFlags.length > 0) {
+      log.error('rollback: --to and the request flags only apply with --on-host; without it rollback returns to `previous`, whatever it is');
+      return 1;
+    }
+  }
+  if (command === 'rollback' && options.onHost) {
+    return require('./on-host/operator').onHostRollback(config, options, { cwd });
   }
 
   switch (command) {
