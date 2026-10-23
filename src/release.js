@@ -939,7 +939,7 @@ function deployRelease(config, options = {}, ctx = {}) {
         ...(restored ? { activeRelease: st.prevTarget } : { activeRevision: st.sha, activeRelease: candidateTarget }),
         ...(rolledBack ? {} : { appsState }),
         ...(st.recoveryNote ? { note: st.recoveryNote } : {}),
-        recovery: { policy: st.failurePolicy, outcome, verified: rolledBack },
+        recovery: { policy: st.failurePolicy, outcome, verified: false },
       });
       if (alertText) postFleetAlert(`${alertText} (${outcome}).${st.recoveryNote ? ` ${st.recoveryNote}.` : ''}`);
     };
@@ -954,7 +954,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     const concludeUnverified = (child) => {
       if (!policyPhase) {
         st.phase = postDeploy ? 'post-deploy-rollback-failed' : 'forward-recovery-failed';
-        if (postDeploy && st.recoveryOutcome === 'rolled-back') st.recoveryOutcome = 'rollback-failed-running';
+        if (postDeploy) st.recoveryOutcome = appsRunFromRelease(config, paths, targetDir, c).ok ? 'rollback-failed-running' : 'rollback-failed-not-started';
         journal();
       }
       return settledFailure(child, policyPhase
@@ -1026,7 +1026,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       priorPointer: st.prevTarget, parentOperationId: first.operationId,
     }, () => {
       journal({ phase: 'forward-recovery-restart', sha: previousSha });
-      if (facts.appsOnline !== true) ensureRollbackTargetRunning();
+      ensureRollbackTargetRunning();
       if (postDeploy) {
         const running = appsRunFromRelease(config, paths, targetDir, c).ok;
         const healthy = running && verifyActivation(config, paths, previousSha, targetDir, c).ok;
