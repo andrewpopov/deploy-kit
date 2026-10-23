@@ -109,6 +109,7 @@ text or redirection filenames.
 | `ssh.batchMode` | `string \| null` | `'yes'` | ssh | unreleased | `-o BatchMode`; `null` omits. Turns any remaining ssh prompt into a fast failure instead of hanging an unattended deploy. |
 | `stepTimeoutSeconds` | `number \| null` | `1800` | both | 0.5 | Per-command wall-clock timeout; explicit `null` = no limit. |
 | `lock` | `boolean` | `true` | both | 0.5 | Take an atomic target lock so concurrent deploys can't interleave. |
+| `transitionAuthority` | `{ command, scope, timeoutSeconds? } \| null` | `null` | release | 0.32 | Opt-in trusted operator command that authorizes release-layout v1 transitions; `scope` is an opaque host-owned string, `timeoutSeconds` an integer 1..300 (default 30). `null` = off. See [Transition authority](#transition-authority-opt-in-fencing). |
 | `localShell` | `string \| null` | `null` | local | unreleased | Absolute path of the shell `mode:'local'` commands run under (default `sh`). `deploy --on-host` sets it to the ssh login shell captured from the host, so hooks run under the shell they would over ssh. |
 | `onHost.env` | `string[]` | `[]` | ssh | unreleased | `deploy --on-host` only: names of environment variables to capture from the host's ssh environment and forward to the unit. Names must match `^[A-Z_][A-Z0-9_]*$`; `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `PM2_HOME`, `XDG_RUNTIME_DIR`, `NODE_OPTIONS` and `INVOCATION_ID` are refused (deploy-kit sets them itself). |
 | `buildBeforeMigrate` | `boolean` | `false` | both | 0.2 | Build while apps are UP (paused window = just migration). |
@@ -118,7 +119,7 @@ text or redirection filenames.
 | `hooks.generate` | `string \| null` | `null` | both | unreleased | Codegen that writes into `node_modules` (e.g. `npx prisma generate`). Runs unconditionally right after install, before build. Keep this OUT of `hooks.build`: a build tool's own cache (Nx/Turbo) can replay a cache hit and skip the build command entirely, silently skipping a generator baked into it while `npm ci` has already wiped what it was supposed to regenerate. `null` = skip. |
 | `hooks.backup` | `string \| null` | `null` | both | 0.1 | Pre-migration backup **gate** — a failure aborts before any schema change, and the tail (last 40 lines) of the hook's stderr and stdout is printed to the deploy log first (Discord webhook URLs redacted); the same applies to the `hooks.pendingMigrations` probe. Preferred output contract: JSON on stdout with a top-level `backupId` (db-backup >= 0.18.0 emits this). Legacy fallbacks remain supported: `id`, `created.fullPath`, `created.fileName`, or a safe final-line id/path. The parsed id is correlated to `deliveryEvent` as a leaf-only `backupReference`; if nothing parses, deploy-kit logs a loud warning (restore correlation unavailable) but never fails the deploy over it. |
 | `hooks.migrate` | `string \| null` | `null` | both | 0.1 | Migration command; runs with `dbBoundApps` paused. |
-| `hooks.pendingMigrations` | `string \| null` | `null` | release | unreleased | Read-only probe that lets a no-op migration skip `hooks.migrate`, so a later failure rolls code back without a DB restore. Runs in the candidate release after the backup, with writers stopped, right before `migrate`. Exit `0` and a last non-empty stdout line that is exactly a base-10 integer (the pending count); only a count of exactly `0` skips `migrate`. Anything else runs it as usual. Ignored under the legacy layout (`loadConfig` warns); skipped with `--skip-migrate`. Must be a non-empty command. See [Skipping a no-op migration](#skipping-a-no-op-migration). |
+| `hooks.pendingMigrations` | `string \| null` | `null` | release | unreleased | Read-only probe that lets a no-op migration skip `hooks.migrate`, so a later failure rolls code back without a DB restore. Runs in the candidate release after the backup, with writers stopped, right before `migrate`. Exit `0` and a last non-empty stdout line that is exactly a base-10 integer (the pending count); only a count of exactly `0` skips `migrate`. Anything else runs it as usual (unconfigured: an invalid or failing probe falls back to `migrate`; with `transitionAuthority` configured, a non-zero exit is a protected hook-running failure handled as manual recovery, with no stopped auto-recovery). Ignored under the legacy layout (`loadConfig` warns); skipped with `--skip-migrate`. Must be a non-empty command. See [Skipping a no-op migration](#skipping-a-no-op-migration). |
 | `hooks.build` | `string \| null` | `null` | both | 0.1 | Build command. |
 | `hooks.restart` | `string \| null` | `null` | both | 0.3 | Override the app (re)start command. `null` → the `ecosystemFile`-aware start-or-restart idiom. |
 | `hooks.restore` | `string \| null` | `null` | both | 0.7 | Restore the pre-migration DB backup during release-layout recovery (gets `DEPLOY_KIT_BACKUP_ID`). `null` = no auto-restore. |
@@ -275,7 +276,8 @@ step list shows `migrate-skipped`. A recovery then flips `current` back and
 resumes the previous release with **no** DB restore. A count above `0` runs
 `hooks.migrate` as today. A non-zero exit, a timeout (`stepTimeoutSeconds`), empty
 or malformed output all count as unknown: deploy-kit warns, journals
-`migrated: true` first, and runs `hooks.migrate`. `--dry-run` never runs the probe
+`migrated: true` first, and runs `hooks.migrate` (unless `transitionAuthority` is
+configured and the probe exits non-zero; see below). `--dry-run` never runs the probe
 and plans the migrate step.
 
 **What `0` must mean.** deploy-kit cannot check this, so the probe has to:
@@ -382,6 +384,45 @@ values. Config validation still runs before planning and fails by the exact inva
 field. Use a real deploy or an explicit live diagnostic when host truth is required;
 the dry-run is an executable-plan review, not a host health check (unreleased,
 CAIRN-369).
+
+### Transition authority (opt-in fencing)
+
+Set `transitionAuthority: { command, scope, timeoutSeconds? }` to make a
+release-layout deploy or rollback ask a trusted operator command before each
+mutating transition. `command` is yours; `scope` is an opaque host-owned string;
+`timeoutSeconds` is an integer 1..300 (default 30). deploy-kit writes one JSON
+request to the command's stdin and requires a JSON ACK with digest, receipt and
+operation IDs; see `TransitionAuthorityConfig`, `TransitionRequest` and
+`TransitionAck` in `src/index.d.ts` for the field list. Begin is acknowledged as
+AUTHORIZED; run persists MUTATING before effects. Completion requires exact
+40-character SHA verification and an acknowledged complete request. Each request
+declares its effects conservatively. Recovery operations use fresh IDs and link
+to the failed parent operation. A pending RPC
+is reconciled by a send that ends the invocation. Interrupted recovery runs only
+for a strictly versioned, matching `stopped` state with the actual previous full
+SHA, and ends the invocation (it is not a new deploy success). Saved interrupted
+migrated, flipped, post-hook and manual states require manual assessment; this
+does not disable fenced rollback during a still-running failed deployment.
+
+Your host adapter MUST supply external lifetime exclusion, idempotent exact
+request replay and conflict detection, current-head checks, and non-restored
+authority, issuer, repository and environment binding wherever you require them.
+The package client does NOT implement a production signer, head authority or a
+Done authorization; keys, custody and app policy stay outside the package. The
+runtime lock TTL alone is not lifetime exclusion. The adapter must remain usable
+when the consuming application API is unavailable during rollback.
+
+Supported: release-layout v1 `deploy` and `rollback`, local and SSH. Legacy and
+remote-specific mutators reject early when configured; `lock: false` and lock
+steal are forbidden. Unconfigured behaviour is unchanged. `--dry-run` plans
+without real authority effects and is not proof of authorization.
+
+State lives in `.deploy-kit-transition-journal.json` and the versioned, protected
+`.deploy-kit-state.json`, written with file fsync, rename and parent-directory
+fsync before ACK. Never delete or edit journals to clear uncertainty. Assess old
+or unversioned phase state by hand before first activation; there is no automatic
+migration. With a protected `hooks.backup` or probe, the hook-running phase is
+retained before execution; an uncertain phase write fails closed without recovery.
 
 ### `port-guard` (shared-host port-conflict guard)
 

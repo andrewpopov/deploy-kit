@@ -306,3 +306,53 @@ describe('config validation: nested key allowlisting (PKG-135 Finding 6)', () =>
     expect(problems).toEqual([]);
   });
 });
+
+describe('config validation: transitionAuthority (PKG-266)', () => {
+  const ok = { command: 'authority-cli', scope: 'app-prod' };
+  const problemsFor = (transitionAuthority: unknown) => validateConfig({ transitionAuthority }).join('\n');
+
+  it('defaults to null and absence/null are valid', () => {
+    expect(DEFAULT_CONFIG.transitionAuthority).toBeNull();
+    expect(validateConfig({})).toEqual([]);
+    expect(validateConfig({ transitionAuthority: null })).toEqual([]);
+  });
+
+  it.each([undefined, 1, 30, 300])('accepts timeoutSeconds %s (omitted or 1..300)', (t) => {
+    const block = t === undefined ? ok : { ...ok, timeoutSeconds: t };
+    expect(validateConfig({ transitionAuthority: block })).toEqual([]);
+  });
+
+  it.each([
+    ['command empty', { ...ok, command: '' }, /transitionAuthority\.command/],
+    ['command too long', { ...ok, command: 'x'.repeat(4097) }, /transitionAuthority\.command/],
+    ['command control char', { ...ok, command: 'a\nb' }, /transitionAuthority\.command/],
+    ['command not string', { ...ok, command: 1 }, /transitionAuthority\.command/],
+    ['scope empty', { ...ok, scope: '' }, /transitionAuthority\.scope/],
+    ['scope too long', { ...ok, scope: 's'.repeat(257) }, /transitionAuthority\.scope/],
+    ['scope control char', { ...ok, scope: 's\u0000' }, /transitionAuthority\.scope/],
+    ['command missing', { scope: 'app-prod' }, /transitionAuthority\.command/],
+    ['scope missing', { command: 'x' }, /transitionAuthority\.scope/],
+    ['timeout 0', { ...ok, timeoutSeconds: 0 }, /timeoutSeconds/],
+    ['timeout 301', { ...ok, timeoutSeconds: 301 }, /timeoutSeconds/],
+    ['timeout fraction', { ...ok, timeoutSeconds: 1.5 }, /timeoutSeconds/],
+    ['timeout string', { ...ok, timeoutSeconds: '30' }, /timeoutSeconds/],
+    ['timeout explicit undefined', { ...ok, timeoutSeconds: undefined }, /timeoutSeconds/],
+    ['unknown key', { ...ok, extra: 1 }, /unknown transitionAuthority key "extra"/],
+  ])('rejects %s', (_name, block, pattern) => {
+    expect(problemsFor(block)).toMatch(pattern);
+  });
+
+  it.each([false, [], 'cmd', 1])('rejects non-object %j', (bad) => {
+    expect(problemsFor(bad)).toMatch(/"transitionAuthority" must be object or null/);
+  });
+
+  it('does not echo the configured command value', () => {
+    expect(problemsFor({ ...ok, command: 'secret-token\n', timeoutSeconds: 0 })).not.toMatch(/secret-token/);
+  });
+
+  it('mergeConfig preserves configured fields and the null default', () => {
+    const block = { ...ok, timeoutSeconds: 5 };
+    expect(kit.mergeConfig(DEFAULT_CONFIG, { transitionAuthority: block }).transitionAuthority).toEqual(block);
+    expect(kit.mergeConfig(DEFAULT_CONFIG, { hooks: { build: 'x' } }).transitionAuthority).toBeNull();
+  });
+});

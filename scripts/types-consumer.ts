@@ -26,6 +26,9 @@ import {
   type RollbackResult,
   type HealthCheck,
   type SshOptions,
+  type TransitionAck,
+  type TransitionAuthorityConfig,
+  type TransitionRequest,
 } from '../src/index';
 
 // Config loads and merges with a typed partial override.
@@ -64,8 +67,22 @@ const apps: string[] = remote.allApps(config);
 const scaffold = init({ cwd: '/srv/app' });
 const tunnel = startTunnel({ configPath: '/etc/cf.yml', tunnelName: 't' });
 
+// Transition authority wire contract (types only).
+const transitionAuthority: TransitionAuthorityConfig = { command: 'authority-cli', scope: 'app-prod', timeoutSeconds: 30 };
+const transitionBegin: TransitionRequest = {
+  action: 'begin', protocolVersion: 1, scope: 'app-prod', operationId: 'e37348d1-73ec-4e50-9cf0-5e297811cf82', parentOperationId: null,
+  targetSha: 'a'.repeat(40), targetRelease: 'r1', priorPointer: null, kind: 'deploy',
+  effects: { stop: true, migrate: false, pointerSwap: true, restart: true, databaseRestore: false },
+};
+const transitionAck: TransitionAck = {
+  action: 'begin', state: 'AUTHORIZED', protocolVersion: 1, scope: 'app-prod', operationId: 'e37348d1-73ec-4e50-9cf0-5e297811cf82',
+  requestDigest: 'c'.repeat(64), receipt: 'rc',
+};
+const transitionConfig: DeployConfig = { ...merged, transitionAuthority };
+
 // Reference the values so tsc doesn't prune the imports as unused.
 export const _contract = {
   config, merged, problems, result, rb, probe, sshArgs, file, args, ran,
   healthy, apps, scaffold, tunnel, removed: REMOVED_KEYS,
+  transitionBegin, transitionAck, transitionConfig,
 };

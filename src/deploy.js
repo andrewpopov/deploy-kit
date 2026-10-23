@@ -18,6 +18,7 @@ const {
   assertVerifiedRefOptions, verifiedRefLabel, resolveVerifiedTip, assertContainedInVerified,
 } = require('./verified-ref');
 const { writeLastDeployRecord } = require('./last-deploy');
+const { assertTransitionAuthorityEntryPoint } = require('./transition-authority');
 
 function defaultSleep(seconds) {
   const ms = seconds * 1000;
@@ -159,6 +160,7 @@ function gate(step, config, ctx, { onFail, capture = false } = {}) {
 //   install → BACKUP(gate) → stop db-bound apps (release SQLite lock) →
 //   migrate(gate, restart on fail) → build → restart apps → health(gate)
 function deploy(config, options = {}, ctx = {}) {
+  assertTransitionAuthorityEntryPoint(config, { supported: config.layout?.type === 'releases', options });
   // `--sha`'s format and its exclusivity with `--branch` -- checked here,
   // before ANYTHING else (including the release-layout delegation below),
   // because `deploy()` is itself an exported, programmatic entry point: the
@@ -886,6 +888,7 @@ function deploy(config, options = {}, ctx = {}) {
 // touched — we print the matching `db-backup restore` command instead of
 // auto-restoring, since a schema rollback is the operator's call.
 function rollback(config, options = {}, ctx = {}) {
+  assertTransitionAuthorityEntryPoint(config, { supported: config.layout?.type === 'releases', options });
   // Release-layout rollback is a symlink flip to the previous release, not a git
   // reset — a different pipeline. Legacy rollback must refuse a release-layout host.
   if (config.layout && config.layout.type === 'releases') {

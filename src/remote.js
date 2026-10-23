@@ -2,6 +2,7 @@
 
 const { runOnTarget, buildHealthCommand } = require('./exec');
 const { log: defaultLog } = require('./log');
+const { assertTransitionAuthorityEntryPoint } = require('./transition-authority');
 
 // Config-driven remote ops, generalized from bewks scripts/tools/remote-agent.js.
 // Uses PM2 app names directly (not `npm run pm2:*`) so it works without the app
@@ -41,6 +42,7 @@ function logs(config, options = {}, ctx = {}) {
 }
 
 function lifecycle(action, config, ctx = {}) {
+  assertTransitionAuthorityEntryPoint(config);
   const log = ctx.log || defaultLog;
   const apps = config.appNames.join(' ');
   if (!apps) {
