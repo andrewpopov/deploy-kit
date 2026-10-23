@@ -18,18 +18,26 @@ const ORIG_DIR = 'releases/00000000aaaa-20260709T090000Z';
 const PREV_DIR = 'releases/00000000bbbb-20260708T090000Z';
 const ORIG_FULL = `0123456789ab${'c'.repeat(28)}`;
 const PREV_FULL = `fedcba987654${'d'.repeat(28)}`;
-const SHA_OF: Record<string, string> = { [ORIG_DIR]: ORIG_FULL, [PREV_DIR]: PREV_FULL };
+const CAND_DIR = 'releases/a1b2c3d4e5f6-20260710T090000Z'; // the forward candidate (fixed `date -u` timestamp), full SHA = SHA
+const SHA_OF: Record<string, string> = { [ORIG_DIR]: ORIG_FULL, [PREV_DIR]: PREV_FULL, [CAND_DIR]: SHA };
 
 // What execFileSync throws for a failed command: the child's stdout is still attached to the error.
 const execFailure = (stdout: string) => Object.assign(new Error('Command failed'), { stdout, status: 1 });
 
-interface RollbackOpts { flipFails?: (relTarget: string) => boolean; checkFails?: boolean; headFails?: (relDir: string) => boolean }
+interface RollbackOpts {
+  flipFails?: (relTarget: string, dest: string) => boolean; checkFails?: boolean; headFails?: (relDir: string) => boolean;
+  probeSha?: (call: number) => string | undefined; // override the running-SHA answer for one probe call
+}
 
-// Observable rollback host state: release SHA map, current/previous pointers, the running process pointer.
+// Observable host state (forward candidate and manual rollback alike): release SHA map, current/previous
+// pointers, the running process pointer and whether PM2 reports the apps online.
 function makeRollbackHost(opts: RollbackOpts = {}) {
-  const s: { current: string; previous: string; running: string; flips: string[]; restarts: number; headReads: Array<{ dir: string; sha: string }>; probeCalls: number } = {
-    current: ORIG_DIR, previous: PREV_DIR, running: ORIG_DIR,
-    flips: [], restarts: 0, headReads: [], probeCalls: 0,
+  const s: {
+    current: string; previous: string; running: string; online: boolean; flips: string[]; previousFlips: string[]; restarts: number;
+    headReads: Array<{ dir: string; sha: string }>; probeCalls: number;
+  } = {
+    current: ORIG_DIR, previous: PREV_DIR, running: ORIG_DIR, online: true,
+    flips: [], previousFlips: [], restarts: 0, headReads: [], probeCalls: 0,
   };
   const handle = (full: string): string | undefined => {
     const [, cwd = '', cmd = full] = /^cd (\S+) && ([\s\S]*)$/.exec(full) ?? [];
@@ -42,18 +50,21 @@ function makeRollbackHost(opts: RollbackOpts = {}) {
     }
     const flip = /^ln -s (\S+) \S+ && mv -Tf \S+ (\S+)$/.exec(cmd);
     if (flip) {
-      s.flips.push(flip[1]);
-      if (opts.flipFails?.(flip[1])) throw execFailure('');
-      if (flip[2].endsWith('/current')) s.current = flip[1];
+      const isCurrent = flip[2].endsWith('/current');
+      (isCurrent ? s.flips : s.previousFlips).push(flip[1]);
+      if (opts.flipFails?.(flip[1], flip[2])) throw execFailure('');
+      if (isCurrent) s.current = flip[1]; else s.previous = flip[1];
       return '';
     }
     if (cmd.includes('pre-restart-smoke')) { if (opts.checkFails) throw execFailure(''); return ''; }
-    if (/pm2 startOrRestart/.test(cmd)) { s.restarts += 1; s.running = s.current; return ''; }
+    if (/pm2 stop /.test(cmd)) { s.online = false; return ''; }
+    if (/pm2 startOrRestart/.test(cmd)) { s.restarts += 1; s.running = s.current; s.online = true; return ''; }
+    if (cmd.includes('pm2 jlist')) return JSON.stringify([{ name: 'app', pid: 111, pm2_env: { status: s.online ? 'online' : 'stopped', restart_time: 5 } }]);
     if (cmd.startsWith('readlink /srv/app/current')) return s.current;
     if (cmd.startsWith('readlink /srv/app/previous')) return s.previous;
     if (/^readlink -f \/srv\/app\/releases\//.test(cmd)) return cmd.slice('readlink -f '.length);
     if (cmd.includes('readlink -f /proc/111/cwd')) return `/srv/app/${s.running}`;
-    if (cmd.includes('get-running-sha')) { s.probeCalls += 1; return SHA_OF[s.running]; }
+    if (cmd.includes('get-running-sha')) { s.probeCalls += 1; return opts.probeSha?.(s.probeCalls) ?? SHA_OF[s.running]; }
     return undefined;
   };
   return { s, handle };
@@ -82,7 +93,7 @@ function makeStorage(events: string[]) {
 }
 
 // Fake authority transport recording exact request bytes; the digest is computed from those bytes.
-function makeAuthority(events: string[], fails: (action: string, count: number) => boolean = () => false) {
+function makeAuthority(events: string[], fails: (action: string, count: number) => boolean = () => false, after: (action: string, count: number) => void = () => {}) {
   const requests: string[] = [];
   const actions: string[] = [];
   const terminal: Record<string, string> = { begin: 'AUTHORIZED', complete: 'COMPLETED', abandon: 'ABANDONED' };
@@ -94,7 +105,9 @@ function makeAuthority(events: string[], fails: (action: string, count: number) 
       requests.push(bytes);
       actions.push(action);
       events.push(`send:${action}`);
-      if (fails(action, actions.filter((a) => a === action).length)) throw new Error('timeout');
+      const count = actions.filter((a) => a === action).length;
+      if (fails(action, count)) throw new Error('timeout');
+      after(action, count);
       return { planned: false, operationId: request.operationId, requestDigest: sha256(bytes), receipt: 'receipt-1', state: terminal[action] };
     },
   };
@@ -102,17 +115,19 @@ function makeAuthority(events: string[], fails: (action: string, count: number) 
 
 // Content-aware target: answers the real preflight/lock/git/pm2 commands and keeps the phase journal the
 // way the host would, by parsing what persistState's atomic shell command writes and replaying it on read.
-function makeTarget(events: string[], over: { builtSha?: string; stateRead?: StateRead; shaProbe?: (call: number) => string; headFails?: boolean; rb?: ReturnType<typeof makeRollbackHost> } = {}) {
-  const t: { stateText: string | null; lastDeploy: string | null; shaCalls: number; stopped: boolean; stateWrites: string[] } = { stateText: null, lastDeploy: null, shaCalls: 0, stopped: false, stateWrites: [] };
+function makeTarget(events: string[], over: { builtSha?: string; stateRead?: StateRead; shaProbe?: (call: number) => string; headFails?: boolean; rb?: ReturnType<typeof makeRollbackHost>; onCommand?: (cmd: string) => void } = {}) {
+  const t: { stateText: string | null; lastDeploy: string | null; shaCalls: number; stopped: boolean; stateWrites: string[]; deliveries: string[] } = { stateText: null, lastDeploy: null, shaCalls: 0, stopped: false, stateWrites: [], deliveries: [] };
   const tags: Array<[RegExp, string]> = [
     [/pre-hook/, 'pre-hook'], [/npm ci/, 'install'], [/npm run build/, 'build'], [/pm2 stop/, 'stop'],
     [/run-backup/, 'backup'], [/run-migrate/, 'migrate'], [/mv -Tf/, 'flip'], [/pm2 (startOrRestart|start|restart)/, 'restart'],
     [/pre-restart-smoke/, 'check'], [/run-restore/, 'restore'],
   ];
-  const execFileSync = (_file: string, args: string[]) => {
+  const execFileSync = (_file: string, args: string[], options?: { input?: string }) => {
     const cmd = args[args.length - 1];
     const tag = tags.find(([re]) => re.test(cmd));
     if (tag) events.push(`target:${tag[1]}`);
+    if (cmd.includes('deliver-hook')) t.deliveries.push(String(options?.input));
+    over.onCommand?.(cmd);
     const modelled = over.rb?.handle(cmd);
     if (modelled !== undefined) return modelled;
     if (over.headFails && cmd.startsWith('cd /srv/app/releases/') && cmd.endsWith('git rev-parse HEAD')) throw execFailure(over.builtSha ?? SHA);
@@ -153,9 +168,14 @@ function makeTarget(events: string[], over: { builtSha?: string; stateRead?: Sta
   return { t, execFileSync };
 }
 
-interface ConfigOver { preRestartChecks?: Array<{ name: string; command: string }>; layout?: Record<string, unknown> }
+interface ConfigOver {
+  preRestartChecks?: Array<{ name: string; command: string }>; layout?: Record<string, unknown>;
+  postDeployChecks?: Array<{ name: string; command: string; onFailure: string }>; deliveryEvent?: boolean;
+}
 const relConfig = (over: ConfigOver = {}) => mergeConfig(DEFAULT_CONFIG, {
   ...(over.preRestartChecks ? { preRestartChecks: over.preRestartChecks } : {}),
+  ...(over.postDeployChecks ? { postDeployChecks: over.postDeployChecks } : {}),
+  ...(over.deliveryEvent ? { deliveryEvent: { command: 'deliver-hook' } } : {}),
   host: 'app@pi', projectDir: '/srv/app', appNames: ['app'], dbBoundApps: ['app'], branch: 'master', autoCut: false,
   ecosystemFile: 'shared/ecosystem.config.cjs', health: { attempts: 2, delaySeconds: 0 },
   hooks: { install: 'npm ci', build: 'npm run build', backup: 'run-backup', migrate: 'run-migrate', restore: 'run-restore' },
@@ -165,10 +185,10 @@ const relConfig = (over: ConfigOver = {}) => mergeConfig(DEFAULT_CONFIG, {
 });
 
 // One host: durable storage + journal state survive across invocations, as the real host's files would.
-function makeHost(opts: { authorityFails?: (action: string, count: number) => boolean; config?: ConfigOver } = {}) {
+function makeHost(opts: { authorityFails?: (action: string, count: number) => boolean; afterSend?: (action: string, count: number) => void; config?: ConfigOver } = {}) {
   const events: string[] = [];
   const durable = makeStorage(events);
-  const authority = makeAuthority(events, opts.authorityFails);
+  const authority = makeAuthority(events, opts.authorityFails, opts.afterSend);
   let uuids = 0;
   const uuid = () => `00000000-0000-4000-8000-${String(++uuids).padStart(12, '0')}`;
   const ctxFor = (target: ReturnType<typeof makeTarget>) => ({
@@ -323,6 +343,130 @@ describe('protected forward release completion', () => {
     expect(() => host.rollback(makeTarget(host.events, { rb: makeRollbackHost() }))).toThrow(/running SHA command/);
     expect(host.authority.actions).toEqual([]);
     expect(host.durable.store.writes).toBe(0);
+  });
+});
+
+describe('protected forward automatic recovery', () => {
+  const failing = (...patterns: string[]) => (cmd: string) => { if (patterns.some((p) => cmd.includes(p))) throw execFailure(''); };
+  const forward = (opts: Parameters<typeof makeHost>[0] = {}, rbOpts: RollbackOpts = {}, onCommand?: (cmd: string) => void) => {
+    const host = makeHost(opts);
+    const rb = makeRollbackHost(rbOpts);
+    return { host, rb, target: makeTarget(host.events, { rb, onCommand }) };
+  };
+  const requestsOf = (host: ReturnType<typeof makeHost>) => host.authority.requests.map((r) => JSON.parse(r));
+  const phases = (target: ReturnType<typeof makeTarget>) => target.t.stateWrites.map((w) => (JSON.parse(w) as Phase).phase);
+  const fence = (events: string[]) => events.filter((e) => /^(send:|storage:MUTATING|target:(flip|check|restore|restart))/.test(e));
+  const withCheck: ConfigOver = { preRestartChecks: [{ name: 'smoke', command: 'pre-restart-smoke' }] };
+
+  it('SAFE_PHASE_FRESH_CHILD: a failed backup after stop abandons UNKNOWN, then a fresh fenced child resumes the original SHA', () => {
+    const { host, rb, target } = forward({}, {}, failing('run-backup'));
+    expect(() => host.deploy(target)).toThrow(/recovered/);
+    expect(host.authority.actions).toEqual(['begin', 'abandon', 'begin', 'complete']);
+    const [deploy, abandon, recovery, complete] = requestsOf(host);
+    expect(deploy).toMatchObject({ kind: 'deploy', targetSha: SHA, targetRelease: CAND_DIR, priorPointer: ORIG_DIR });
+    expect(abandon).toMatchObject({ operationId: deploy.operationId, reason: 'UNKNOWN' });
+    expect(recovery).toMatchObject({ kind: 'automatic-recovery', parentOperationId: deploy.operationId, targetSha: ORIG_FULL, targetRelease: ORIG_DIR, priorPointer: ORIG_DIR });
+    expect(recovery.operationId).not.toBe(deploy.operationId);
+    expect(complete.operationId).toBe(recovery.operationId);
+    expect(host.authority.requests[3]).toContain(ORIG_FULL);
+    expect(host.journal().operations.map((o) => o.state)).toEqual(['ABANDONED', 'COMPLETED']);
+    expect(fence(host.events)).toEqual(['send:begin', 'storage:MUTATING', 'send:abandon', 'send:begin', 'storage:MUTATING', 'target:restart', 'send:complete']);
+    expect(phases(target).slice(phases(target).indexOf('stopped'))).toEqual(['stopped', 'forward-recovery', 'recovered']);
+    expect(phaseOf(target)).toMatchObject({ phase: 'recovered', operationId: recovery.operationId, targetSha: ORIG_FULL, sha: ORIG_FULL });
+    expect(rb.s).toMatchObject({ current: ORIG_DIR, running: ORIG_DIR, online: true, restarts: 1, probeCalls: 1 });
+    expect(target.t.lastDeploy).toBeNull();
+  });
+
+  it('ABANDON_REFUSAL_ZERO_RECOVERY: an unacknowledged forward abandon starts no recovery and keeps the pending journal', () => {
+    const { host, rb, target } = forward({ authorityFails: (action) => action === 'abandon' }, {}, failing('run-backup'));
+    expect(() => host.deploy(target)).toThrow(/abandon was not acknowledged/);
+    expect(host.authority.actions).toEqual(['begin', 'abandon']);
+    expect(host.journal().operations).toHaveLength(1);
+    expect(['ABANDONED', 'COMPLETED']).not.toContain(host.journal().operations[0].state);
+    expect(phaseOf(target).phase).toBe('stopped');
+    expect(host.runtimeEvents()).not.toContain('target:restart');
+    expect(host.runtimeEvents()).not.toContain('target:restore');
+    expect(rb.s).toMatchObject({ restarts: 0, online: false });
+  });
+
+  it.each<[string, RollbackOpts, string[]]>([
+    ['restore failure', {}, ['run-restore']],
+    ['flip-back failure', { flipFails: (rel, dest) => rel === ORIG_DIR && dest.endsWith('/current') }, []],
+  ])('RESTORE_OR_FLIP_FAILURE_NO_RESTART: %s after migrate+flip abandons the recovery UNKNOWN and never restarts PM2', (name, rbOpts, failCommands) => {
+    const { host, rb, target } = forward({ config: withCheck }, { ...rbOpts, checkFails: true }, failing(...failCommands));
+    expect(() => host.deploy(target)).toThrow(/abandoned UNKNOWN/);
+    expect(host.authority.actions).toEqual(['begin', 'abandon', 'begin', 'abandon']);
+    const [deploy, , recovery, abandon] = requestsOf(host);
+    expect(recovery).toMatchObject({ kind: 'automatic-recovery', parentOperationId: deploy.operationId, targetSha: ORIG_FULL });
+    expect(abandon).toMatchObject({ operationId: recovery.operationId, reason: 'UNKNOWN' });
+    expect(host.runtimeEvents()).not.toContain('target:restart');
+    // The ordinary previous-pointer metadata flip (dest previous) succeeded; only the current flip-back may fail.
+    expect(rb.s).toMatchObject({ restarts: 0, online: false, previous: ORIG_DIR, previousFlips: [ORIG_DIR], flips: [CAND_DIR, ORIG_DIR] });
+    expect(rb.s.current, name).toBe(failCommands.length ? ORIG_DIR : CAND_DIR);
+    expect(host.events.includes('target:restore')).toBe(true);
+  });
+
+  it('RESTART_SETTLES_PARENT: a crash after the first recovery settles makes the restart child re-check actual state and start again', () => {
+    const rb = makeRollbackHost({ probeSha: (call) => (call <= 4 ? OTHER_SHA : undefined) }); // forward verify + first resume lie
+    const host = makeHost({ afterSend: (action, count) => { if (action === 'abandon' && count === 2) rb.s.online = false; } });
+    const target = makeTarget(host.events, { rb });
+    expect(() => host.deploy(target)).toThrow(/recovered/);
+    expect(host.authority.actions).toEqual(['begin', 'abandon', 'begin', 'abandon', 'begin', 'complete']);
+    const [deploy, , first, firstAbandon, restart, complete] = requestsOf(host);
+    expect(first).toMatchObject({ kind: 'automatic-recovery', parentOperationId: deploy.operationId, targetSha: ORIG_FULL });
+    expect(firstAbandon).toMatchObject({ operationId: first.operationId, reason: 'UNKNOWN' });
+    expect(restart).toMatchObject({ kind: 'recovery-restart', parentOperationId: first.operationId, targetSha: ORIG_FULL, targetRelease: ORIG_DIR });
+    expect(new Set([deploy.operationId, first.operationId, restart.operationId]).size).toBe(3);
+    expect(complete.operationId).toBe(restart.operationId);
+    expect(host.authority.requests[5]).toContain(ORIG_FULL);
+    expect(host.journal().operations.map((o) => o.state)).toEqual(['ABANDONED', 'ABANDONED', 'COMPLETED']);
+    expect(rb.s).toMatchObject({ current: ORIG_DIR, running: ORIG_DIR, online: true, restarts: 3 }); // forward, first resume, restart child
+    expect(phaseOf(target)).toMatchObject({ phase: 'recovered', operationId: restart.operationId, targetSha: ORIG_FULL });
+    expect(target.t.lastDeploy).toBeNull();
+  });
+
+  it.each([['remain-active', 'degraded', 'post-deploy-degraded', 'remained-active'], ['manual', 'failed', 'post-deploy-manual-decision', 'manual-decision-required']])(
+    'FAILED_POLICY_NEVER_COMPLETE: %s leaves the candidate active under a fenced report child that abandons FAILED',
+    (policy, status, phase, outcome) => {
+      const postDeployChecks = [{ name: 'smoke-post', command: 'post-check-fail', onFailure: policy }];
+      const { host, target } = forward({ config: { postDeployChecks, deliveryEvent: true } }, {}, failing('post-check-fail'));
+      expect(() => host.deploy(target)).toThrow(/manual review required/);
+      expect(host.authority.actions).toEqual(['begin', 'abandon', 'begin', 'abandon']);
+      const [deploy, , report, abandon] = requestsOf(host);
+      expect(report).toMatchObject({ kind: 'automatic-recovery', parentOperationId: deploy.operationId, targetSha: SHA, targetRelease: CAND_DIR });
+      expect(abandon).toMatchObject({ operationId: report.operationId, reason: 'FAILED' });
+      expect(host.journal().operations.map((o) => o.state)).toEqual(['ABANDONED', 'ABANDONED']);
+      expect(target.t.deliveries.map((d) => JSON.parse(d))).toMatchObject([{ status, failedCheck: 'smoke-post', activeRelease: CAND_DIR, recovery: { policy, outcome, verified: false } }]);
+      expect(phaseOf(target)).toMatchObject({ phase, operationId: report.operationId, targetSha: SHA });
+      expect(target.t.lastDeploy).toBeNull();
+    },
+  );
+
+  it('FINALIZATION_ERROR_NO_RECOVER: a lost recovery complete ACK stays COMPLETE_PENDING with no further abandon, begin or restart', () => {
+    const { host, rb, target } = forward({ authorityFails: (action) => action === 'complete' }, {}, failing('run-backup'));
+    expect(() => host.deploy(target)).toThrow(/outcome is uncertain/);
+    expect(host.authority.actions).toEqual(['begin', 'abandon', 'begin', 'complete']);
+    expect(host.journal().operations.map((o) => o.state)).toEqual(['ABANDONED', 'COMPLETE_PENDING']);
+    expect(phaseOf(target).phase).toBe('forward-recovery');
+    expect(rb.s.restarts).toBe(1);
+  });
+
+  it('DIAGNOSTIC_EVENT_NOT_FINAL_VERIFICATION: a delivery hook that takes the apps offline cannot yield a verified or complete recovery', () => {
+    const rb = makeRollbackHost();
+    const host = makeHost({ config: { postDeployChecks: [{ name: 'smoke-post', command: 'post-check-fail', onFailure: 'rollback' }], deliveryEvent: true } });
+    const target = makeTarget(host.events, { rb, onCommand: (cmd) => {
+      if (cmd.includes('post-check-fail')) throw execFailure('');
+      if (cmd.includes('deliver-hook')) rb.s.online = false;
+    } });
+    expect(() => host.deploy(target)).toThrow(/recovery did not verify/);
+    expect(host.authority.actions).toEqual(['begin', 'abandon', 'begin', 'abandon']);
+    expect(requestsOf(host)[3]).toMatchObject({ reason: 'FAILED' });
+    const payloads = target.t.deliveries.map((d) => JSON.parse(d));
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]).toMatchObject({ status: 'failed', recovery: { outcome: 'rolled-back', verified: false } });
+    expect(phaseOf(target)).toMatchObject({ phase: 'post-deploy-rollback-failed', recoveryOutcome: 'rollback-failed-not-started' });
+    expect(rb.s).toMatchObject({ online: false, restarts: 2 });
+    expect(target.t.lastDeploy).toBeNull();
   });
 });
 
