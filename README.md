@@ -109,7 +109,7 @@ text or redirection filenames.
 | `ssh.batchMode` | `string \| null` | `'yes'` | ssh | unreleased | `-o BatchMode`; `null` omits. Turns any remaining ssh prompt into a fast failure instead of hanging an unattended deploy. |
 | `stepTimeoutSeconds` | `number \| null` | `1800` | both | 0.5 | Per-command wall-clock timeout; explicit `null` = no limit. |
 | `lock` | `boolean` | `true` | both | 0.5 | Take an atomic target lock so concurrent deploys can't interleave. |
-| `transitionAuthority` | `{ command, scope, timeoutSeconds? } \| null` | `null` | release | unreleased | Opt-in trusted operator command that authorizes release-layout v1 transitions; `scope` is an opaque host-owned string, `timeoutSeconds` an integer 1..300 (default 30). `null` = off. See [Transition authority](#transition-authority-opt-in-fencing). |
+| `transitionAuthority` | `{ command, scope, timeoutSeconds? } \| null` | `null` | release | 0.32 | Opt-in trusted operator command that authorizes release-layout v1 transitions; `scope` is an opaque host-owned string, `timeoutSeconds` an integer 1..300 (default 30). `null` = off. See [Transition authority](#transition-authority-opt-in-fencing). |
 | `localShell` | `string \| null` | `null` | local | unreleased | Absolute path of the shell `mode:'local'` commands run under (default `sh`). `deploy --on-host` sets it to the ssh login shell captured from the host, so hooks run under the shell they would over ssh. |
 | `onHost.env` | `string[]` | `[]` | ssh | unreleased | `deploy --on-host` only: names of environment variables to capture from the host's ssh environment and forward to the unit. Names must match `^[A-Z_][A-Z0-9_]*$`; `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `PM2_HOME`, `XDG_RUNTIME_DIR`, `NODE_OPTIONS` and `INVOCATION_ID` are refused (deploy-kit sets them itself). |
 | `buildBeforeMigrate` | `boolean` | `false` | both | 0.2 | Build while apps are UP (paused window = just migration). |
@@ -387,7 +387,7 @@ CAIRN-369).
 
 ### Transition authority (opt-in fencing)
 
-Unreleased. Set `transitionAuthority: { command, scope, timeoutSeconds? }` to make a
+Set `transitionAuthority: { command, scope, timeoutSeconds? }` to make a
 release-layout deploy or rollback ask a trusted operator command before each
 mutating transition. `command` is yours; `scope` is an opaque host-owned string;
 `timeoutSeconds` is an integer 1..300 (default 30). deploy-kit writes one JSON

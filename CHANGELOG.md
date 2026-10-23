@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.32.0
+
+- opt-in transition authority fences release-layout deploys and rollbacks and recovers durably from interrupted transitions
+  New `transitionAuthority: { command, scope, timeoutSeconds? }` config asks a trusted operator command to authorize each mutating release-layout v1 transition over a JSON stdin request and ACK, for local and SSH `deploy` and `rollback`. Progress is journaled in `.deploy-kit-transition-journal.json` and the protected, versioned `.deploy-kit-state.json`, so automatic, manual, interrupted and restart recovery stay fresh and parent-linked, and uncertain phase writes fail closed. Unconfigured deploys are unchanged. The host supplies lifetime exclusion, replay handling and signing; the package ships no production signer. See the README section Transition authority.
+- Update shared release notes tooling
+  Refresh the shared release notes package pins and lockfiles. Full release verification and production rollout remain with the next release candidate.
+- a failed rollback now also posts to the fleet alert webhook, and the rollback outcomes name the real release and app state
+  A failed automatic rollback now also posts one message straight to the webhook in `DISCORD_ALERT_WEBHOOK` (when set in deploy-kit's environment) through the `alert-discord` sender, so it no longer depends on an app's own release-channel sink. A send failure only warns. A rollback target counts as running only when every app is online from that release, so candidate processes that stay online no longer pass. A restored target whose apps do not start gets `rollback-failed-not-started` and names the rollback target, not the candidate. The "check failed identically on both releases" note is now also recorded when the rollback verifies cleanly and the outcome stays `rolled-back`.
+
 ## 0.31.1
 
 - a failed backup hook now prints its stderr, and deploy --on-host refuses when the user manager has stale groups
