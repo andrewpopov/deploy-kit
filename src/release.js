@@ -2115,3 +2115,6 @@ module.exports = {
   prune,
   readPointers,
 };
+
+// Shared with src/layout-migrate.js (BRAIN-636 D9) so the migration restarts and health-waits exactly as a deploy does.
+Object.assign(module.exports, { waitForHealth, pm2Activate });

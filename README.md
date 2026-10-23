@@ -405,6 +405,33 @@ field. Use a real deploy or an explicit live diagnostic when host truth is requi
 the dry-run is an executable-plan review, not a host health check (unreleased,
 CAIRN-369).
 
+### Migrating a host between layouts (`layout migrate`)
+
+`deploy-kit layout migrate --to releases|legacy [--dry-run]` converts a host's `projectDir` between the legacy
+in-place checkout and the release layout, and back. It needs `hostLock` (both locks are taken), a `layout`
+block, and an `ecosystemFile` whose `cwd` is `<projectDir>/current`. It only renames: live shared data keeps
+its inode, and the original checkout is kept as `<projectDir>/.legacy-checkout`.
+
+Forward refuses unless there is no marker, the checkout is clean at a known sha (apart from `sharedPaths`),
+there is no deploy recovery journal or unresolved record, and every shared path exists, is untracked and is on
+the root's filesystem. Steps, each journaled in `layout-migrate.journal.json` before it runs: `worktree`
+(bare `repo.git` plus `releases/<id>` at the live sha), `shared` (move each shared path into `shared/`, leaving
+a symlink behind), `build` (the configured install/generate/build hooks in the new release), `pointers`
+(`current`), `legacy` (rename the old content into `.legacy-checkout`, leave a copy of the ecosystem file),
+`marker` (records the sha for the reverse), `restart` (stable ecosystem), then verification (marker, `current`
+sha, health 200, shared inodes unchanged).
+
+Reverse restores the checkout, moves the shared data back (never an older snapshot), removes `current`,
+`previous` and the marker, restarts from the restored ecosystem file (or `hooks.restart`) and checks `HEAD`,
+`deploy-kit git` and health. It refuses with `layout-reverse-after-deploy` once `current` is not the release
+forward created (a deploy ran since: the database may have migrated). `repo.git`, `releases/` and `shared/` are
+left in place.
+
+A crash leaves the journal; every later run refuses with `layout-migrate-interrupted` and prints the commands
+that undo the journaled steps. Nothing resumes on its own. `--dry-run` runs the read-only precondition commands
+and prints every command it would run. The result is JSON `{direction, sha, steps, verified}`; exit 0 verified,
+3 refused, 2 failed (journal kept).
+
 ### Transition authority (opt-in fencing)
 
 Set `transitionAuthority: { command, scope, timeoutSeconds? }` to make a

@@ -197,6 +197,10 @@ Commands:
   lock break --nonce <N> --reason <text>   operator-only: remove a held lock after proving
     [--host] [--legacy-owner-gone]         its owner is gone (see README). Exit 0 broken,
                                             3 refused
+  layout migrate --to releases|legacy     convert the host between the legacy checkout and the
+    [--dry-run]                            release layout, under both locks, with a step journal.
+                                            Moves, never copies. Exit 0 verified, 3 refused,
+                                            2 failed (journal kept; a rerun refuses)
   clear-pending-release [--dir <path>]     discard the crash-recovery pointer
     [--json]                               auto-cut writes to
                                             .deploy-kit/pending-release.json, so the
@@ -541,6 +545,28 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     } catch (error) {
       log.error(error instanceof Error ? error.message : String(error));
       return 1;
+    }
+  }
+
+  // layout migrate (BRAIN-636 D9) takes a positional subcommand like lock, so it is dispatched before
+  // parseOptions. Exit 0 verified (or a clean dry run), 3 refused, 2 failed with the journal left in place.
+  if (command === 'layout') {
+    const rest = argv.slice(1);
+    const toIndex = rest.indexOf('--to');
+    const to = toIndex >= 0 ? rest[toIndex + 1] : undefined;
+    const extra = rest.filter((a, i) => i > 0 && i !== toIndex && i !== toIndex + 1 && a !== '--dry-run');
+    if (rest[0] !== 'migrate' || !['releases', 'legacy'].includes(to) || extra.length) {
+      log.error('Usage: deploy-kit layout migrate --to releases|legacy [--dry-run]');
+      return 1;
+    }
+    try {
+      const { migrateLayout } = require('./layout-migrate');
+      const { exitCode, result } = migrateLayout(loadConfig({ cwd }), { to, dryRun: rest.includes('--dry-run') }, { env, log });
+      console.log(JSON.stringify(result, null, 2));
+      return exitCode;
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 2;
     }
   }
 
