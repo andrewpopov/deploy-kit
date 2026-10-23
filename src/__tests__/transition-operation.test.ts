@@ -176,20 +176,36 @@ describe('transition operation manager', () => {
     expect(d.store.text && lastOf(d.store.text).state).toBe('COMPLETE_PENDING');
   });
 
-  it('a loaded MUTATING operation needs an explicit parent-linked recovery with a new id', () => {
+  it('a loaded MUTATING operation must be explicitly abandoned before any fresh begin, then recovers cleanly', () => {
     const d = durable();
     const a = authority();
+    let oldCallbacks = 0;
     const first = make(d, a, ids(1));
     const { handle } = first.begin(spec());
-    rejectsWith(() => first.run(handle, () => { throw new Error('boom'); }), 'RUNTIME_FAILED');
+    rejectsWith(() => first.run(handle, () => { oldCallbacks += 1; throw new Error('boom'); }), 'RUNTIME_FAILED');
     const loaded = make(d, a, ids(2));
+    const before = d.store.text;
+    const sent = a.requests.length;
     rejectsWith(() => loaded.begin(spec()), 'RECOVERY_REQUIRED');
     rejectsWith(() => loaded.begin(spec({ kind: 'interrupted-recovery' })), 'RECOVERY_REQUIRED');
     rejectsWith(() => loaded.begin(spec({ parentOperationId: id(1) })), 'RECOVERY_REQUIRED');
+    rejectsWith(() => loaded.begin(spec({ kind: 'interrupted-recovery', parentOperationId: id(1) })), 'RECOVERY_REQUIRED');
+    expect(d.store.text).toBe(before);
+    expect(a.requests).toHaveLength(sent);
+    expect(loaded.abandonSaved(id(1), 'UNKNOWN')).toEqual({ operationId: id(1), state: 'ABANDONED' });
     const recovery = loaded.begin(spec({ kind: 'interrupted-recovery', parentOperationId: id(1) }));
     expect(recovery.operationId).toBe(id(2));
-    const states = loaded.inspect().journal.operations.map((op: { state: string; parentOperationId: string | null }) => [op.state, op.parentOperationId]);
-    expect(states).toEqual([['MUTATING', null], ['AUTHORIZED', id(1)]]);
+    expect(loaded.run(recovery.handle, () => ok)).toEqual(ok);
+    loaded.complete(recovery.handle, ok);
+    const ordinary = make(d, a, ids(3)).begin(spec());
+    expect(ordinary.operationId).toBe(id(3));
+    const records = JSON.parse(d.store.text ?? '{}').operations.map((op: { operationId: string; state: string; parentOperationId: string | null }) =>
+      [op.operationId, op.state, op.parentOperationId]);
+    expect(records).toEqual([
+      [id(1), 'ABANDONED', null], [id(2), 'COMPLETED', id(1)], [id(3), 'AUTHORIZED', null],
+    ]);
+    expect(a.actions).toEqual(['begin', 'abandon', 'begin', 'complete', 'begin']);
+    expect(oldCallbacks).toBe(1);
   });
 
   it('never overwrites an unresolved pending begin', () => {

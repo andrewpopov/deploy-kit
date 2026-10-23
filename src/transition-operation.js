@@ -144,13 +144,11 @@ function createTransitionOperationManager(config, ctx = {}) {
       if (!dryRun) usable();
       const last = active();
       if (last) {
-        const recoversMutating = last.state === 'MUTATING' && fields.kind !== 'deploy'
-          && fields.parentOperationId === last.operationId;
         const terminal = last.state === 'COMPLETED' || last.state === 'ABANDONED';
-        if (!terminal && !recoversMutating) {
+        if (!terminal) {
           fail('RECOVERY_REQUIRED', PENDING_STATES.includes(last.state)
             ? 'a pending transition RPC must be reconciled first'
-            : 'the saved operation must be abandoned or recovered with an explicit parent-linked recovery begin');
+            : 'the saved operation must be explicitly abandoned before any new begin');
         }
         if (journal.operations.length >= MAX_OPERATIONS) fail('JOURNAL_FAILED', 'transition journal operation limit reached');
       }
