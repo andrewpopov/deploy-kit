@@ -8,13 +8,16 @@ const { runOnTarget, shQuote } = require('./exec');
 const JOURNAL_FILE = '.deploy-kit-transition-journal.json';
 const MAX_JOURNAL_BYTES = 128 * 1024;
 const TIMEOUT_SECONDS = 20;
+const RELEASE_PHASE_FILE = '.deploy-kit-state.json';
+// The only two files this backend can ever address; callers pick one, never a path.
+const FIXED_FILES = Object.freeze({ journal: JOURNAL_FILE, phase: RELEASE_PHASE_FILE });
 
 // Static node script run on the target (cwd = projectDir). stdin is
 // "<op>\n<payload bytes>"; nothing variable is ever in the command line. stdout is
 // one JSON envelope. Any failure other than read ENOENT exits 1 with no output.
-const TRANSITION_JOURNAL_SCRIPT = [
+const buildStorageScript = (file) => [
   "const fs=require('fs'),crypto=require('crypto');",
-  `const FILE=${JSON.stringify(JOURNAL_FILE)},MAX=${MAX_JOURNAL_BYTES};`,
+  `const FILE=${JSON.stringify(file)},MAX=${MAX_JOURNAL_BYTES};`,
   'const out=(o)=>process.stdout.write(JSON.stringify(o));',
   '(function(){',
   ' let fd=-1,tmp=null,renamed=false;',
@@ -47,6 +50,7 @@ const TRANSITION_JOURNAL_SCRIPT = [
   ' }',
   '})();',
 ].join('\n');
+const TRANSITION_JOURNAL_SCRIPT = buildStorageScript(JOURNAL_FILE);
 
 function journalFailed() {
   const error = new Error('deploy-kit: transition journal storage failed');
@@ -84,8 +88,9 @@ function assertWritableJson(json) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw journalFailed();
 }
 
-function createTransitionJournalStorage(config, { runtime } = {}) {
-  const command = `node -e ${shQuote(TRANSITION_JOURNAL_SCRIPT)}`;
+function createFixedFileStorage(selection, config, { runtime } = {}) {
+  if (!Object.prototype.hasOwnProperty.call(FIXED_FILES, selection)) throw journalFailed();
+  const command = `node -e ${shQuote(buildStorageScript(FIXED_FILES[selection]))}`;
   const dryRun = Boolean(runtime && runtime.dryRun === true);
   const run = (input) => runOnTarget(command, config, { capture: true, runtime, input, timeoutSeconds: TIMEOUT_SECONDS });
 
@@ -106,4 +111,15 @@ function createTransitionJournalStorage(config, { runtime } = {}) {
   };
 }
 
-module.exports = { createTransitionJournalStorage, TRANSITION_JOURNAL_SCRIPT, MAX_JOURNAL_BYTES, JOURNAL_FILE };
+function createTransitionJournalStorage(config, options) {
+  return createFixedFileStorage('journal', config, options);
+}
+
+// Durable protected release-phase record (.deploy-kit-state.json), rooted at config.projectDir.
+function createReleasePhaseStorage(config, options) {
+  return createFixedFileStorage('phase', config, options);
+}
+
+module.exports = {
+  createTransitionJournalStorage, createReleasePhaseStorage, TRANSITION_JOURNAL_SCRIPT, MAX_JOURNAL_BYTES, JOURNAL_FILE,
+};

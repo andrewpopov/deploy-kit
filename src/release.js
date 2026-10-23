@@ -19,6 +19,7 @@ const {
 const { atomicWriteCommand, writeLastDeployRecord } = require('./last-deploy');
 const { assertTransitionAuthorityEntryPoint } = require('./transition-authority');
 const { createTransitionOperationManager, TransitionOperationError } = require('./transition-operation');
+const { createReleasePhaseStorage } = require('./transition-operation-storage');
 
 // A run may execute trusted hooks that write the production DB, so every effect is declared.
 const CONSERVATIVE_EFFECTS = {
@@ -30,6 +31,11 @@ const recoveryRequired = (message, cause) => new TransitionOperationError('RECOV
 // version into .deploy-kit-layout; a release deploy refuses a host whose marker
 // is absent or a different version, so an out-of-date host can't be deployed to.
 const LAYOUT_VERSION = 1;
+const PHASE_JOURNAL_VERSION = 1;
+
+// A protected phase write whose durability is unknown (storage JOURNAL_FAILED, possibly wrapped
+// by manager.run as RUNTIME_FAILED). Must never be abandoned, retried or generically recovered.
+const isPhaseWriteUncertain = (err) => err?.code === 'JOURNAL_FAILED' || err?.cause?.code === 'JOURNAL_FAILED';
 
 // Post-restart settling window: after the app is healthy, sample PM2 restart
 // counts this many times, this many seconds apart, and require they never climb.
@@ -510,7 +516,7 @@ function deployRelease(config, options = {}, ctx = {}) {
   // a metadata write failing here must not mask the recovery that just succeeded.
   const markRecovered = () => {
     st.phase = 'recovered';
-    try { journal(); } catch { /* best effort */ }
+    try { journal(); } catch (err) { if (isPhaseWriteUncertain(err)) throw err; /* best effort */ }
   };
 
   // Stop the DB-bound apps and PROVE they are actually stopped (a zero-exit
@@ -902,7 +908,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       try {
         observation = manager.run(begun.handle, body);
       } catch (err) {
-        if (!(err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED')) throw err;
+        if (!(err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED') || isPhaseWriteUncertain(err)) throw err;
         try {
           manager.abandon(begun.handle, 'UNKNOWN');
         } catch (abandonErr) {
@@ -1195,6 +1201,14 @@ function deployRelease(config, options = {}, ctx = {}) {
     }
     steps.push('shared');
 
+    // Protected: a configured hook may mutate production, so "hook-running" is journaled BEFORE
+    // it and retained after it ("stopped" then only means the stop-only window).
+    const beginProtectedHook = () => {
+      if (!protectedMode) return;
+      st.phase = 'hook-running';
+      if (operationIdentity) journal();
+    };
+
     const executeCandidate = () => {
     if (protectedMode) {
       // Delayed pre-deploy hooks may mutate production: identity is journaled first.
@@ -1284,6 +1298,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       st.dbAppsPaused = true;
     }
     if (!skipMigrate && config.hooks.backup) {
+      beginProtectedHook();
       log.step('Backing up the database (writers stopped)');
       const res = runInDir(st.releaseDir, config.hooks.backup, config, c, { capture: true });
       if (!res.ok) {
@@ -1311,6 +1326,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // ownership -- see README "Skipping a no-op migration").
     let migrateHookNeeded = !skipMigrate && Boolean(config.hooks.migrate);
     if (migrateHookNeeded && config.hooks.pendingMigrations) {
+      beginProtectedHook();
       log.step('Checking for pending database migrations (writers stopped)');
       const probe = runInDir(st.releaseDir, config.hooks.pendingMigrations, config, c, { capture: true });
       if (!probe.ok) logFailureOutput('Pending-migration probe', probe, log);
@@ -1466,7 +1482,7 @@ function deployRelease(config, options = {}, ctx = {}) {
   } catch (err) {
     if (protectedMode) {
       // Never generic recover(): early hooks may have mutated production.
-      if (err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED' && authorityHandle) {
+      if (err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED' && authorityHandle && !isPhaseWriteUncertain(err)) {
         const handle = authorityHandle;
         const failedOperationId = operationIdentity?.operationId;
         const failedPhase = st.phase;
@@ -1510,17 +1526,18 @@ function inspectTransitionAuthority(config, paths, c, ctx) {
       throw recoveryRequired('saved MUTATING operation requires recovery assessment');
     }
   }
-  const file = shQuote(paths.stateFile);
-  const phaseRead = runOnTarget(`if [ -e ${file} ] || [ -L ${file} ]; then printf 'present\n'; cat ${file}; else printf 'absent\n'; fi`, { ...config, projectDir: paths.root }, { capture: true, runtime: c.runtime, readOnly: true });
-  if (!phaseRead.ok || typeof phaseRead.output !== 'string') throw recoveryRequired('deploy state journal could not be read under transition authority');
-  let saved = null;
-  if (phaseRead.output !== 'absent\n') {
-    if (!phaseRead.output.startsWith('present\n')) throw recoveryRequired('invalid deploy state journal read response');
-    try { saved = JSON.parse(phaseRead.output.slice('present\n'.length)); } catch { throw recoveryRequired('unreadable deploy state journal under transition authority'); }
-    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw recoveryRequired('invalid deploy state journal under transition authority');
+  let saved;
+  try {
+    saved = createReleasePhaseStorage({ ...config, projectDir: paths.root }, { runtime: c.runtime }).read();
+  } catch (readErr) {
+    throw recoveryRequired('deploy state journal could not be read under transition authority', readErr);
   }
-  if (saved && !['done', 'recovered'].includes(saved.phase)) {
-    throw recoveryRequired(`previous deploy journal in phase "${saved.phase}" requires recovery under transition authority`);
+  if (saved) {
+    // A legacy (unversioned) phase file is never trusted under protected mode.
+    if (saved.phaseJournalVersion !== PHASE_JOURNAL_VERSION || saved.layoutVersion !== LAYOUT_VERSION) throw recoveryRequired('deploy state journal is not a versioned protected phase journal; recovery assessment required');
+    if (!['done', 'recovered'].includes(saved.phase)) {
+      throw recoveryRequired(`previous deploy journal in phase "${saved.phase}" requires recovery under transition authority`);
+    }
   }
   return manager;
 }
@@ -1561,6 +1578,13 @@ function activateSymlink(config, paths, relTarget, ctx, { link, tolerate = false
 // truncated/empty state. Gated — a failed write aborts rather than silently
 // reporting success. Used both for durable journaling and the final success record.
 function persistState(config, paths, state, ctx) {
+  if (config.transitionAuthority != null && ctx.runtime?.dryRun !== true) {
+    // Protected: fsync-backed write acknowledged only after rename + parent fsync; failures
+    // carry JOURNAL_FAILED so callers can tell phase-write uncertainty from ordinary errors.
+    createReleasePhaseStorage({ ...config, projectDir: paths.root }, { runtime: ctx.runtime })
+      .write(JSON.stringify({ ...state, phaseJournalVersion: PHASE_JOURNAL_VERSION, layoutVersion: LAYOUT_VERSION }));
+    return;
+  }
   const cmd = atomicWriteCommand(paths.stateFile, JSON.stringify({ ...state, layoutVersion: LAYOUT_VERSION }));
   const res = runOnTarget(cmd, { ...config, projectDir: paths.root }, { runtime: ctx.runtime });
   if (!res.ok) throw new Error(`Failed to persist release metadata (${paths.stateFile})`);
@@ -1736,7 +1760,7 @@ function rollbackRelease(config, options = {}, ctx = {}) {
           return executeRollback(previousSha);
         });
       } catch (err) {
-        if (!isRuntimeFailure(err)) throw err;
+        if (!isRuntimeFailure(err) || isPhaseWriteUncertain(err)) throw err;
         // Uncertainty ends only by an acknowledged UNKNOWN abandon; then a fresh child recovers.
         try {
           manager.abandon(begun.handle, 'UNKNOWN');
@@ -1774,7 +1798,7 @@ function rollbackRelease(config, options = {}, ctx = {}) {
           return recoverFailedRollback(config, paths, originalCurrent, c, reason, originalSha);
         });
       } catch (err) {
-        if (!isRuntimeFailure(err)) throw err;
+        if (!isRuntimeFailure(err) || isPhaseWriteUncertain(err)) throw err;
         try {
           manager.abandon(begun.handle, 'UNKNOWN');
         } catch (abandonErr) {
