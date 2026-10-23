@@ -1329,7 +1329,10 @@ function deployRelease(config, options = {}, ctx = {}) {
       beginProtectedHook();
       log.step('Checking for pending database migrations (writers stopped)');
       const probe = runInDir(st.releaseDir, config.hooks.pendingMigrations, config, c, { capture: true });
-      if (!probe.ok) logFailureOutput('Pending-migration probe', probe, log);
+      if (!probe.ok) {
+        logFailureOutput('Pending-migration probe', probe, log);
+        if (protectedMode) throw new Error('Pending-migration probe failed; manual recovery assessment required');
+      }
       const pending = parsePendingCount(probe);
       if (pending === 0) {
         st.migrationsPending = 0;
