@@ -494,13 +494,14 @@ function deployRelease(config, options = {}, ctx = {}) {
   let manager = null;
   let authorityHandle = null;
   let operationIdentity = null; // set only once an authority begin is acknowledged
-  const journal = () => persistState(config, paths, {
+  const journal = (overrides = {}) => persistState(config, paths, {
     ...(operationIdentity || {}),
     phase: st.phase, releaseId: st.releaseId, sha: st.sha, backupId: st.backupId,
     migrated: st.migrated, ...migrationsPendingField(), flipped: st.flipped, prevTarget: st.prevTarget,
     failedCheck: st.failedCheck, failurePolicy: st.failurePolicy,
     recoveryOutcome: st.recoveryOutcome,
     ...(st.recoveryNote ? { recoveryNote: st.recoveryNote } : {}),
+    ...overrides,
   }, c);
 
   // After a SUCCESSFUL recovery, overwrite the journaled disruptive phase so the
@@ -523,11 +524,11 @@ function deployRelease(config, options = {}, ctx = {}) {
     return config.dbBoundApps.every((n) => !snap[n] || !snap[n].online);
   };
 
-  const resumePrevious = () => {
+  const resumePrevious = (targetSha = null) => {
     // Bring the previous release's apps back and verify it is actually healthy —
     // a zero-exit `pm2 start` is not proof (Codex).
     runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
-    return verifyActivation(config, paths, null, `${paths.root}/${st.prevTarget}`, c);
+    return verifyActivation(config, paths, targetSha, `${paths.root}/${st.prevTarget}`, c);
   };
 
   // The rollback target is restored (DB and pointer) but did not verify. It must still
@@ -586,7 +587,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     return { delivered: delivery.ok };
   };
 
-  const rollbackToPrevious = (fail) => {
+  const rollbackToPrevious = (fail, targetSha = null) => {
     if (!st.prevTarget) {
       fail('no previous release exists to satisfy the configured rollback policy');
     }
@@ -611,9 +612,12 @@ function deployRelease(config, options = {}, ctx = {}) {
         + 'restarted; manually confirm the pointer and running process',
       );
     }
-    const resumed = resumePrevious();
+    const resumed = resumePrevious(targetSha);
     if (!resumed.ok) {
-      const appsOnline = ensureRollbackTargetRunning();
+      // Protected: read-only facts only; a restart would be an unfenced nested mutation.
+      const appsOnline = targetSha
+        ? appsRunFromRelease(config, paths, `${paths.root}/${st.prevTarget}`, c).ok
+        : ensureRollbackTargetRunning();
       fail(
         `the previous release did not come back healthy after DB/symlink recovery (${resumed.reason}); `
         + `its apps were left ${appsOnline ? 'running' : 'NOT online'}`,
@@ -833,8 +837,13 @@ function deployRelease(config, options = {}, ctx = {}) {
   // It re-raises rather than calling process.exit(1) so an embedder calling
   // deployRelease() programmatically keeps control of its own shutdown.
   const onSignal = (sig) => {
-    log.error(`Received ${sig} mid-deploy — running recovery for phase "${st.phase}"`);
-    try { recover(new Error(`interrupted by ${sig}`)); } catch (e) { log.error(e.message); }
+    log.error(protectedMode && !dryRun ? `Received ${sig} mid-deploy — recovery required for phase "${st.phase}"` : `Received ${sig} mid-deploy — running recovery for phase "${st.phase}"`);
+    if (protectedMode && !dryRun) {
+      // Never generic recover() or a re-entrant manager call; the journal is preserved.
+      log.error(`Recovery required: interrupted by ${sig} under transition authority; journal preserved for assessment`);
+    } else {
+      try { recover(new Error(`interrupted by ${sig}`)); } catch (e) { log.error(e.message); }
+    }
     process.removeListener(sig, sigHandlers[sig]);
     process.kill(process.pid, sig);
   };
@@ -853,6 +862,70 @@ function deployRelease(config, options = {}, ctx = {}) {
   // recovery integration slice.
   function initializeTransitionAuthority() {
     manager = inspectTransitionAuthority(config, paths, c, ctx);
+  }
+
+  // Failed protected forward deploy, after the failed operation's acknowledged UNKNOWN abandon.
+  // Always throws: the requested forward deployment failed even when the previous release recovers.
+  // Only phases whose effects are fully understood are recovered; everything else is assessed manually.
+  function recoverProtectedForward(failure, failedOperationId, failedPhase) {
+    const reason = failure.cause?.message || failure.message;
+    const rollbackPhase = ['migrated', 'flipped', 'verify'].includes(failedPhase)
+      || (failedPhase === 'post-deploy-failed' && st.failurePolicy === 'rollback');
+    if (failedPhase !== 'stopped' && !rollbackPhase) {
+      throw recoveryRequired(`forward operation failed in phase "${failedPhase}" (${reason}) and was abandoned UNKNOWN; manual recovery assessment required`, failure);
+    }
+    let previousSha;
+    let actualCurrent;
+    try {
+      if (!st.prevTarget) throw new Error('no previous release recorded');
+      actualCurrent = readPointers(config, paths, c).current;
+      assertSafeTarget(actualCurrent, 'current');
+      previousSha = resolveReleaseSha(config, paths, st.prevTarget, 'previous', c);
+      const candidateTarget = `releases/${st.releaseId}`;
+      if (failedPhase === 'stopped' ? actualCurrent !== st.prevTarget : ![st.prevTarget, candidateTarget].includes(actualCurrent)) {
+        throw new Error(`current points to ${actualCurrent}, which does not match the failed ${failedPhase} phase`);
+      }
+    } catch (assessErr) {
+      throw recoveryRequired(`forward operation failed (${reason}) and no safe previous release could be assessed; manual recovery required`, assessErr);
+    }
+    if (failedPhase !== 'stopped') st.flipped = actualCurrent !== st.prevTarget;
+    const begun = manager.begin({
+      kind: 'automatic-recovery', targetSha: previousSha, targetRelease: st.prevTarget, priorPointer: actualCurrent,
+      effects: { ...CONSERVATIVE_EFFECTS }, parentOperationId: failedOperationId,
+    });
+    operationIdentity = { operationId: begun.operationId, targetSha: previousSha };
+    const withFacts = (error) => Object.assign(error, { childOperationId: begun.operationId, failedOperationId });
+    let observation;
+    try {
+      observation = manager.run(begun.handle, () => {
+        journal({ phase: 'forward-recovery', sha: previousSha });
+        if (failedPhase === 'stopped') {
+          if (!resumePrevious(previousSha).ok) {
+            throw Object.assign(new Error('failed to bring the previous release back online after aborting pre-migration'), {
+              rollbackTargetRestored: !st.migrated,
+              appsOnline: appsRunFromRelease(config, paths, `${paths.root}/${st.prevTarget}`, c).ok,
+            });
+          }
+        } else {
+          rollbackToPrevious((msg, details = {}) => {
+            throw Object.assign(new Error(`MANUAL RECOVERY REQUIRED — ${msg}. Original: ${reason}`), details);
+          }, previousSha);
+        }
+        return { observedSha: previousSha, verified: true };
+      });
+    } catch (err) {
+      if (!(err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED')) throw err;
+      try {
+        manager.abandon(begun.handle, 'UNKNOWN');
+      } catch (abandonErr) {
+        throw withFacts(recoveryRequired('forward recovery failed and abandon was not acknowledged; recovery assessment required', abandonErr));
+      }
+      throw withFacts(recoveryRequired('forward recovery failed and was abandoned UNKNOWN; recovery assessment required', err));
+    }
+    manager.complete(begun.handle, observation);
+    journal({ phase: 'recovered', sha: previousSha });
+    log.success(`Restored the previous release ${st.prevTarget}`);
+    throw withFacts(recoveryRequired(`forward deployment failed (${reason}); previous release ${st.prevTarget} recovered`, failure));
   }
 
   const release = acquireLock(config, c, { steal: stealLock });
@@ -1283,13 +1356,15 @@ function deployRelease(config, options = {}, ctx = {}) {
       // Never generic recover(): early hooks may have mutated production.
       if (err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED' && authorityHandle) {
         const handle = authorityHandle;
+        const failedOperationId = operationIdentity?.operationId;
+        const failedPhase = st.phase;
         authorityHandle = null;
         try {
           manager.abandon(handle, 'UNKNOWN');
         } catch (abandonErr) {
           throw recoveryRequired('forward operation failed and abandon was not acknowledged; recovery assessment required', abandonErr);
         }
-        throw recoveryRequired('forward operation failed and was abandoned UNKNOWN; recovery assessment required', err);
+        recoverProtectedForward(err, failedOperationId, failedPhase);
       }
       throw err;
     }
