@@ -90,6 +90,9 @@ const DEFAULT_CONFIG = {
   // `required: true` (BRAIN-636) opts the app out of automatic lock takeover: a
   // held lock is only ever removed by an evidence-checked `lock break`.
   onHost: null,
+  // `{ dir, key }` (BRAIN-636 D2): a lock shared by every app on one host, at
+  // `<dir>/<key>.lock` (+ `.guard`). Owned-lock acquisition takes it before the app lock.
+  hostLock: null,
   // Build before the backup/stop/migrate block (apps stay up during build) so the
   // paused window is just migration. Default false = build after migrate (paused).
   buildBeforeMigrate: false,
@@ -246,6 +249,7 @@ const KEY_TYPES = {
   lock: 'boolean',
   localShell: 'string?',
   onHost: 'object?',
+  hostLock: 'object?',
   buildBeforeMigrate: 'boolean',
   verifyPins: 'boolean',
   requireVerifiedRef: 'string?',
@@ -582,6 +586,22 @@ function validateOnHost(onHost, source) {
   return problems;
 }
 
+// `dir` is interpolated into target shell, so it is an absolute path of safe
+// characters with no ".." segment; `key` is one safe filename token.
+const HOST_LOCK_DIR_RE = /^\/[A-Za-z0-9_./-]*$/;
+const HOST_LOCK_KEY_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
+
+function validateHostLock(hostLock, source) {
+  const problems = rejectUnknownKeys(hostLock, ['dir', 'key'], source, 'hostLock');
+  if (typeof hostLock.dir !== 'string' || !HOST_LOCK_DIR_RE.test(hostLock.dir) || hostLock.dir.split('/').includes('..')) {
+    problems.push(`${source}: "hostLock.dir" must be an absolute path (letters, digits, ".", "_", "-", "/"; no "..")`);
+  }
+  if (typeof hostLock.key !== 'string' || !HOST_LOCK_KEY_RE.test(hostLock.key)) {
+    problems.push(`${source}: "hostLock.key" must match ${HOST_LOCK_KEY_RE}`);
+  }
+  return problems;
+}
+
 // Validate the opt-in `layout` block. Returns human-readable problem strings.
 // Enforces Codex's shared-path safety rules at config time: relative, cannot
 // escape the release, and no two paths overlap (one being a prefix of another
@@ -753,6 +773,9 @@ function validateConfig(raw, { source = 'config' } = {}) {
   }
   if (raw.onHost != null && typeof raw.onHost === 'object' && !Array.isArray(raw.onHost)) {
     problems.push(...validateOnHost(raw.onHost, source));
+  }
+  if (raw.hostLock != null && typeof raw.hostLock === 'object' && !Array.isArray(raw.hostLock)) {
+    problems.push(...validateHostLock(raw.hostLock, source));
   }
   if (raw.deliveryEvent != null && typeof raw.deliveryEvent === 'object' && !Array.isArray(raw.deliveryEvent)) {
     problems.push(...validateDeliveryEvent(raw.deliveryEvent, source));

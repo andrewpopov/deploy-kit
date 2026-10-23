@@ -3,7 +3,7 @@
 const path = require('path');
 const { execFileSync: nodeExecFileSync } = require('child_process');
 const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
-const { acquireLock } = require('./lock');
+const { acquireLock, validateOwnedLocks } = require('./lock');
 const { log: defaultLog, logFailureOutput } = require('./log');
 const { backupIdFromOutput, isSafeBackupId, backupReferenceFromId } = require('./backup-reference');
 const { resolveBranch } = require('./branch');
@@ -416,6 +416,14 @@ function readInterruptedDeploy(config, paths, ctx) {
     );
   }
   return null;
+}
+
+// With `ctx.ownedLocks` (host-run's handle) the locks are already held: validate
+// the handle and return a no-op release. Otherwise take the app lock as always.
+function acquireOrAdoptLock(config, c, { steal }) {
+  if (c.ownedLocks == null) return acquireLock(config, c, { steal });
+  validateOwnedLocks(config, c, c.ownedLocks);
+  return () => {};
 }
 
 // The full artifact-first release deploy. See the failure-phase table in the ticket:
@@ -1088,7 +1096,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     return restart.verified ? concludeVerified(restart) : concludeUnverified(restart);
   }
 
-  const release = acquireLock(config, c, { steal: stealLock });
+  const release = acquireOrAdoptLock(config, c, { steal: stealLock });
   process.on('SIGINT', sigHandlers.SIGINT);
   process.on('SIGTERM', sigHandlers.SIGTERM);
   try {
@@ -1776,7 +1784,7 @@ function rollbackRelease(config, options = {}, ctx = {}) {
   }
 
   log.header(`⏪ Rolling back [release layout] (${config.mode}${config.host ? ` → ${config.host}` : ''})`);
-  const release = acquireLock(config, c, { steal: options.stealLock === true });
+  const release = acquireOrAdoptLock(config, c, { steal: options.stealLock === true });
   try {
     preflight(config, paths, c);
     const fenced = config.transitionAuthority != null && c.runtime?.dryRun !== true;

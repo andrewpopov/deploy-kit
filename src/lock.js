@@ -2,6 +2,10 @@
 
 const { runOnTarget } = require('./exec');
 
+// Handles minted by acquireOwnedLocks, with what releasing them needs. A copied or
+// deserialized handle is not a key here, so it never validates.
+const OWNED_LOCKS = new WeakMap();
+
 // Stable per-target id from the projectDir (falls back to appNames/host).
 // Sanitized to a filesystem-safe token so two deploys of the same target
 // contend for the same lock but different targets don't. Also keeps the
@@ -24,6 +28,18 @@ const BASE_DIR = '$HOME/.deploy-kit';
 
 function lockDir(config, suffix) {
   return `${BASE_DIR}/deploy-kit-${lockId(config)}${suffix ? `-${suffix}` : ''}.lock`;
+}
+
+// The lock shared by every app on one host (config.hostLock = { dir, key }).
+function hostLockDir(config) {
+  if (!config.hostLock) throw new Error('deploy-kit: no hostLock configured');
+  return `${config.hostLock.dir}/${config.hostLock.key}.lock`;
+}
+
+// Directory and permanent guard of either the app lock or (scope 'host') the host lock.
+function lockLocation(config, { suffix, scope } = {}) {
+  const dir = scope === 'host' ? hostLockDir(config) : lockDir(config, suffix);
+  return { dir, guard: `${dir}.guard` };
 }
 
 // Where the pre-pull SHA is recorded for legacy `rollback`. Kept outside the
@@ -97,6 +113,10 @@ function ensureStateDir(config) {
 // empirically: a real `exit 1` sets status:1, while a spawn failure (ENOENT)
 // or a non-1 exit (ssh conventionally uses 255 for a connection/auth failure)
 // leaves status anything else.
+function heldError(message) {
+  return Object.assign(new Error(message), { code: 'held' });
+}
+
 function isConfirmedScriptExit1(res) {
   return res.error != null && res.error.status === 1;
 }
@@ -133,8 +153,7 @@ function guardFile(config, suffix) {
 // flock(1) is util-linux, so stock macOS lacks it: apps that did not opt in keep
 // working unguarded there (exactly the pre-guard behaviour); an opted-in app
 // refuses (exit 2), because its safety rests on the guard.
-function guardPrelude(config, suffix) {
-  const guard = guardFile(config, suffix);
+function guardPrelude(config, guard) {
   const missing = lockRequiresOwnership(config)
     ? 'echo "deploy-kit: flock(1) is required for onHost.required apps" >&2; exit 2'
     : ':';
@@ -199,15 +218,15 @@ function ownerWriter(dir, { kind, runId, purpose }) {
 // for onHost.required apps, which never lose a lock to anything but a break);
 // config.lock:false disables locking entirely.
 function acquireLock(config, ctx, {
-  steal = false, suffix, kind, runId, purpose,
+  steal = false, suffix, kind, runId, purpose, scope,
 } = {}) {
   const noop = () => {};
   if (config.lock === false) return noop;
-  const dir = lockDir(config, suffix);
+  const { dir, guard } = lockLocation(config, { suffix, scope });
   const ttl = lockTtlSeconds(config);
   const stateDir = ensureStateDir(config);
   const owned = lockRequiresOwnership(config);
-  const prelude = guardPrelude(config, suffix);
+  const prelude = guardPrelude(config, guard);
   const writeOwner = ownerWriter(dir, ownerFields({ kind, runId, purpose }));
 
   if (steal && owned) {
@@ -279,10 +298,8 @@ function acquireLock(config, ctx, {
     const res = runOnTarget(script, config, { runtime: ctx.runtime, capture: owned });
     if (!res.ok) {
       if (isConfirmedScriptExit1(res)) {
-        if (owned) throw new Error(`refused lock-held: ${(res.output || '').trim()}`);
-        throw new Error(
-          `Another deploy holds the lock (${dir}). Wait for it to finish, or pass --steal-lock.`,
-        );
+        if (owned) throw heldError(`refused lock-held: ${(res.output || '').trim()}`);
+        throw heldError(`Another deploy holds the lock (${dir}). Wait for it to finish, or pass --steal-lock.`);
       }
       throw new Error(lockCheckFailedMessage(res, dir, 'check'));
     }
@@ -299,11 +316,131 @@ function acquireLock(config, ctx, {
   // exceeds the TTL gets reclaimed by run B, but A's eventual release() would
   // delete B's (not A's) lock, letting a third run C start while B still
   // believes it holds the lock.
-  return () => runOnTarget(
-    `${prelude}\n[ "$(cat "${dir}/nonce" 2>/dev/null)" = "${nonce}" ] && rm -rf "${dir}" 2>/dev/null || true`,
+  return () => removeIfNonce(config, ctx, { dir, guard }, nonce);
+}
+
+function removeIfNonce(config, ctx, { dir, guard }, nonce) {
+  return runOnTarget(
+    `${guardPrelude(config, guard)}\n[ "$(cat "${dir}/nonce" 2>/dev/null)" = "${nonce}" ] && rm -rf "${dir}" 2>/dev/null || true`,
     config,
     { runtime: ctx.runtime },
   );
+}
+
+function sleepSync(seconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, seconds * 1000);
+}
+
+function lateError(dir, notAfter) {
+  return Object.assign(
+    new Error(`late: lock ${dir} was still held at notAfter ${notAfter}`),
+    { code: 'late' },
+  );
+}
+
+// Take one lock, polling while another run holds it, until `notAfter` (unix
+// seconds). Only a confirmed "held" outcome is retried; any other failure throws.
+function acquireWithin(config, ctx, options, { notAfter, now, sleep }) {
+  for (;;) {
+    try {
+      return acquireLock(config, ctx, options);
+    } catch (error) {
+      if (error.code !== 'held') throw error;
+      if (now() >= notAfter) throw lateError(lockLocation(config, options).dir, notAfter);
+      sleep(1);
+    }
+  }
+}
+
+// Canonical path (symlinks resolved on the target) and parsed owner record of a
+// lock directory, or null when it does not exist or cannot be read.
+function readLockIdentity(config, ctx, dir) {
+  const res = runOnTarget(
+    `cd "${dir}" 2>/dev/null || exit 3\npwd -P\ncat owner 2>/dev/null`,
+    config,
+    { capture: true, runtime: ctx.runtime, readOnly: true },
+  );
+  if (!res.ok) return null;
+  const [canonical, ...rest] = res.output.split('\n');
+  let owner = null;
+  try { owner = JSON.parse(rest.join('\n')); } catch { return null; }
+  return { path: canonical, owner };
+}
+
+// Take the host lock (when configured) and then the app lock, both with the owner
+// record, and return a handle the pipeline accepts in place of taking them again.
+// Both waits are bounded by `notAfter`; past it the refusal is `late`.
+function acquireOwnedLocks(config, ctx, {
+  notAfter, runId, purpose, kind, now = () => Date.now() / 1000, sleep = sleepSync,
+} = {}) {
+  if (config.lock === false) throw new Error('deploy-kit: owned locks require locking to be enabled');
+  if (!Number.isFinite(notAfter)) throw new Error('deploy-kit: acquireOwnedLocks needs a numeric notAfter (unix seconds)');
+  const wait = { notAfter, now, sleep };
+  const common = { kind, runId, purpose };
+  const releases = [];
+  const releaseAll = () => { while (releases.length) releases.pop()(); };
+  try {
+    if (config.hostLock) releases.push(acquireWithin(config, ctx, { ...common, scope: 'host' }, wait));
+    releases.push(acquireWithin(config, ctx, common, wait));
+    const host = config.hostLock ? readLockIdentity(config, ctx, hostLockDir(config)) : null;
+    const app = readLockIdentity(config, ctx, lockDir(config));
+    if ((config.hostLock && !host) || !app) throw new Error('deploy-kit: could not read back the lock owner records just written');
+    const handle = {
+      hostPath: host ? host.path : null,
+      appPath: app.path,
+      runId: runId || null,
+      pid: process.pid,
+      hostNonce: host ? host.owner.nonce : null,
+      appNonce: app.owner.nonce,
+      released: false,
+    };
+    OWNED_LOCKS.set(handle, { config, ctx });
+    return handle;
+  } catch (error) {
+    releaseAll();
+    throw error;
+  }
+}
+
+function rejectHandle(reason) {
+  return new Error(`deploy-kit: owned lock handle rejected: ${reason}`);
+}
+
+// Check a handle against the registry, this process, the config's canonical lock
+// paths and the owner records on disk. Throws on anything but a live, whole,
+// own handle.
+function validateOwnedLocks(config, ctx, handle) {
+  if (handle == null || typeof handle !== 'object' || !OWNED_LOCKS.has(handle)) {
+    throw rejectHandle('not issued by acquireOwnedLocks in this process (copied or deserialized)');
+  }
+  if (handle.released) throw rejectHandle('already released');
+  if (handle.pid !== process.pid) throw rejectHandle(`issued to pid ${handle.pid}, not ${process.pid}`);
+  if (config.lock === false) throw rejectHandle('locking is disabled in this config');
+  const wantsHost = Boolean(config.hostLock);
+  if (!handle.appPath || (wantsHost && !handle.hostPath)) throw rejectHandle('partial handle: a configured lock is missing');
+  if (!wantsHost && handle.hostPath) throw rejectHandle('handle holds a host lock this config does not configure');
+  const checks = [['app', lockDir(config), handle.appPath, handle.appNonce]];
+  if (wantsHost) checks.unshift(['host', hostLockDir(config), handle.hostPath, handle.hostNonce]);
+  for (const [name, dir, path, nonce] of checks) {
+    const found = readLockIdentity(config, ctx, dir);
+    if (!found) throw rejectHandle(`${name} lock ${dir} is not held`);
+    if (found.path !== path) throw rejectHandle(`${name} lock path ${path} is not the config's ${found.path}`);
+    if (found.owner.nonce !== nonce || found.owner.runId !== handle.runId) {
+      throw rejectHandle(`${name} lock owner on disk is not this handle`);
+    }
+  }
+}
+
+// Release the app lock, then the host lock, each only if its nonce still matches.
+function releaseOwnedLocks(handle) {
+  const held = OWNED_LOCKS.get(handle);
+  if (!held || handle.released) return;
+  handle.released = true;
+  const { config, ctx } = held;
+  removeIfNonce(config, ctx, { dir: handle.appPath, guard: `${handle.appPath}.guard` }, handle.appNonce);
+  if (handle.hostPath) {
+    removeIfNonce(config, ctx, { dir: handle.hostPath, guard: `${handle.hostPath}.guard` }, handle.hostNonce);
+  }
 }
 
 // Read-only view of the app lock for `deploy-kit lock inspect --json`: owner
@@ -363,5 +500,6 @@ function inspectLock(config, ctx, { suffix } = {}) {
 
 module.exports = {
   lockId, lockDir, prevShaFile, legacyPrevShaFile, lockTtlSeconds, ensureStateDir, acquireLock,
-  inspectLock, guardFile, lockRequiresOwnership,
+  inspectLock, guardFile, lockRequiresOwnership, hostLockDir,
+  acquireOwnedLocks, validateOwnedLocks, releaseOwnedLocks,
 };
