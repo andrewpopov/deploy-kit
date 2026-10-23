@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { createRequire } from 'module';
 import crypto from 'crypto';
+import { makeFakeFs, nodeEScript, runScriptOnFake } from './durable-storage-fixture';
 
 const require = createRequire(__filename);
 const kit = require('../index.js');
@@ -10,6 +11,7 @@ const { mergeConfig, DEFAULT_CONFIG } = kit;
 
 const SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
 const OTHER_SHA = 'b'.repeat(40);
+const STATE_FILE = '.deploy-kit-state.json';
 const sha256 = (text: string) => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 const RUNTIME_TAGS = ['pre-hook', 'install', 'build', 'stop', 'backup', 'migrate', 'flip', 'check', 'restore', 'restart'];
 
@@ -114,9 +116,14 @@ function makeAuthority(events: string[], fails: (action: string, count: number) 
 }
 
 // Content-aware target: answers the real preflight/lock/git/pm2 commands and keeps the phase journal the
-// way the host would, by parsing what persistState's atomic shell command writes and replaying it on read.
-function makeTarget(events: string[], over: { builtSha?: string; stateRead?: StateRead; shaProbe?: (call: number) => string; headFails?: boolean; rb?: ReturnType<typeof makeRollbackHost>; onCommand?: (cmd: string) => void } = {}) {
+// way the host would, by running the real fsync-backed phase storage script over a fake fs.
+function makeTarget(events: string[], over: { builtSha?: string; stateRead?: StateRead; stateSeed?: Record<string, unknown>; phaseFault?: (phase: Phase) => string | undefined; shaProbe?: (call: number) => string; headFails?: boolean; rb?: ReturnType<typeof makeRollbackHost>; onCommand?: (cmd: string) => void } = {}) {
   const t: { stateText: string | null; lastDeploy: string | null; shaCalls: number; stopped: boolean; stateWrites: string[]; deliveries: string[] } = { stateText: null, lastDeploy: null, shaCalls: 0, stopped: false, stateWrites: [], deliveries: [] };
+  const seed = { fails: undefined, corrupt: Buffer.from('{not json'), empty: Buffer.alloc(0), normal: undefined }[over.stateRead ?? 'normal'];
+  const phaseFs = makeFakeFs(STATE_FILE, {
+    existing: over.stateSeed ? Buffer.from(JSON.stringify(over.stateSeed)) : seed,
+    readCode: over.stateRead === 'fails' ? 'EACCES' : undefined,
+  });
   const tags: Array<[RegExp, string]> = [
     [/pre-hook/, 'pre-hook'], [/npm ci/, 'install'], [/npm run build/, 'build'], [/pm2 stop/, 'stop'],
     [/run-backup/, 'backup'], [/run-migrate/, 'migrate'], [/mv -Tf/, 'flip'], [/pm2 (startOrRestart|start|restart)/, 'restart'],
@@ -127,26 +134,31 @@ function makeTarget(events: string[], over: { builtSha?: string; stateRead?: Sta
     const tag = tags.find(([re]) => re.test(cmd));
     if (tag) events.push(`target:${tag[1]}`);
     if (cmd.includes('deliver-hook')) t.deliveries.push(String(options?.input));
+    // Protected phase record: the REAL static storage script, decoded from the shell-quoted command, over a fake fs.
+    const script = nodeEScript(cmd);
+    if (script?.includes(STATE_FILE)) {
+      const input = String(options?.input);
+      const body = input.slice(input.indexOf('\n') + 1);
+      const isWrite = input.startsWith('write\n');
+      if (isWrite) phaseFs.setFail(over.phaseFault?.(JSON.parse(body)));
+      try {
+        const stdout = runScriptOnFake(script, phaseFs, input);
+        if (isWrite) {
+          const phase: Phase = JSON.parse(body);
+          t.stateWrites.push(body);
+          events.push(`target:state:${phase.phase}`);
+        }
+        return stdout;
+      } finally {
+        t.stateText = phaseFs.files.get(STATE_FILE)?.toString() ?? null;
+      }
+    }
     over.onCommand?.(cmd);
     const modelled = over.rb?.handle(cmd);
     if (modelled !== undefined) return modelled;
     if (over.headFails && cmd.startsWith('cd /srv/app/releases/') && cmd.endsWith('git rev-parse HEAD')) throw execFailure(over.builtSha ?? SHA);
     if (cmd.includes('.deploy-kit-last-deploy.json.tmp')) { t.lastDeploy = cmd; events.push('target:last-deploy'); return ''; }
-    if (cmd.includes('.deploy-kit-state.json')) {
-      if (cmd.includes('[ -e ')) {
-        if (over.stateRead === 'fails') throw Object.assign(new Error('read failed'), { stdout: '' });
-        if (over.stateRead === 'corrupt') return 'present\n{not json';
-        if (over.stateRead === 'empty') return 'present\n';
-        return t.stateText === null ? 'absent\n' : `present\n${t.stateText}`;
-      }
-      const written = /printf '%s' '(.*)' > \S+ && mv -f \S+ \S+$/s.exec(cmd);
-      if (!written) throw new Error(`unrecognised phase journal command: ${cmd}`);
-      t.stateText = written[1];
-      t.stateWrites.push(written[1]);
-      const phase: Phase = JSON.parse(written[1]);
-      events.push(`target:state:${phase.phase}`);
-      return '';
-    }
+    if (cmd.includes(STATE_FILE)) throw new Error(`unrecognised phase journal command: ${cmd}`);
     if (/pm2 stop /.test(cmd)) { t.stopped = true; return ''; }
     if (/pm2 (startOrRestart|start|restart)/.test(cmd)) { t.stopped = false; return ''; }
     if (cmd.includes('.deploy-kit-layout')) return '{"layout":"releases","version":1}';
@@ -171,6 +183,7 @@ function makeTarget(events: string[], over: { builtSha?: string; stateRead?: Sta
 interface ConfigOver {
   preRestartChecks?: Array<{ name: string; command: string }>; layout?: Record<string, unknown>;
   postDeployChecks?: Array<{ name: string; command: string; onFailure: string }>; deliveryEvent?: boolean;
+  hooks?: Record<string, string>;
 }
 const relConfig = (over: ConfigOver = {}) => mergeConfig(DEFAULT_CONFIG, {
   ...(over.preRestartChecks ? { preRestartChecks: over.preRestartChecks } : {}),
@@ -178,7 +191,7 @@ const relConfig = (over: ConfigOver = {}) => mergeConfig(DEFAULT_CONFIG, {
   ...(over.deliveryEvent ? { deliveryEvent: { command: 'deliver-hook' } } : {}),
   host: 'app@pi', projectDir: '/srv/app', appNames: ['app'], dbBoundApps: ['app'], branch: 'master', autoCut: false,
   ecosystemFile: 'shared/ecosystem.config.cjs', health: { attempts: 2, delaySeconds: 0 },
-  hooks: { install: 'npm ci', build: 'npm run build', backup: 'run-backup', migrate: 'run-migrate', restore: 'run-restore' },
+  hooks: { install: 'npm ci', build: 'npm run build', backup: 'run-backup', migrate: 'run-migrate', restore: 'run-restore', ...over.hooks },
   preDeployChecks: [{ name: 'pre', command: 'pre-hook' }],
   layout: { type: 'releases', keepReleases: 4, sharedPaths: [], releaseChecks: [], runningShaCommand: 'get-running-sha', ...over.layout },
   transitionAuthority: { command: 'authority', scope: 'host-a' },
@@ -358,8 +371,8 @@ describe('protected forward automatic recovery', () => {
   const fence = (events: string[]) => events.filter((e) => /^(send:|storage:MUTATING|target:(flip|check|restore|restart))/.test(e));
   const withCheck: ConfigOver = { preRestartChecks: [{ name: 'smoke', command: 'pre-restart-smoke' }] };
 
-  it('SAFE_PHASE_FRESH_CHILD: a failed backup after stop abandons UNKNOWN, then a fresh fenced child resumes the original SHA', () => {
-    const { host, rb, target } = forward({}, {}, failing('run-backup'));
+  it('SAFE_PHASE_FRESH_CHILD: an unconfirmed stop (stop-only window) abandons UNKNOWN, then a fresh fenced child resumes the original SHA', () => {
+    const { host, rb, target } = forward({}, {}, failing('pm2 stop'));
     expect(() => host.deploy(target)).toThrow(/recovered/);
     expect(host.authority.actions).toEqual(['begin', 'abandon', 'begin', 'complete']);
     const [deploy, abandon, recovery, complete] = requestsOf(host);
@@ -378,7 +391,7 @@ describe('protected forward automatic recovery', () => {
   });
 
   it('ABANDON_REFUSAL_ZERO_RECOVERY: an unacknowledged forward abandon starts no recovery and keeps the pending journal', () => {
-    const { host, rb, target } = forward({ authorityFails: (action) => action === 'abandon' }, {}, failing('run-backup'));
+    const { host, rb, target } = forward({ authorityFails: (action) => action === 'abandon' }, {}, failing('pm2 stop'));
     expect(() => host.deploy(target)).toThrow(/abandon was not acknowledged/);
     expect(host.authority.actions).toEqual(['begin', 'abandon']);
     expect(host.journal().operations).toHaveLength(1);
@@ -386,7 +399,73 @@ describe('protected forward automatic recovery', () => {
     expect(phaseOf(target).phase).toBe('stopped');
     expect(host.runtimeEvents()).not.toContain('target:restart');
     expect(host.runtimeEvents()).not.toContain('target:restore');
-    expect(rb.s).toMatchObject({ restarts: 0, online: false });
+    expect(rb.s).toMatchObject({ restarts: 0, online: true }); // the stop never took
+  });
+
+  it.each<[string, Record<string, string>, string]>([
+    ['BACKUP_HOOK_FAILURE_MANUAL', {}, 'run-backup'],
+    ['PENDING_PROBE_FAILURE_MANUAL', { pendingMigrations: 'count-pending' }, 'count-pending'],
+  ])('%s: a failed hook in hook-running abandons the parent UNKNOWN only; no resume, restore or new begin', (_name, hooks, failingCommand) => {
+    const { host, rb, target } = forward({ config: { hooks } }, {}, failing(failingCommand));
+    expect(() => host.deploy(target)).toThrow(/manual recovery assessment required/);
+    expect(host.authority.actions).toEqual(['begin', 'abandon']);
+    expect(requestsOf(host)[1]).toMatchObject({ reason: 'UNKNOWN' });
+    expect(host.journal().operations.map((o) => o.state)).toEqual(['ABANDONED']);
+    expect(phaseOf(target).phase).toBe('hook-running');
+    for (const tag of ['restart', 'restore', 'flip', 'migrate']) expect(host.runtimeEvents()).not.toContain(`target:${tag}`);
+    expect(rb.s).toMatchObject({ restarts: 0, online: false, current: ORIG_DIR });
+    expect(target.t.lastDeploy).toBeNull();
+  });
+
+  it('PHASE_DURABILITY_UNCERTAIN_ZERO_RECOVERY: a phase write failing before stop keeps the op MUTATING and runs nothing further', () => {
+    for (const step of ['fsync-file', 'fsync-dir']) {
+      const host = makeHost();
+      const rb = makeRollbackHost();
+      const target = makeTarget(host.events, { rb, phaseFault: (p) => (p.phase === 'stopped' ? step : undefined) });
+      let thrown: unknown;
+      try { host.deploy(target); } catch (e) { thrown = e; }
+      const codes = thrown instanceof Error ? [Reflect.get(thrown, 'code'), Reflect.get(Object(thrown.cause), 'code')] : [];
+      expect(codes, step).toContain('JOURNAL_FAILED');
+      expect(host.authority.actions, step).toEqual(['begin']);
+      expect(host.journal().operations.map((o) => o.state), step).toEqual(['MUTATING']);
+      expect(host.runtimeEvents(), step).not.toContain('target:stop');
+      expect(host.runtimeEvents(), step).not.toContain('target:restart');
+      expect(rb.s, step).toMatchObject({ restarts: 0, online: true });
+      expect(target.t.lastDeploy, step).toBeNull();
+      // The retry still refuses on MUTATING (interrupted recovery is a later slice): no new begin, abandon or effect.
+      const mark = host.events.length;
+      expect(() => host.deploy(target), step).toThrow(/MUTATING operation requires recovery assessment/);
+      expect(host.authority.actions, step).toEqual(['begin']);
+      expect(host.runtimeEvents(mark), step).toEqual([]);
+    }
+  });
+
+  it.each([
+    ['unversioned done', { phase: 'done', layoutVersion: 1 }],
+    ['unversioned stopped', { phase: 'stopped', layoutVersion: 1 }],
+  ])('LEGACY_PHASE_RECORD_REFUSED: %s is denied before any begin or hook', (_name, stateSeed) => {
+    const host = makeHost();
+    const target = makeTarget(host.events, { stateSeed });
+    expect(() => host.deploy(target)).toThrow(/not a versioned protected phase journal/);
+    expect(host.authority.actions).toEqual([]);
+    expect(host.runtimeEvents()).toEqual([]);
+    expect(target.t.stateWrites).toEqual([]);
+  });
+
+  it.each(['done', 'recovered'])('VERSIONED_TERMINAL_ALLOWED: a versioned %s record at the current layout lets a new deploy begin', (phase) => {
+    const host = makeHost();
+    const target = makeTarget(host.events, { stateSeed: { phase, phaseJournalVersion: 1, layoutVersion: release.LAYOUT_VERSION } });
+    expect(host.deploy(target).healthy).toBe(true);
+    expect(host.authority.actions).toEqual(['begin', 'complete']);
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ['wrong phase version', { phase: 'done', phaseJournalVersion: 2, layoutVersion: 1 }],
+    ['wrong layout version', { phase: 'done', phaseJournalVersion: 1, layoutVersion: 2 }],
+  ])('LEGACY_PHASE_RECORD_REFUSED: %s is denied', (_name, stateSeed) => {
+    const host = makeHost();
+    expect(() => host.deploy(makeTarget(host.events, { stateSeed }))).toThrow(/not a versioned protected phase journal/);
+    expect(host.authority.actions).toEqual([]);
   });
 
   it.each<[string, RollbackOpts, string[]]>([
@@ -443,7 +522,7 @@ describe('protected forward automatic recovery', () => {
   );
 
   it('FINALIZATION_ERROR_NO_RECOVER: a lost recovery complete ACK stays COMPLETE_PENDING with no further abandon, begin or restart', () => {
-    const { host, rb, target } = forward({ authorityFails: (action) => action === 'complete' }, {}, failing('run-backup'));
+    const { host, rb, target } = forward({ authorityFails: (action) => action === 'complete' }, {}, failing('pm2 stop'));
     expect(() => host.deploy(target)).toThrow(/outcome is uncertain/);
     expect(host.authority.actions).toEqual(['begin', 'abandon', 'begin', 'complete']);
     expect(host.journal().operations.map((o) => o.state)).toEqual(['ABANDONED', 'COMPLETE_PENDING']);
