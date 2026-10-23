@@ -864,10 +864,52 @@ function deployRelease(config, options = {}, ctx = {}) {
   };
 
   // Protected mode: inspect the saved authority journal BEFORE any recovery or configured hook.
-  // No old phase journal may bypass authority; anything unsettled fails closed until the
-  // recovery integration slice.
+  // Only a matched durable stop-only record can enter a fresh recovery operation;
+  // every other unsettled state requires explicit assessment.
   function initializeTransitionAuthority() {
-    manager = inspectTransitionAuthority(config, paths, c, ctx);
+    const inspected = inspectTransitionAuthority(config, paths, c, ctx, { allowStoppedRecovery: true });
+    manager = inspected.manager;
+    if (inspected.kind === 'stoppedRecovery') recoverStoppedInterrupted(inspected);
+  }
+
+  // Interrupted stop-only deploy: settle the old operation, restore the previous release under a fresh
+  // parent-linked child, then END the invocation. Never continues into a new deployment.
+  function recoverStoppedInterrupted({ saved, oldOperationId, previousSha, observedCurrent }) {
+    Object.assign(st, freshState(), {
+      phase: 'stopped', releaseId: saved.releaseId, sha: saved.sha, prevTarget: saved.prevTarget,
+      releaseDir: `${paths.releasesDir}/${saved.releaseId}`, backupId: saved.backupId ?? null,
+      migrated: false, flipped: false,
+    });
+    manager.abandonSaved(oldOperationId, 'UNKNOWN');
+    const begun = manager.begin({
+      kind: 'interrupted-recovery', targetSha: previousSha, targetRelease: saved.prevTarget, priorPointer: observedCurrent,
+      effects: { ...CONSERVATIVE_EFFECTS }, parentOperationId: oldOperationId,
+    });
+    operationIdentity = { operationId: begun.operationId, targetSha: previousSha };
+    let observation;
+    try {
+      observation = manager.run(begun.handle, () => {
+        st.phase = 'interrupted-recovery';
+        st.sha = previousSha;
+        journal();
+        if (!resumePrevious(previousSha).ok) throw new Error('failed to bring the previous release back online');
+        const final = verifyActivation(config, paths, previousSha, `${paths.root}/${st.prevTarget}`, c);
+        if (!final.ok) throw new Error(`Activation verification failed: ${final.reason}`);
+        return { observedSha: previousSha, verified: true };
+      });
+    } catch (err) {
+      if (!(err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED') || isPhaseWriteUncertain(err)) throw err;
+      try {
+        manager.abandon(begun.handle, 'UNKNOWN');
+      } catch (abandonErr) {
+        throw recoveryRequired('interrupted recovery failed and abandon was not acknowledged; recovery assessment required', abandonErr);
+      }
+      throw recoveryRequired('interrupted recovery failed and was abandoned UNKNOWN; manual recovery required', err);
+    }
+    manager.complete(begun.handle, observation);
+    st.phase = 'recovered';
+    journal();
+    throw recoveryRequired(`interrupted deploy ${saved.releaseId} recovered to ${saved.prevTarget}; start a new invocation`);
   }
 
   // Failed protected forward deploy, after the failed operation's acknowledged UNKNOWN abandon.
@@ -1510,12 +1552,17 @@ function deployRelease(config, options = {}, ctx = {}) {
 }
 
 // Protected mode: inspect the saved authority journal BEFORE any recovery or configured hook.
-// Shared by forward deploy and manual rollback; returns the manager once nothing is unsettled.
-function inspectTransitionAuthority(config, paths, c, ctx) {
+// Shared by forward deploy and manual rollback; only forward deploy admits matched stopped recovery.
+// Returns { kind: 'ready', manager }, or (only with the forward-only allowStoppedRecovery option)
+// { kind: 'stoppedRecovery', manager, saved, oldOperationId, previousSha, observedCurrent }.
+function inspectTransitionAuthority(config, paths, c, ctx, { allowStoppedRecovery = false } = {}) {
   if (typeof config.layout.runningShaCommand !== 'string' || !config.layout.runningShaCommand.trim()) throw recoveryRequired('transition authority requires a running SHA command for exact activation verification');
   const manager = (ctx.transitionManagerFactory || createTransitionOperationManager)(config, c);
   const operations = manager.inspect().journal?.operations || [];
   const op = operations[operations.length - 1];
+  if (op && op.state === 'MUTATING' && allowStoppedRecovery) {
+    return assessStoppedRecovery(config, paths, c, manager, op);
+  }
   if (op) {
     if (['BEGIN_PENDING', 'COMPLETE_PENDING', 'ABANDON_PENDING'].includes(op.state)) {
       manager.reconcilePending();
@@ -1542,7 +1589,40 @@ function inspectTransitionAuthority(config, paths, c, ctx) {
       throw recoveryRequired(`previous deploy journal in phase "${saved.phase}" requires recovery under transition authority`);
     }
   }
-  return manager;
+  return { kind: 'ready', manager };
+}
+
+// Read-only assessment of a saved MUTATING deploy interrupted in the stop-only window.
+// Everything is validated BEFORE any settlement; any doubt refuses with manual recovery.
+function assessStoppedRecovery(config, paths, c, manager, op) {
+  const refuse = (why, cause) => recoveryRequired(`saved MUTATING operation requires recovery assessment (${why})`, cause);
+  let begin;
+  try { begin = JSON.parse(op.beginJson); } catch (err) { throw refuse('unreadable begin record', err); }
+  let saved;
+  try {
+    saved = createReleasePhaseStorage({ ...config, projectDir: paths.root }, { runtime: c.runtime }).read();
+  } catch (err) {
+    throw refuse('deploy state journal unreadable', err);
+  }
+  const fullSha = /^[0-9a-f]{40}$/;
+  const releaseId = saved?.releaseId;
+  const ok = begin && begin.kind === 'deploy' && saved
+    && saved.phaseJournalVersion === PHASE_JOURNAL_VERSION && saved.layoutVersion === LAYOUT_VERSION
+    && saved.phase === 'stopped' && saved.operationId === op.operationId
+    && typeof begin.targetSha === 'string' && fullSha.test(begin.targetSha)
+    && saved.targetSha === begin.targetSha && saved.sha === begin.targetSha
+    && typeof releaseId === 'string' && RELEASE_ID_RE.test(releaseId)
+    && `releases/${releaseId}` === begin.targetRelease
+    && begin.targetSha.startsWith(releaseId.split('-')[0])
+    && typeof saved.prevTarget === 'string' && RELEASE_TARGET_RE.test(saved.prevTarget)
+    && saved.prevTarget === begin.priorPointer
+    && saved.migrated === false && saved.flipped === false;
+  if (!ok) throw refuse('journal does not match a stop-only deploy');
+  const read = runOnTarget(`readlink ${paths.currentLink}`, { ...config, projectDir: paths.root }, { capture: true, runtime: c.runtime, readOnly: true });
+  const observedCurrent = read.ok ? (read.output || '').trim() : '';
+  if (!read.ok || !RELEASE_TARGET_RE.test(observedCurrent) || observedCurrent !== saved.prevTarget) throw refuse('current does not point at the previous release');
+  const previousSha = resolveReleaseSha(config, paths, saved.prevTarget, 'previous', c);
+  return { kind: 'stoppedRecovery', manager, saved, oldOperationId: op.operationId, previousSha, observedCurrent };
 }
 
 // Read-only: the ACTUAL full commit of a release worktree (never inferred from the directory name).
@@ -1700,7 +1780,7 @@ function rollbackRelease(config, options = {}, ctx = {}) {
   try {
     preflight(config, paths, c);
     const fenced = config.transitionAuthority != null && c.runtime?.dryRun !== true;
-    const manager = fenced ? inspectTransitionAuthority(config, paths, c, ctx) : null;
+    const manager = fenced ? inspectTransitionAuthority(config, paths, c, ctx).manager : null;
     const pointers = readPointers(config, paths, c);
     if (!pointers.previous) throw new Error(`No previous release recorded (${paths.previousLink}); cannot roll back.`);
     assertSafeTarget(pointers.previous, 'previous');
