@@ -18,6 +18,13 @@ const {
 } = require('./verified-ref');
 const { atomicWriteCommand, writeLastDeployRecord } = require('./last-deploy');
 const { assertTransitionAuthorityEntryPoint } = require('./transition-authority');
+const { createTransitionOperationManager, TransitionOperationError } = require('./transition-operation');
+
+// A run may execute trusted hooks that write the production DB, so every effect is declared.
+const CONSERVATIVE_EFFECTS = {
+  stop: true, migrate: true, pointerSwap: true, restart: true, databaseRestore: true,
+};
+const recoveryRequired = (message, cause) => new TransitionOperationError('RECOVERY_REQUIRED', message, cause);
 
 // Bump when the on-host layout changes shape. The host migration writes this
 // version into .deploy-kit-layout; a release deploy refuses a host whose marker
@@ -474,7 +481,13 @@ function deployRelease(config, options = {}, ctx = {}) {
   // process/SSH/power loss leaves an on-host record of whether the DB was migrated
   // and which backup restores it (recovery on the next invocation is a follow-up;
   // this at least makes the truth recoverable instead of lost in process memory).
+  const protectedMode = config.transitionAuthority != null;
+  const dryRun = c.runtime?.dryRun === true;
+  let manager = null;
+  let authorityHandle = null;
+  let operationIdentity = null; // set only once an authority begin is acknowledged
   const journal = () => persistState(config, paths, {
+    ...(operationIdentity || {}),
     phase: st.phase, releaseId: st.releaseId, sha: st.sha, backupId: st.backupId,
     migrated: st.migrated, ...migrationsPendingField(), flipped: st.flipped, prevTarget: st.prevTarget,
     failedCheck: st.failedCheck, failurePolicy: st.failurePolicy,
@@ -819,17 +832,56 @@ function deployRelease(config, options = {}, ctx = {}) {
   };
   const sigHandlers = { SIGINT: () => onSignal('SIGINT'), SIGTERM: () => onSignal('SIGTERM') };
 
+  const runPreDeployChecks = () => {
+    for (const check of config.preDeployChecks) {
+      st.phase = protectedMode ? 'hook-running' : 'preflight';
+      const res = runInDir(paths.root, check.command, config, c, { tolerate: true });
+      if (!res.ok) throw new Error(`Pre-deploy check failed: ${check.name}`);
+    }
+  };
+
+  // Protected mode: inspect the saved authority journal BEFORE any recovery or configured hook.
+  // No old phase journal may bypass authority; anything unsettled fails closed until the
+  // recovery integration slice.
+  function initializeTransitionAuthority() {
+    manager = (ctx.transitionManagerFactory || createTransitionOperationManager)(config, c);
+    const operations = manager.inspect().journal?.operations || [];
+    const op = operations[operations.length - 1];
+    if (op) {
+      if (['BEGIN_PENDING', 'COMPLETE_PENDING', 'ABANDON_PENDING'].includes(op.state)) {
+        manager.reconcilePending();
+        throw recoveryRequired('pending transition RPC reconciled; start a new invocation');
+      }
+      if (op.state === 'AUTHORIZED') {
+        manager.abandonSaved(op.operationId, 'UNKNOWN');
+        throw recoveryRequired('saved authorized operation abandoned UNKNOWN; start a new invocation');
+      }
+      if (op.state === 'MUTATING') {
+        throw recoveryRequired('saved MUTATING operation requires recovery assessment');
+      }
+    }
+    const file = shQuote(paths.stateFile);
+    const phaseRead = runOnTarget(`if [ -e ${file} ] || [ -L ${file} ]; then printf 'present\n'; cat ${file}; else printf 'absent\n'; fi`, { ...config, projectDir: paths.root }, { capture: true, runtime: c.runtime, readOnly: true });
+    if (!phaseRead.ok || typeof phaseRead.output !== 'string') throw recoveryRequired('deploy state journal could not be read under transition authority');
+    let saved = null;
+    if (phaseRead.output !== 'absent\n') {
+      if (!phaseRead.output.startsWith('present\n')) throw recoveryRequired('invalid deploy state journal read response');
+      try { saved = JSON.parse(phaseRead.output.slice('present\n'.length)); } catch { throw recoveryRequired('unreadable deploy state journal under transition authority'); }
+      if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw recoveryRequired('invalid deploy state journal under transition authority');
+    }
+    if (saved && !['done', 'recovered'].includes(saved.phase)) {
+      throw recoveryRequired(`previous deploy journal in phase "${saved.phase}" requires recovery under transition authority`);
+    }
+  }
+
   const release = acquireLock(config, c, { steal: stealLock });
   process.on('SIGINT', sigHandlers.SIGINT);
   process.on('SIGTERM', sigHandlers.SIGTERM);
   try {
     preflight(config, paths, c);
-    recoverInterruptedDeploy();
-    for (const check of config.preDeployChecks) {
-      st.phase = 'preflight';
-      const res = runInDir(paths.root, check.command, config, c, { tolerate: true });
-      if (!res.ok) throw new Error(`Pre-deploy check failed: ${check.name}`);
-    }
+    if (protectedMode && !dryRun) initializeTransitionAuthority();
+    if (!protectedMode || dryRun) recoverInterruptedDeploy();
+    if (!protectedMode) runPreDeployChecks();
 
     // Auto-cut, on the LOCAL controller checkout, runs here -- AFTER the lock
     // is held and after target preflight, interrupted recovery, and pre-deploy
@@ -978,6 +1030,12 @@ function deployRelease(config, options = {}, ctx = {}) {
     steps.push('shared');
 
     const executeCandidate = () => {
+    if (protectedMode) {
+      // Delayed pre-deploy hooks may mutate production: identity is journaled first.
+      st.phase = 'hook-running';
+      if (operationIdentity) journal();
+      runPreDeployChecks();
+    }
     // ---- Phase: install (inside the candidate; current still serving) ----
     st.phase = 'install';
     if (skipDeps) {
@@ -1201,8 +1259,44 @@ function deployRelease(config, options = {}, ctx = {}) {
       ...(deliveryEvent ? { deliveryEvent } : {}),
     };
     };
-    return executeCandidate();
+    if (!protectedMode) return executeCandidate();
+    if (dryRun) {
+      log.info('[dry-run] transition authority would be required: begin/run/complete around the candidate; none performed');
+      return executeCandidate();
+    }
+    const candidateSha = capture(st.releaseDir, 'git rev-parse HEAD', config, c);
+    if (candidateSha !== st.sha) throw recoveryRequired(`Candidate SHA ${candidateSha} != resolved ${st.sha}; refusing authority begin`);
+    const begun = manager.begin({
+      kind: 'deploy', targetSha: st.sha, targetRelease: `releases/${releaseId}`, priorPointer: st.prevTarget,
+      effects: { ...CONSERVATIVE_EFFECTS }, parentOperationId: null,
+    });
+    authorityHandle = begun.handle;
+    operationIdentity = { operationId: begun.operationId, targetSha: st.sha };
+    let deployed;
+    const observation = manager.run(authorityHandle, () => {
+      deployed = executeCandidate();
+      const final = verifyActivation(config, paths, st.sha, st.releaseDir, c);
+      if (!final.ok) throw new Error(`Activation verification failed: ${final.reason}`);
+      return { observedSha: st.sha, verified: true };
+    });
+    manager.complete(authorityHandle, observation);
+    authorityHandle = null;
+    return deployed;
   } catch (err) {
+    if (protectedMode) {
+      // Never generic recover(): early hooks may have mutated production.
+      if (err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED' && authorityHandle) {
+        const handle = authorityHandle;
+        authorityHandle = null;
+        try {
+          manager.abandon(handle, 'UNKNOWN');
+        } catch (abandonErr) {
+          throw recoveryRequired('forward operation failed and abandon was not acknowledged; recovery assessment required', abandonErr);
+        }
+        throw recoveryRequired('forward operation failed and was abandoned UNKNOWN; recovery assessment required', err);
+      }
+      throw err;
+    }
     if (recoveringInterrupted) throw err;
     recover(err);
     throw err;
