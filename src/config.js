@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { log: defaultLog } = require('./log');
 const { verifiedRefProblems } = require('./verified-ref');
+const { DECLARABLE_CLASSES, USER_HOOK_STEPS } = require('./effects');
 
 const CONFIG_FILENAME = '.deploy-kit.config.json';
 
@@ -129,6 +130,9 @@ const DEFAULT_CONFIG = {
   //     runningShaCommand: 'curl -s localhost:PORT/health | jq -r .buildSha',
   //                                       // returns the SHA the live app reports;
   //                                       // asserted == the deployed SHA post-flip.
+  //     effects: { build: 'candidate' },  // hook/step name -> 'candidate' | 'read-only' | 'live'
+  //                                       // (BRAIN-636 D4d). A user hook not declared is 'live',
+  //                                       // which stops a failed deploy being a clean abort.
   //   }
   layout: null,
   // Fleet monitoring + alerting (SMH-116). null (default) = disabled (no-op), so
@@ -557,7 +561,7 @@ function validateMonitor(m, source) {
 
 // Keys allowed inside a `layout` block, with their validators. Absence of most is
 // fine (deploy normalizes defaults); `type` is the only required key.
-const LAYOUT_KEYS = ['type', 'keepReleases', 'sharedPaths', 'releaseChecks', 'runningShaCommand'];
+const LAYOUT_KEYS = ['type', 'keepReleases', 'sharedPaths', 'releaseChecks', 'runningShaCommand', 'effects'];
 
 // Names the on-host runner sets itself (or that would let a config redirect the
 // unit's identity or runtime); they can never be forwarded via `onHost.env`.
@@ -619,6 +623,19 @@ function validateLayout(layout, source) {
   }
   if (layout.runningShaCommand != null && typeof layout.runningShaCommand !== 'string') {
     problems.push(`${source}: "layout.runningShaCommand" must be a string`);
+  }
+  if (layout.effects != null) {
+    if (typeof layout.effects !== 'object' || Array.isArray(layout.effects)) {
+      problems.push(`${source}: "layout.effects" must be an object of step name -> class`);
+    } else {
+      for (const [step, cls] of Object.entries(layout.effects)) {
+        if (!USER_HOOK_STEPS.includes(step)) {
+          problems.push(`${source}: "layout.effects.${step}" is not a declarable step (one of ${USER_HOOK_STEPS.join(', ')}; every other step has a fixed class)`);
+        } else if (!DECLARABLE_CLASSES.includes(cls)) {
+          problems.push(`${source}: "layout.effects.${step}" must be one of ${DECLARABLE_CLASSES.join(', ')}`);
+        }
+      }
+    }
   }
   if (layout.releaseChecks != null) {
     if (!Array.isArray(layout.releaseChecks)) {

@@ -129,6 +129,7 @@ text or redirection filenames.
 | `layout.keepReleases` | `number` | `4` | both | 0.7 | Releases retained when pruning (≥1). |
 | `layout.sharedPaths` | `string[]` | `[]` | both | 0.7 | Relative paths symlinked from `shared/` into every release (dirs, `.env`, uploads — never `node_modules` or a bare SQLite file). Validated relative + non-overlapping. |
 | `layout.releaseChecks` | `{name,command}[]` | `[]` | both | 0.7 | Commands run INSIDE the candidate release before activation (prisma client loads, entrypoint present). Non-zero quarantines the candidate. |
+| `layout.effects` | `{step: 'candidate'\|'read-only'\|'live'}` | `{}` | release | 0.33 | Declares what a user hook may touch: `install`, `generate`, `build`, `releaseChecks`, `preMigrationChecks`. An undeclared hook is `live`. A failed deploy whose executed steps are all `staging`/`candidate`/`read-only` is `aborted-clean` (`effectsClean: true`); any `live` step makes it `effectsClean: false` and leaves the app unresolved. Built-in step classes are fixed in `src/effects.js`. |
 | `layout.runningShaCommand` | `string \| null` | `null` | both | 0.7 | Returns the SHA the live app reports; asserted == deployed SHA post-flip. |
 | `monitor` | `{…} \| null` | `null` | both | 0.8 | Opt-in fleet monitoring + alerting (see below). `null` = disabled. |
 | `monitor.alert` | `{command, run?}` | — | both | 0.8 | Required. Policy-free sink; gets the batched alert JSON on stdin. `run`: `controller` (default) or `target`. |

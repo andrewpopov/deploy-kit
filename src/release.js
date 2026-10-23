@@ -28,6 +28,7 @@ const CONSERVATIVE_EFFECTS = {
 const {
   NO_RECOVERY, shaOfTarget, deployed: deployedResult, failureFromError, attach,
 } = require('./deploy-result');
+const { stepClass, isClean } = require('./effects');
 const recoveryRequired = (message, cause) => new TransitionOperationError('RECOVERY_REQUIRED', message, cause);
 
 // Bump when the on-host layout changes shape. The host migration writes this
@@ -513,6 +514,22 @@ function deployRelease(config, options = {}, ctx = {}) {
   });
   const rollbackAction = () => (st.migrated ? 'restore+flip-back' : 'flip-back');
 
+  // BRAIN-636 D4d effects ledger: each step is reported (ctx.onStep) BEFORE it runs, and its class decides
+  // effectsClean if the pipeline then fails. A step is recorded even when onStep throws: assume it ran.
+  const executedClasses = [];
+  const stepStart = (step) => {
+    const stepClassName = stepClass(config, step);
+    executedClasses.push(stepClassName);
+    if (typeof c.onStep === 'function') c.onStep({ step, class: stepClassName });
+  };
+  // A failure with only staging/candidate/read-only steps behind it, in an unprotected deploy that recovery
+  // only quarantined (or had nothing to quarantine), is a clean abort. Protected mode never claims one.
+  const withEffects = (result) => {
+    const clean = !protectedMode && isClean(executedClasses);
+    const abortedClean = clean && result.status === 'failed' && ['none', 'quarantine'].includes(result.recovery.action);
+    return { ...result, status: abortedClean ? 'aborted-clean' : result.status, effectsClean: clean };
+  };
+
   // Informational audit field, written only once a probe has answered: a deploy
   // without `hooks.pendingMigrations` keeps a byte-identical journal (the consumer
   // regression fixtures pin that).
@@ -834,6 +851,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // release is safe whether the stop itself completed or not.
     const saved = readInterruptedDeploy(config, paths, c);
     if (!saved) return;
+    stepStart('recover-interrupted');
 
     const phase = saved.phase;
     const releaseId = typeof saved.releaseId === 'string' ? saved.releaseId : '';
@@ -891,6 +909,7 @@ function deployRelease(config, options = {}, ctx = {}) {
   const sigHandlers = { SIGINT: () => onSignal('SIGINT'), SIGTERM: () => onSignal('SIGTERM') };
 
   const runPreDeployChecks = () => {
+    if (config.preDeployChecks.length) stepStart('preDeployChecks');
     for (const check of config.preDeployChecks) {
       st.phase = protectedMode ? 'hook-running' : 'preflight';
       const res = runInDir(paths.root, check.command, config, c, { tolerate: true });
@@ -1129,6 +1148,7 @@ function deployRelease(config, options = {}, ctx = {}) {
   process.on('SIGINT', sigHandlers.SIGINT);
   process.on('SIGTERM', sigHandlers.SIGTERM);
   try {
+    stepStart('preflight');
     preflight(config, paths, c);
     if (protectedMode && !dryRun) initializeTransitionAuthority();
     if (!protectedMode || dryRun) recoverInterruptedDeploy();
@@ -1180,6 +1200,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // heads/*` force-updates every local head to the remote (releases are detached, so
     // no worktree has a branch checked out). It also updates a mirror clone's heads
     // harmlessly. --prune keeps deleted branches from lingering.
+    stepStart('fetch');
     runInDir(paths.root, `git --git-dir=${paths.repoGit} fetch --prune ${shQuote(config.remote)} '+refs/heads/*:refs/heads/*'`, config, c);
     // Same branch-resolution rule as the legacy path (README.md: null branch ->
     // resolve origin/HEAD, fall back to master) — the release layout's repo lives
@@ -1262,10 +1283,12 @@ function deployRelease(config, options = {}, ctx = {}) {
     st.releaseId = releaseId;
     st.releaseDir = `${paths.releasesDir}/${releaseId}`;
     log.step(`Materializing release ${releaseId} at ${st.sha.slice(0, 12)}`);
+    stepStart('worktree-add');
     runInDir(paths.root, `git --git-dir=${paths.repoGit} worktree add --detach ${st.releaseDir} ${st.sha}`, config, c);
     steps.push('materialize');
 
     // Symlink shared state in (verifying the release does not track the path).
+    if ((config.layout.sharedPaths || []).length) stepStart('shared-links');
     for (const rel of (config.layout.sharedPaths || [])) {
       const src = `${paths.sharedDir}/${rel}`;
       const dest = `${st.releaseDir}/${rel}`;
@@ -1301,6 +1324,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       log.warning('Skipping dependency install (--skip-deps) — the candidate release will have no node_modules unless sharedPaths supplies one');
     } else {
       log.step('Installing dependencies in the candidate release');
+      stepStart('install');
       runInDir(st.releaseDir, `npm_config_cache=${paths.npmCache} ${config.hooks.install}`, config, c);
       steps.push('install');
       // Always run right after install, never folded into `hooks.build` — a
@@ -1310,6 +1334,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       // config.js's `hooks.generate` comment for the full incident.
       if (config.hooks.generate) {
         log.step('Running post-install generation in the candidate release');
+        stepStart('generate');
         runInDir(st.releaseDir, config.hooks.generate, config, c);
         steps.push('generate');
       }
@@ -1321,6 +1346,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     if (verifyPins) {
       st.phase = 'verify-pins';
       log.step('Verifying dependency pins in the candidate release');
+      stepStart('verify-pins');
       runInDir(st.releaseDir, PIN_CHECK_COMMAND, config, c, { input: buildPinCheckProgram() });
       steps.push('verify-pins');
     }
@@ -1332,6 +1358,7 @@ function deployRelease(config, options = {}, ctx = {}) {
         log.warning('Skipping build (--skip-build)');
       } else {
         log.step('Building the candidate release');
+        stepStart('build');
         runInDir(st.releaseDir, config.hooks.build, config, c);
         steps.push('build');
       }
@@ -1341,6 +1368,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     st.phase = 'validate';
     const builtSha = capture(st.releaseDir, 'git rev-parse HEAD', config, c);
     if (builtSha !== st.sha) throw new Error(`Candidate SHA ${builtSha} != resolved ${st.sha}`);
+    if ((config.layout.releaseChecks || []).length) stepStart('releaseChecks');
     for (const check of (config.layout.releaseChecks || [])) {
       log.step(`Release check: ${check.name}`);
       runInDir(st.releaseDir, check.command, config, c);
@@ -1352,6 +1380,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // a WAL-safe disposable copy, run the candidate migrations against it, and
     // abort without stopping the live service when data-dependent SQL fails.
     if (!skipMigrate) {
+      if (config.preMigrationChecks.length) stepStart('preMigrationChecks');
       for (const check of config.preMigrationChecks) {
         log.step(`Pre-migration check: ${check.name}`);
         runInDir(st.releaseDir, check.command, config, c);
@@ -1370,6 +1399,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       // Codex ordering: stop writers FIRST, THEN back up (consistent snapshot), THEN
       // migrate. The stop is GATED and verified — writers left online would corrupt
       // the backup and defeat the consistent-snapshot guarantee.
+      stepStart('stop-writers');
       st.phase = 'stopped';
       journal();
       log.step(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`);
@@ -1377,6 +1407,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       st.dbAppsPaused = true;
     }
     if (!skipMigrate && config.hooks.backup) {
+      stepStart('backup');
       beginProtectedHook();
       log.step('Backing up the database (writers stopped)');
       const res = runInDir(st.releaseDir, config.hooks.backup, config, c, { capture: true });
@@ -1405,6 +1436,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // ownership -- see README "Skipping a no-op migration").
     let migrateHookNeeded = !skipMigrate && Boolean(config.hooks.migrate);
     if (migrateHookNeeded && config.hooks.pendingMigrations) {
+      stepStart('pending-migrations');
       beginProtectedHook();
       log.step('Checking for pending database migrations (writers stopped)');
       const probe = runInDir(st.releaseDir, config.hooks.pendingMigrations, config, c, { capture: true });
@@ -1433,6 +1465,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       // Mark migrated BEFORE running: a migration that fails partway may have already
       // touched the schema, so recovery from here on must restore the DB, not just
       // resume the previous (possibly-incompatible) code.
+      stepStart('migrate');
       st.phase = 'migrated';
       st.migrated = true;
       journal();
@@ -1448,8 +1481,10 @@ function deployRelease(config, options = {}, ctx = {}) {
     // `current` forward. Only when the old target is a safe releases/<id> value — a
     // pure code deploy with no prior current just skips the previous update.
     if (st.prevTarget && RELEASE_TARGET_RE.test(st.prevTarget)) {
+      stepStart('previous-pointer');
       activateSymlink(config, paths, st.prevTarget, c, { link: paths.previousLink });
     }
+    stepStart('current-pointer');
     activateSymlink(config, paths, `releases/${releaseId}`, c);
     st.flipped = true;
     steps.push('flip');
@@ -1459,6 +1494,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // process. A failure here throws into the 'flipped'-phase recovery (flips
     // `current` back, restores DB if migrated, resumes the previous release) —
     // the same recovery a failure anywhere else in this phase gets.
+    if (config.preRestartChecks.length) stepStart('preRestartChecks');
     for (const check of config.preRestartChecks) {
       log.step(`Pre-restart check: ${check.name}`);
       runInDir(paths.root, check.command, config, c);
@@ -1466,6 +1502,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     }
 
     log.step('Restarting apps from the stable ecosystem');
+    stepStart('pm2-restart');
     runInDir(paths.root, pm2Activate(config, paths), config, c);
     runInDir(paths.root, 'pm2 save 2>/dev/null || true', config, c, { tolerate: true });
 
@@ -1482,6 +1519,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // outcome is journaled before a durable delivery event is attempted.
     st.phase = 'post-deploy';
     journal();
+    if (config.postDeployChecks.length) stepStart('postDeployChecks');
     for (const check of config.postDeployChecks) {
       log.step(`Post-deploy check: ${check.name}`);
       const result = runInDir(paths.root, check.command, config, c, { tolerate: true });
@@ -1502,6 +1540,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // the authority completion ACK; only then does recordSuccess run.
     const fenced = protectedMode && !dryRun;
     if (!fenced) recordSuccess();
+    stepStart('prune');
     prune(config, paths, releaseId, c);
     steps.push('prune');
 
@@ -1581,16 +1620,16 @@ function deployRelease(config, options = {}, ctx = {}) {
         }
         throw err;
       } catch (protectedError) {
-        throw attach(protectedError, failureFromError(resultFacts(stage), NO_RECOVERY, protectedError));
+        throw attach(protectedError, withEffects(failureFromError(resultFacts(stage), NO_RECOVERY, protectedError)));
       }
     }
-    if (recoveringInterrupted) throw attach(err, failureFromError(resultFacts(stage), recoveryInfo, err));
+    if (recoveringInterrupted) throw attach(err, withEffects(failureFromError(resultFacts(stage), recoveryInfo, err)));
     try {
       recover(err);
     } catch (recoveryError) {
-      throw attach(recoveryError, failureFromError(resultFacts(stage), recoveryInfo, recoveryError));
+      throw attach(recoveryError, withEffects(failureFromError(resultFacts(stage), recoveryInfo, recoveryError)));
     }
-    throw attach(err, failureFromError(resultFacts(stage), recoveryInfo, err));
+    throw attach(err, withEffects(failureFromError(resultFacts(stage), recoveryInfo, err)));
   } finally {
     process.removeListener('SIGINT', sigHandlers.SIGINT);
     process.removeListener('SIGTERM', sigHandlers.SIGTERM);

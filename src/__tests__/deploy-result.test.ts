@@ -135,9 +135,9 @@ describe('DeployResult: forward deploy', () => {
     expect(result).toMatchObject({ status: 'failed', stage: 'build', migrated: false, liveAfter: '00000000aaaa', recovery: { action: 'quarantine', verified: false } });
   });
 
-  it('a failure before a candidate exists: failed, no recovery', () => {
+  it('a failure before a candidate exists: nothing live ran, so aborted-clean with no recovery', () => {
     const result = failedResult(() => deploy(config(), { fail: ['mv --version'] }));
-    expect(result).toMatchObject({ status: 'failed', recovery: { action: 'none', verified: false } });
+    expect(result).toMatchObject({ status: 'aborted-clean', effectsClean: true, recovery: { action: 'none', verified: false } });
   });
 
   it('writers stopped, nothing migrated: resume-previous, verified', () => {

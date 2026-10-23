@@ -21,6 +21,7 @@ const {
   NO_RECOVERY, deployed, failureFromError, pickDeployResult,
 } = require('../deploy-result');
 const { releasePaths } = require('../release');
+const { stepClass } = require('../effects');
 const {
   stateFiles, classifyHold, classifyEpoch, classifyJournal,
 } = require('../target-state');
@@ -81,6 +82,23 @@ function readIfPresent(file) {
   }
 }
 
+// BRAIN-636 D4d: the effects ledger. One JSON line per step, fsynced BEFORE the step runs, so a crash
+// mid-step still shows what was about to happen. `entries` collects the same lines for terminal.json.
+function openLedger(file) {
+  const fd = fs.openSync(file, 'a', 0o600);
+  const entries = [];
+  return {
+    entries,
+    record: ({ step, class: stepClass }) => {
+      const entry = { step, class: stepClass };
+      entries.push(entry);
+      fs.writeSync(fd, `${JSON.stringify(entry)}\n`);
+      fs.fsyncSync(fd);
+    },
+    close: () => fs.closeSync(fd),
+  };
+}
+
 function targetFiles(config, home) {
   return Object.fromEntries(Object.entries(stateFiles(config)).map(([key, value]) => [key, value.replace('$HOME', home)]));
 }
@@ -134,10 +152,11 @@ function takeLocks({ config, request, runId, nowSec, deps }) {
   }
 }
 
-function stageObjects({ config, request, paths, nowSec, git }) {
+function stageObjects({ config, request, paths, nowSec, git, ledger }) {
   const remainingMs = (request.notAfter - nowSec()) * 1000;
   if (remainingMs <= 0) throw new Refusal('late', 'notAfter passed before staging');
   const timeoutMs = Math.min(config.stepTimeoutSeconds * 1000, remainingMs);
+  ledger.record({ step: 'staging-fetch', class: stepClass({}, 'staging-fetch') });
   try {
     git.stage({ repoGit: paths.repoGit, remote: config.remote, sha: request.sha, timeoutMs });
   } catch (error) {
@@ -278,16 +297,30 @@ function needsResolution(result) {
   return true;
 }
 
-function execute({ files, runDir, runId, request, config, options, handle, deps, crashAt }) {
+function readLiveOrNull(git, paths) {
+  try {
+    return git.readLive(paths);
+  } catch {
+    return null;
+  }
+}
+
+function execute({
+  files, runDir, runId, request, config, options, handle, deps, crashAt, ledger, liveBefore, paths,
+}) {
   let result;
   try {
-    const ctx = { ownedLocks: handle, recoverInterrupted: 'refuse', ...(deps.runtime ? { runtime: deps.runtime } : {}) };
+    const ctx = {
+      ownedLocks: handle, recoverInterrupted: 'refuse', onStep: ledger.record, ...(deps.runtime ? { runtime: deps.runtime } : {}),
+    };
     result = resultOf(deps.deployRelease(config, options, ctx));
   } catch (error) {
     deps.log.error(error instanceof Error ? error.message : String(error));
     result = resultOf(undefined, error);
   }
   crashAt('after-release-result');
+  // The full 40-hex shas, read here rather than taken from the pipeline's release-id prefixes.
+  result = { ...result, liveBefore, liveAfter: readLiveOrNull(deps.git || defaultGit, paths) };
   const finishedAt = deps.now().toISOString();
   if (needsResolution(result)) {
     replaceRecord(files.unresolved, {
@@ -295,7 +328,7 @@ function execute({ files, runDir, runId, request, config, options, handle, deps,
     });
   }
   createRecord(path.join(runDir, 'terminal.json'), {
-    runId, kind: request.kind, result, effects: null, kitArtifact: request.kitArtifact, finishedAt,
+    runId, kind: request.kind, result, effects: ledger.entries, kitArtifact: request.kitArtifact, finishedAt,
   });
   const ok = result.status === 'deployed';
   replaceRecord(path.join(runDir, 'outcome.json'), { runId, ok, ...(result.error ? { error: result.error } : {}), finishedAt });
@@ -310,12 +343,15 @@ function runAccepted({ runDir, runId, request, config, options, deps }) {
   const crash = deps.crash || defaultCrash;
   const crashAt = (point) => { if (deps.env.DEPLOY_KIT_TEST_CRASH_AT === point) crash(point); };
   let handle = null;
+  let ledger = null;
   let accepted = false;
   let crashed = false;
   try {
     handle = takeLocks({ config, request, runId, nowSec, deps });
     crashAt('after-lock');
-    stageObjects({ config, request, paths, nowSec, git: deps.git || defaultGit });
+    fs.mkdirSync(runDir, { recursive: true });
+    ledger = openLedger(path.join(runDir, 'effects.jsonl'));
+    stageObjects({ config, request, paths, nowSec, git: deps.git || defaultGit, ledger });
     crashAt('after-staging');
     const { plan, liveBefore } = checkGates({ files, request, runId, paths, nowSec, deps });
     if (request.kind === 'deploy') runPreDeployChecks({ config, paths, deps });
@@ -325,7 +361,9 @@ function runAccepted({ runDir, runId, request, config, options, deps }) {
       files, runDir, runId, request, plan, liveBefore, deps, crashAt, onAccepted: () => { accepted = true; },
     });
     crashAt('after-accept');
-    return execute({ files, runDir, runId, request, config, options, handle, deps, crashAt });
+    return execute({
+      files, runDir, runId, request, config, options, handle, deps, crashAt, ledger, liveBefore, paths,
+    });
   } catch (error) {
     if (error instanceof CrashSeam) crashed = true;
     if (crashed || accepted) throw error;
@@ -334,6 +372,7 @@ function runAccepted({ runDir, runId, request, config, options, deps }) {
     deps.log.error(refusal.message);
     return 1;
   } finally {
+    if (ledger) ledger.close();
     if (handle && !crashed) releaseOwnedLocks(handle);
   }
 }
