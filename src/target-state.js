@@ -7,11 +7,21 @@
 // takes the app lock as owner `kind: session` through the D1a protocol (guard flock, owner record
 // with its own pid and sid), fails fast with `refused lock-held` instead of waiting for a running
 // deploy, does its work with builtins plus the coreutils a file write needs, and releases the lock
-// nonce-matched under the guard. It runs no hook, no node and nothing detached: a lock owner whose
-// descendants cannot create another session is what lets a breaker prove the owner gone by its sid.
+// nonce-matched under the guard. It runs no hook and nothing detached: a lock owner whose descendants
+// cannot create another session is what lets a breaker prove the owner gone by its sid.
+// The one exception is `request cancel`, which must parse and validate the reservation, the holder's
+// terminal.json and the accepted-run metadata with the same validators the status reader uses (status.js,
+// deploy-result.js). It runs `node` ONCE, synchronously, by the absolute path `command -v node` +
+// `readlink -f` resolve (as on-host/operator.js does), and waits for it inside the critical section. That
+// keeps Amendment A's single-session guarantee: the child is not detached, starts no session and exits
+// before the lock is released, so the owner's sid still names exactly the owner (plus that waited-for
+// child while it validates) and nothing after release. A non-zero exit or an unusable verdict is
+// `not-cancellable corrupt`; unreadable accepted-run metadata fails closed the same way. The validators
+// are carried inside the node program itself (see validatorSource), so nothing is looked up on the target.
 // The reservation shape this reads and writes is on-host/status.js's validateReservation.
 // Nothing else may write these files.
 
+const fs = require('fs');
 const path = require('path');
 const { runOnTarget, shQuote } = require('./exec');
 const {
@@ -19,8 +29,9 @@ const {
 } = require('./lock');
 const { isReleaseLayout, releasePaths } = require('./release');
 const { parseFramedReply } = require('./on-host/attach');
-const { RUN_ID_RE, isPlainObject, parseRecord } = require('./on-host/outcome');
+const { isPlainObject, parseRecord } = require('./on-host/outcome');
 const { readRecord, validateReservation } = require('./on-host/status');
+
 
 const REMOTE_CALL_TIMEOUT_SECONDS = 30;
 const BASE_FRAMES = ['hold', 'lastEpoch', 'liveSha', 'appLock', 'appOwner'];
@@ -171,33 +182,94 @@ function setEpoch(config, value, { runtime, pauseFifo } = {}) {
   return runSession(config, runtime, sessionScript(config, { purpose: 'epoch-set', body, pauseFifo }));
 }
 
-// The cancel decision, in shell, over the files D5's status.js validates in node. A record that fails the
-// shape below is `corrupt`, never absent and never cancellable. Values are tokens (run ids, ints, ISO
-// times), so the compact-JSON field extraction is exact for what D4a writes with JSON.stringify.
+// The validator the locked cancel script runs once, synchronously, as `node -e`. It parses and
+// validates the reservation, the holder's terminal.json and the accepted-run metadata with the SAME
+// validators the status reader uses (status.js validateReservation/validateTerminal, which use
+// deploy-result.js validateDeployResult), and prints ONE verdict line: `<verdict> [a [b...]]`.
+// Anything it cannot read or parse throws, so the process exits non-zero and the script fails closed.
+const VALIDATOR_BODY = String.raw`
+const fs = require('fs');
+const path = require('path');
+const { readRecord, validateReservation, validateTerminal, parseRecord, isPlainObject } = loadValidators();
+const { DK_RID: rid, DK_RF: reservationFile, DK_RUNS: runsDir } = process.env;
+const readOptional = (file) => {
+  try { return fs.readFileSync(file, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+};
+const oneLine = (text) => String(text).replace(/\s+/g, ' ');
+const say = (...words) => { process.stdout.write(words.join(' ') + '\n'); };
+
+function acceptedRunNamingRequest() {
+  let names;
+  try { names = fs.readdirSync(runsDir); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  for (const name of names) {
+    if (readOptional(path.join(runsDir, name, 'accepted.json')) === null) continue;
+    const meta = parseRecord(readOptional(path.join(runsDir, name, 'meta.json')));
+    if (meta.absent || meta.error || !isPlainObject(meta.record)) return { unreadable: name };
+    if (meta.record.requestId === rid) return { name };
+  }
+  return null;
+}
+
+const raw = readOptional(reservationFile);
+if (raw === null) {
+  const taken = acceptedRunNamingRequest();
+  if (taken && taken.unreadable) say('corrupt', 'accepted-run metadata of ' + taken.unreadable + ' is unreadable');
+  else if (taken) say('missing');
+  else say('none');
+} else {
+  const reservation = readRecord(raw, validateReservation, rid);
+  if (reservation.state !== 'valid') say('corrupt', oneLine(reservation.problem));
+  else if (reservation.value.state === 'cancelled') say('already', reservation.value.gen);
+  else {
+    const { runId: holder, gen } = reservation.value;
+    const rawTerminal = readOptional(path.join(runsDir, holder, 'terminal.json'));
+    if (rawTerminal === null) say('taken', holder);
+    else {
+      const terminal = readRecord(rawTerminal, validateTerminal, holder);
+      if (terminal.state !== 'valid') say('terminal-corrupt', oneLine(terminal.problem));
+      else if (terminal.value.result.status === 'aborted-clean' && terminal.value.result.effectsClean === true) say('clean', gen, holder);
+      else say('executed', holder);
+    }
+  }
+}
+`;
+
+// The validators travel INSIDE the program: the controller runs this over ssh, and the target has no
+// persistent kit outside per-run bundles (operator.js buildBundle stages kit/ under runs/<id>/), so no
+// builder-side path can be relied on. status.js, outcome.js and deploy-result.js are the same files the
+// rest of deploy-kit uses (about 19 KB together); status.js's other requires (exec, lock, attach) are only
+// used by its remote readers, never by the validators, so the loader gives them an empty module.
+const VALIDATOR_FILES = { 'on-host/status': 'status', 'on-host/outcome': 'outcome', 'deploy-result': 'deploy-result' };
+function validatorSource() {
+  const sources = {};
+  for (const [file, name] of Object.entries(VALIDATOR_FILES)) sources[name] = fs.readFileSync(path.join(__dirname, `${file}.js`), 'utf8');
+  return `const SOURCES = ${JSON.stringify(sources)};
+const LOADED = {};
+function loadValidators() {
+  const load = (name) => {
+    if (LOADED[name]) return LOADED[name].exports;
+    const module = { exports: {} };
+    LOADED[name] = module;
+    const need = (spec) => { const base = spec.split('/').pop(); return SOURCES[base] ? load(base) : {}; };
+    new Function('require', 'module', 'exports', SOURCES[name])(need, module, module.exports);
+    return module.exports;
+  };
+  return { ...load('status'), ...load('outcome') };
+}
+${VALIDATOR_BODY}`;
+}
+
+// The cancel decision. The shell owns the lock and the one write (the tombstone); node owns every
+// parse and validation (validatorSource()). A validator that fails, prints nothing usable or cannot
+// be started is `not-cancellable corrupt`, never absent and never cancellable.
 function cancelBody(config, requestId, at) {
-  const { requests, runs } = stateFiles(config);
+  const { base, requests, runs } = stateFiles(config);
   const rf = `${requests}/${requestId}.json`;
-  const runIdRe = RUN_ID_RE.source;
   return String.raw`
   rid=${shQuote(requestId)}
   at=${shQuote(at)}
   rf="${rf}"
-  compact() { tr -d ' \t\r\n' < "$1"; }
-  jstr() { printf '%s' "$c" | sed -n 's/.*"'"$1"'":"\([^"]*\)".*/\1/p' | head -n 1; }
-  jnum() { printf '%s' "$c" | sed -n 's/.*"'"$1"'":\([0-9][0-9]*\)[,}].*/\1/p' | head -n 1; }
-  jnull() { printf '%s' "$c" | grep -Eq '"'"$1"'":null[,}]'; }
-  isrun() { printf '%s' "$1" | grep -Eq '${runIdRe}'; }
-  isgen() { case "$1" in ""|*[!0-9]*|0*|${'?'.repeat(MAX_EPOCH_DIGITS+1)}*) return 1 ;; esac; }
   refuse() { echo "not-cancellable $1"; [ -z "$2" ] || echo "detail: $2"; return ${EXIT_REFUSED}; }
-  accepted_run_exists() {
-    for m in "${runs}"/*/meta.json; do
-      [ -f "$m" ] || continue
-      d=$(dirname "$m")
-      [ -f "$d/accepted.json" ] || continue
-      if compact "$m" | grep -Fq '"requestId":"'"$rid"'"'; then return 0; fi
-    done
-    return 1
-  }
   write_tombstone() {
     mkdir -p -m 700 "${requests}" || return 2
     tmp="$rf.tmp.$$"
@@ -206,46 +278,28 @@ function cancelBody(config, requestId, at) {
     mv "$tmp" "$rf" || return 2
     echo "cancelled $rid gen=$1"
   }
-  # sets $problem; $state $gen $holder on success
-  read_reservation() {
-    problem=; state=; gen=; holder=
-    c=$(compact "$rf") || { problem="unreadable"; return; }
-    case "$c" in "{"*"}") ;; *) problem="not an object"; return ;; esac
-    prev=$(printf '%s' "$c" | sed -n 's/.*"prev":{\([^}]*\)}.*/\1/p')
-    c=$(printf '%s' "$c" | sed 's/"prev":{[^}]*}/"prev":P/')
-    [ "$(jstr requestId)" = "$rid" ] || { problem="requestId is not $rid"; return; }
-    gen=$(jnum gen); isgen "$gen" || { problem="gen is not a positive integer"; return; }
-    state=$(jstr state)
-    case "$state" in accepted|cancelled) ;; *) problem="state is not accepted or cancelled"; return ;; esac
-    holder=$(jstr runId)
-    if [ -n "$holder" ]; then isrun "$holder" || { problem="runId is not a run id or null"; return; }
-    else jnull runId || { problem="runId is not a run id or null"; return; }; fi
-    [ "$state" != accepted ] || [ -n "$holder" ] || { problem="an accepted reservation has no runId"; return; }
-    [ -n "$(jstr at)" ] || { problem="at is not a string"; return; }
-    [ -n "$(jstr liveBefore)" ] || jnull liveBefore || { problem="liveBefore is not a string or null"; return; }
-    if printf '%s' "$c" | grep -Fq '"prev":P'; then
-      c="{$prev}"; pr=$(jstr runId); pg=$(jnum gen)
-      { [ -n "$pr" ] && isrun "$pr" && isgen "$pg"; } || { problem="prev is not null or {runId, gen}"; return; }
-    elif ! jnull prev; then problem="prev is not null or {runId, gen}"; return; fi
-  }
-  if [ ! -e "$rf" ]; then
-    if accepted_run_exists; then refuse reservation-missing "an accepted run names this request"; return $?; fi
-    write_tombstone 1 null; return $?
+  node_bin=$(command -v node 2>/dev/null) && node_bin=$(readlink -f "$node_bin" 2>/dev/null)
+  case "$node_bin" in /*) [ -x "$node_bin" ] || node_bin= ;; *) node_bin= ;; esac
+  if [ -z "$node_bin" ]; then refuse corrupt "no absolute node binary to validate with"; return $?; fi
+  verdict_file="${base}/cancel-verdict.$$"
+  if ! DK_RID="$rid" DK_RF="$rf" DK_RUNS="${runs}" \
+    "$node_bin" -e ${shQuote(validatorSource())} > "$verdict_file" 2>/dev/null; then
+    rm -f "$verdict_file"; refuse corrupt "the validator did not complete"; return $?
   fi
-  read_reservation
-  if [ -n "$problem" ]; then refuse corrupt "$problem"; return $?; fi
-  if [ "$state" = cancelled ]; then echo "cancelled $rid gen=$gen (already)"; return 0; fi
-  tf="${runs}/$holder/terminal.json"
-  if [ ! -e "$tf" ]; then refuse request-taken "run $holder has no terminal.json"; return $?; fi
-  t=$(compact "$tf") || { refuse terminal-corrupt "unreadable"; return $?; }
-  case "$t" in "{"*"}") ;; *) refuse terminal-corrupt "not an object"; return $? ;; esac
-  c="$t"
-  { [ "$(jstr runId)" = "$holder" ] && [ -n "$(jstr finishedAt)" ] && printf '%s' "$t" | grep -Eq '"kind":"(deploy|rollback|recover)"' \
-    && printf '%s' "$t" | grep -Fq '"result":{'; } || { refuse terminal-corrupt "fails validation"; return $?; }
-  if printf '%s' "$t" | grep -Fq '"status":"aborted-clean"' && printf '%s' "$t" | grep -Fq '"effectsClean":true'; then
-    write_tombstone "$((gen + 1))" '{"runId":"'"$holder"'","gen":'"$gen"'}'; return $?
-  fi
-  refuse request-executed "run $holder ended without a clean abort"; return $?
+  verdict=; a=; b=
+  read -r verdict a b < "$verdict_file"; rm -f "$verdict_file"
+  case "$verdict" in
+    none) write_tombstone 1 null; return $? ;;
+    missing) refuse reservation-missing "an accepted run names this request"; return $? ;;
+    already) echo "cancelled $rid gen=$a (already)"; return 0 ;;
+    taken) refuse request-taken "run $a has no terminal.json"; return $? ;;
+    terminal-corrupt) refuse terminal-corrupt "$a $b"; return $? ;;
+    executed) refuse request-executed "run $a ended without a clean abort"; return $? ;;
+    clean)
+      case "$a" in ""|*[!0-9]*) refuse corrupt "the validator reported gen $a"; return $? ;; esac
+      write_tombstone "$((a + 1))" '{"runId":"'"$b"'","gen":'"$a"'}'; return $? ;;
+    *) refuse corrupt "$verdict $a $b"; return $? ;;
+  esac
 `;
 }
 

@@ -59,3 +59,20 @@ export function holdAppLock(config: any, home: string, runId = 'someone-else') {
   const optedIn = { ...config, onHost: { required: true } };
   return lock.acquireLock(optedIn, { runtime: runtimeFor(home) }, { kind: 'unit', runId, purpose: 'deploy' });
 }
+
+// A `node` ahead of the real one on PATH that records who started it, then execs the real node. The
+// lock session test uses it to see the one waited-for child that `request cancel` runs while validating.
+// Returns the env to give runtimeFor() and the file the shim appends `<ppid> <sid>` to.
+export function nodeShim(home: string, ownerFile: string) {
+  const dir = join(home, 'shim-bin');
+  const log = join(home, 'node-shim.log');
+  mkdirSync(dir, { recursive: true });
+  const shim = join(dir, 'node');
+  writeFileSync(shim, [
+    '#!/bin/sh',
+    'sid=; [ -e /proc/self/stat ] && sid=$(ps -o sid= -p $$ | tr -d " ")',
+    `echo "$(ps -o ppid= -p $$ | tr -d ' ') $sid $(cat ${JSON.stringify(ownerFile)} 2>/dev/null | tr -d '\\n')" >> ${JSON.stringify(log)}`,
+    `exec ${JSON.stringify(process.execPath)} "$@"`,
+  ].join('\n'), { mode: 0o755 });
+  return { env: { PATH: `${dir}:${process.env.PATH}` }, log };
+}
