@@ -10,12 +10,14 @@
 // then the directory is synced. The reservation (requests/<id>.json) is replaced by rename under both
 // locks only; its table of cases is plan §4.2. A failure after a possible live effect writes the app's
 // unresolved.json (before terminal.json), which blocks every later request for the app until
-// `deploy-kit resolve` clears it (plan "Amendments from vet round 4", B).
+// `deploy-kit resolve` clears it (plan "Amendments from vet round 4", B). A run killed before that point leaves no
+// terminal.json and no unresolved.json, so acceptance also writes an in-flight marker (<lock id>.inflight.json) that only
+// a terminal result which needs no resolution removes; admission turns a stranded one into the unresolved marker.
 
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { acquireOwnedLocks, releaseOwnedLocks } = require('../lock');
+const { acquireOwnedLocks, releaseOwnedLocks, lockId } = require('../lock');
 const { runOnTarget } = require('../exec');
 const {
   NO_RECOVERY, deployed, failureFromError, pickDeployResult,
@@ -100,7 +102,8 @@ function openLedger(file) {
 }
 
 function targetFiles(config, home) {
-  return Object.fromEntries(Object.entries(stateFiles(config)).map(([key, value]) => [key, value.replace('$HOME', home)]));
+  const files = Object.fromEntries(Object.entries(stateFiles(config)).map(([key, value]) => [key, value.replace('$HOME', home)]));
+  return { ...files, inflight: `${files.base}/deploy-kit-${lockId(config)}.inflight.json` };
 }
 
 // ---- default git and check seams (tests inject fakes) ----------------------------------------------
@@ -256,37 +259,70 @@ function readUnresolved(files) {
   }
 }
 
+function readInflight(files) {
+  const raw = readIfPresent(files.inflight);
+  if (raw === null) return null;
+  try {
+    const marker = JSON.parse(raw);
+    return marker !== null && typeof marker === 'object' && typeof marker.runId === 'string' && typeof marker.requestId === 'string' ? marker : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// An in-flight marker whose run never wrote a valid terminal.json belongs to a run that was killed (or lost) after
+// acceptance: production may have changed. It becomes the unresolved marker, which `deploy-kit resolve` and a
+// recover for that run already know how to settle. A run that did finish just left the marker behind: it is dropped.
+// A marker that cannot be read is left alone and blocks (checkUnresolved).
+function settleInflight(files, deps) {
+  const inflight = readInflight(files);
+  if (inflight === null || inflight === undefined) return;
+  const terminal = readRecord(readIfPresent(path.join(files.runs, inflight.runId, 'terminal.json')), validateTerminal, inflight.runId);
+  if (terminal.state === 'valid') {
+    fs.rmSync(files.inflight, { force: true });
+    return;
+  }
+  if (!fs.existsSync(files.unresolved)) {
+    replaceRecord(files.unresolved, {
+      requestId: inflight.requestId, runId: inflight.runId, kind: inflight.kind, status: 'unknown',
+      error: 'the run was accepted but never wrote a terminal.json (killed or lost mid-run)', at: deps.now().toISOString(),
+    });
+  }
+  fs.rmSync(files.inflight, { force: true });
+}
+
 // A recover is how an unresolved app gets settled, so the marker does not block the one recover whose parent
 // is the run that left it. Any other request, and a marker that cannot be read, still refuse.
-function checkUnresolved(files, request) {
+function checkUnresolved(files, request, deps) {
+  if (fs.existsSync(files.inflight) && readInflight(files) === undefined) {
+    throw new Refusal('app-unresolved', `${files.inflight} is unreadable: an earlier run may have changed production; run deploy-kit resolve`);
+  }
+  settleInflight(files, deps);
   if (!fs.existsSync(files.unresolved)) return;
   const marker = readUnresolved(files);
   if (request.kind === 'recover' && marker !== null && marker.runId === request.parentRunId) return;
   throw new Refusal('app-unresolved', `${files.unresolved} exists: an earlier request may have changed production; run deploy-kit resolve`);
 }
 
-// The release a parent run deployed starts with its sha's first 12 characters (`<sha12>-<timestamp>`). accepted.json
-// is the proof the run was accepted; meta.json is the fallback for a run staged before acceptance was written.
-function parentSha(files, parentRunId) {
-  for (const name of ['accepted.json', 'meta.json']) {
-    const raw = readIfPresent(path.join(files.runs, parentRunId, name));
-    if (raw === null) continue;
-    try {
-      const { sha } = JSON.parse(raw);
-      if (typeof sha === 'string') return sha;
-    } catch {
-      return null;
-    }
+// The release a parent run created, as the run itself recorded it (release.json, written by the pipeline before it touched
+// the release). Never inferred from a sha: two attempts at one sha create different releases.
+function parentRelease(files, parentRunId) {
+  const raw = readIfPresent(path.join(files.runs, parentRunId, 'release.json'));
+  if (raw === null) return null;
+  try {
+    const record = JSON.parse(raw);
+    return record !== null && typeof record === 'object' && record.runId === parentRunId && typeof record.releaseId === 'string' ? record.releaseId : null;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 function checkRecover({ request, journal, files }) {
   if (journal.class !== 'interrupted') throw new Refusal('nothing-to-recover', `journal is ${journal.class}`);
-  const sha = parentSha(files, request.parentRunId);
-  if (sha === null) throw new Refusal('recover-parent-mismatch', `parent run ${request.parentRunId} has no readable accepted.json or meta.json sha`);
-  if (journal.releaseId === null || !journal.releaseId.startsWith(`${sha.slice(0, 12)}-`)) {
-    throw new Refusal('recover-parent-mismatch', `journal release ${journal.releaseId} is not a release of parent run ${request.parentRunId} (sha ${sha.slice(0, 12)})`);
+  const releaseId = parentRelease(files, request.parentRunId);
+  if (releaseId === null) throw new Refusal('recover-parent-unknown', `parent run ${request.parentRunId} has no readable release.json`);
+  if (journal.releaseId !== releaseId) {
+    throw new Refusal('recover-parent-mismatch', `journal release ${journal.releaseId} is not release ${releaseId}, the one parent run ${request.parentRunId} created`);
   }
 }
 
@@ -332,7 +368,7 @@ function checkGates({ files, request, runId, paths, nowSec, deps }) {
   if (hold && (hold.corrupt || !hold.expired)) throw new Refusal('hold', hold.corrupt ? hold.problem : hold.reason);
   if (nowSec() >= request.notAfter) throw new Refusal('late', `notAfter ${request.notAfter}`);
   const plan = checkReservation({ files, request, runId });
-  checkUnresolved(files, request);
+  checkUnresolved(files, request, deps);
   const liveBefore = checkKind({ request, paths, git, files });
   return { plan, liveBefore };
 }
@@ -358,6 +394,8 @@ function accept({ files, runDir, runId, request, plan, liveBefore, deps, crashAt
   replaceRecord(path.join(files.requests, `${request.requestId}.json`), {
     requestId: request.requestId, gen: plan.gen, state: 'accepted', runId, at, liveBefore, prev: plan.prev,
   });
+  // From here the pipeline may change production: nothing but a terminal result that needs no resolution clears this.
+  replaceRecord(files.inflight, { requestId: request.requestId, runId, kind: request.kind, at });
 }
 
 // The pipeline's DeployResult (src/deploy-result.js): the fields of what deployRelease returned, or the one
@@ -411,7 +449,12 @@ function execute({
   let result;
   try {
     const ctx = {
-      ownedLocks: handle, recoverInterrupted: 'refuse', onStep: ledger.record, notAfter: request.notAfter, ...(deps.runtime ? { runtime: deps.runtime } : {}),
+      ownedLocks: handle,
+      recoverInterrupted: 'refuse',
+      onStep: ledger.record,
+      onRelease: ({ releaseId, sha }) => createRecord(path.join(runDir, 'release.json'), { runId, requestId: request.requestId, releaseId, sha }),
+      notAfter: request.notAfter,
+      ...(deps.runtime ? { runtime: deps.runtime } : {}),
     };
     const pipeline = { deploy: deps.deployRelease, rollback: deps.rollbackRelease, recover: deps.recoverRelease }[request.kind];
     result = resultOf(pipeline(config, options, ctx));
@@ -434,6 +477,9 @@ function execute({
   createRecord(path.join(runDir, 'terminal.json'), {
     runId, kind: request.kind, result, effects: ledger.entries, kitArtifact: request.kitArtifact, finishedAt,
   });
+  // terminal.json is on disk, so the in-flight marker has done its job: a result that needs resolution already
+  // became (or, for a failed recover, kept) the unresolved marker above, and any other needs no marker at all.
+  fs.rmSync(files.inflight, { force: true });
   if (request.kind === 'recover' && ok) clearSettledMarker({ files, runId, request, finishedAt });
   replaceRecord(path.join(runDir, 'outcome.json'), { runId, ok, ...(result.error ? { error: result.error } : {}), finishedAt });
   return ok ? 0 : 1;

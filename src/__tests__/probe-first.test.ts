@@ -1,10 +1,15 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createRequire } from 'module';
+import * as fs from 'fs';
+import * as path from 'path';
+import { makeTarget, requestMeta, runIdN, OTHER_REQUEST_ID, Target } from './on-host-fixture';
+import { hasFlock } from './target-state-fixture';
 
 const require = createRequire(__filename);
 const kit = require('../index.js');
 const release = require('../release.js');
 const { validateDeployResult } = require('../deploy-result.js');
+const { classifyJournal } = require('../target-state.js');
 const { mergeConfig, DEFAULT_CONFIG, validateConfig } = kit;
 
 const SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
@@ -144,5 +149,51 @@ describe('migrationsExclusive off keeps today\'s order', () => {
     expect(out.names).toContain('stop-writers');
     expect(out.names).toContain('migrate');
     expect(out.names).not.toContain('pending-migrations-probe');
+  });
+});
+
+// BRAIN-636 review finding 6: the zero probe is read-only, so a clean abort after it must not leave an interrupted journal
+// (the host would refuse every later attempt with recovery-pending, and a `validate` journal cannot be recovered).
+const describeWithFlock = hasFlock ? describe : describe.skip;
+
+describeWithFlock('probe zero, then a refused gate, through host-run with the real journal file', () => {
+  let t: Target;
+  beforeEach(() => { t = makeTarget(); });
+  afterEach(() => t.cleanup());
+  const journalFile = () => path.join(t.config.projectDir, '.deploy-kit-state.json');
+  const forApp = () => config({}, {
+    mode: 'local', host: null, projectDir: t.config.projectDir, onHost: { required: true }, hostLock: t.config.hostLock,
+  });
+
+  // The fake target for everything but the journal and the lock identity, which are the real files in the fixture's HOME.
+  function pipelineWith(fail: string[]) {
+    return (_cfg: unknown, _opts: unknown, ctx: any) => {
+      const fake = makeRuntime({ probe: { output: '0\n' }, fail });
+      let clock = Date.parse('2026-07-10T09:00:00Z');
+      return release.deployRelease(forApp(), {}, {
+        ...ctx,
+        runtime: {
+          execFileSync: (file: string, args: string[], o: any) => (/pwd -P|deploy-kit-state\.json/.test(args[args.length - 1] || '')
+            ? t.runtime.execFileSync(file, args, o) : fake.runtime.execFileSync(file, args)),
+        },
+        sleep: (seconds: number) => { clock += seconds * 1000; }, now: () => clock,
+      });
+    };
+  }
+
+  it('leaves no interrupted journal, so a fresh deploy is admitted and succeeds', () => {
+    t.stage(runIdN(1));
+    const first = t.go(runIdN(1), { pipeline: pipelineWith(['check-idle']) });
+    expect(first.code).toBe(1);
+    expect(t.readJson(`runs/${runIdN(1)}/terminal.json`).result).toMatchObject({ status: 'aborted-clean', stage: 'disruptive-gate', effectsClean: true });
+    const raw = fs.existsSync(journalFile()) ? fs.readFileSync(journalFile(), 'utf8') : null;
+    expect(classifyJournal(raw).class).not.toBe('interrupted');
+
+    t.stage(runIdN(2), requestMeta({ requestId: OTHER_REQUEST_ID }));
+    const second = t.go(runIdN(2), { pipeline: pipelineWith([]) });
+    expect(t.has(`runs/${runIdN(2)}/refused.json`) ? t.readJson(`runs/${runIdN(2)}/refused.json`).code : null).toBeNull();
+    expect(second.code).toBe(0);
+    expect(second.deployRelease).toHaveBeenCalled();
+    expect(t.readJson(`runs/${runIdN(2)}/terminal.json`).result).toMatchObject({ status: 'deployed', migrated: false, migrationsPending: 0 });
   });
 });

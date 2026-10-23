@@ -58,7 +58,7 @@ const age = (config: any, home: string) => writeFileSync(
 describeOnPosix('lock owner record', () => {
   it('writes every owner field at acquisition, null where it does not apply', () => {
     const home = freshHome();
-    const config = lockConfig();
+    const config = optedConfig();
     lock.acquireLock(config, { runtime: runtimeFor(home) });
 
     const owner = readOwner(config, home);
@@ -83,7 +83,7 @@ describeOnPosix('lock owner record', () => {
 
   it('records a systemd invocation as kind unit, and caller-supplied runId/purpose', () => {
     const home = freshHome();
-    const config = lockConfig();
+    const config = optedConfig();
     lock.acquireLock(config, {
       runtime: runtimeFor(home, { INVOCATION_ID: 'abcdef0123456789abcdef0123456789' }),
     }, { runId: 'run-42', purpose: 'deploy' });
@@ -96,7 +96,7 @@ describeOnPosix('lock owner record', () => {
   });
 
   it('rejects an owner field that could break out of the record', () => {
-    const config = lockConfig();
+    const config = optedConfig();
     expect(() => lock.acquireLock(config, { runtime: runtimeFor(freshHome()) }, { purpose: 'x"; rm -rf /' }))
       .toThrow(/purpose must match/);
   });
@@ -126,7 +126,7 @@ describeOnPosix('lock release', () => {
 describeWithFlock('lock guard file', () => {
   it('is a permanent inode: same file across acquire, release and acquire', () => {
     const home = freshHome();
-    const config = lockConfig();
+    const config = optedConfig();
     const runtime = runtimeFor(home);
     const guard = lock.guardFile(config).replace('$HOME', home);
 
@@ -142,7 +142,7 @@ describeWithFlock('lock guard file', () => {
 
   it('serializes: an acquire waits for whoever holds the guard', () => {
     const home = freshHome();
-    const config = lockConfig();
+    const config = optedConfig();
     const guard = lock.guardFile(config).replace('$HOME', home);
     lock.acquireLock(config, { runtime: runtimeFor(home) })(); // creates the guard
     // Hold the guard for ~1.5s from a separate process.
@@ -163,7 +163,7 @@ describeWithFlock('lock guard file', () => {
     const home = freshHome();
     const script = `
       const lock = require(${JSON.stringify(join(__dirname, '..', 'lock.js'))});
-      const config = ${JSON.stringify(lockConfig())};
+      const config = ${JSON.stringify(optedConfig())};
       try { lock.acquireLock(config, {}); console.log('WON'); } catch (e) { console.log('LOST'); }
     `;
     const results = await Promise.all(Array.from({ length: 6 }, () => new Promise<string>((resolve) => {
@@ -177,8 +177,8 @@ describeWithFlock('lock guard file', () => {
   });
 });
 
-// The guarded path with onHost.required: true (flock present). The block above runs it for a
-// plain config; the opted-in config is the one whose safety rests on the guard.
+// The guarded path with onHost.required: true (flock present): only an opted-in app (or an owned handle) runs it;
+// a plain config keeps the v0.32.0 scripts (lock-legacy-scripts.test.ts).
 describeWithFlock('lock guard with onHost.required', () => {
   const holdGuard = (guard: string, seconds: number) => {
     const holder = spawn('sh', ['-c', `exec 9>> "${guard}"; flock -x 9; echo held; sleep ${seconds}`], { stdio: ['ignore', 'pipe', 'ignore'] });
@@ -260,11 +260,12 @@ describeOnPosix('lock takeover policy', () => {
     const config = lockConfig();
     const runtime = runtimeFor(home);
     lock.acquireLock(config, { runtime });
-    const before = readOwner(config, home).nonce;
+    const nonceFile = join(lockPath(config, home), 'nonce');
+    const before = readFileSync(nonceFile, 'utf8');
     age(config, home);
 
     expect(() => lock.acquireLock(config, { runtime })).not.toThrow();
-    expect(readOwner(config, home).nonce).not.toBe(before);
+    expect(readFileSync(nonceFile, 'utf8')).not.toBe(before);
   });
 
   it('an onHost.required app is NOT taken over even when stale by age; the owner is reported', () => {

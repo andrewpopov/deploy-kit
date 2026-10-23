@@ -5,7 +5,7 @@ const {
 } = require('./exec');
 const { buildPinCheckProgram, PIN_CHECK_COMMAND } = require('./pin-gate');
 const {
-  lockDir, prevShaFile, ensureStateDir, acquireLock,
+  lockDir, prevShaFile, ensureStateDir, acquireLock, assertOwnedEntry,
 } = require('./lock');
 const { log: defaultLog, logFailureOutput } = require('./log');
 const { backupIdFromOutput, backupReferenceFromId } = require('./backup-reference');
@@ -166,6 +166,7 @@ function deploy(config, options = {}, ctx = {}) {
   // because `deploy()` is itself an exported, programmatic entry point: the
   // CLI's parse-time checks are not the only way in (PKG-164 review finding 6).
   assertShaOptions(options);
+  assertOwnedEntry(config, options, ctx, 'deploy');
   // Artifact-first release layout (SMH-112) is a separate pipeline. Lazy-require to
   // avoid a top-level cycle (release.js pulls shared helpers, not this module).
   if (config.layout && config.layout.type === 'releases') {
@@ -889,6 +890,7 @@ function deploy(config, options = {}, ctx = {}) {
 // auto-restoring, since a schema rollback is the operator's call.
 function rollback(config, options = {}, ctx = {}) {
   assertTransitionAuthorityEntryPoint(config, { supported: config.layout?.type === 'releases', options });
+  assertOwnedEntry(config, options, ctx, 'rollback');
   // Release-layout rollback is a symlink flip to the previous release, not a git
   // reset — a different pipeline. Legacy rollback must refuse a release-layout host.
   if (config.layout && config.layout.type === 'releases') {

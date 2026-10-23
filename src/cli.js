@@ -792,6 +792,17 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   }
   if (options.lock === false) config = { ...config, lock: false };
 
+  // An onHost.required app deploys and rolls back only as an accepted request (`--on-host`), under owned locks.
+  if (['deploy', 'rollback'].includes(command) && require('./lock').lockRequiresOwnership(config)) {
+    const refusal = !options.onHost
+      ? `${command}: this app sets onHost.required, so it only runs as \`deploy-kit ${command} --on-host ...\` (an accepted request under the host and app locks)`
+      : (options.stealLock || options.lock === false) && `${command}: --steal-lock and --no-lock are refused for an onHost.required app`;
+    if (refusal) {
+      log.error(refusal);
+      return 1;
+    }
+  }
+
   if (command === 'deploy' && options.onHost) {
     return require('./on-host/operator').onHostDeploy(config, options, { cwd });
   }

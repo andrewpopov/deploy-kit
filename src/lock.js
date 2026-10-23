@@ -139,6 +139,25 @@ function lockRequiresOwnership(config) {
   return config.onHost != null && config.onHost.required === true;
 }
 
+// The one entry check of every production pipeline (deploy, rollback, recover): an onHost.required app only
+// deploys through the accepted request path, which hands the pipeline an owned-locks handle. Without one the
+// pipeline would take just the app lock and skip the host lock, hold, epoch, reservation, unresolved admission and
+// acceptance; `--no-lock` and `--steal-lock` would skip even that. The handle itself is validated where the
+// pipeline adopts it (validateOwnedLocks).
+function assertOwnedEntry(config, options, ctx, command) {
+  if (!lockRequiresOwnership(config)) return;
+  const entry = `deploy-kit ${command} --on-host`;
+  if (ctx.ownedLocks == null) {
+    throw new Error(
+      `deploy-kit: ${command} is refused for an onHost.required app outside an accepted request (no owned lock handle). `
+      + `Run \`${entry} ...\` (merge-train's deploy executor does), which takes the host and app locks and admits the request first.`,
+    );
+  }
+  if (options.stealLock === true || config.lock === false) {
+    throw new Error(`deploy-kit: ${command} for an onHost.required app never runs with --steal-lock or --no-lock; \`${entry}\` owns the locks.`);
+  }
+}
+
 // Permanent sibling of the lock directory. It is NEVER renamed or unlinked: the
 // lock directory itself is renamed/removed, so an flock on it could not
 // serialize two parties who each saw a different directory at the same path.
@@ -173,6 +192,14 @@ function ownerFields({ kind = 'legacy', runId = '', purpose = '' } = {}) {
     if (!SAFE_TOKEN.test(value)) throw new Error(`deploy-kit: lock owner ${name} must match ${SAFE_TOKEN}`);
   }
   return { kind, runId, purpose };
+}
+
+// The v0.32.0 owner writer, kept verbatim for apps that did not opt in: pid, ts and nonce only.
+function legacyWriteOwner(dir) {
+  const genNonce = 'nonce=$(head -c16 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d " \\n"); '
+    + '[ -n "$nonce" ] || nonce="$$-$(date +%s)"';
+  return `${genNonce}; echo $$ > "${dir}/pid" 2>/dev/null; date +%s > "${dir}/ts" 2>/dev/null; `
+    + `echo "$nonce" > "${dir}/nonce" 2>/dev/null`;
 }
 
 // Shell fragment that writes the lock's files: the legacy pid/ts/nonce plus the
@@ -218,7 +245,7 @@ function ownerWriter(dir, { kind, runId, purpose }) {
 // for onHost.required apps, which never lose a lock to anything but a break);
 // config.lock:false disables locking entirely.
 function acquireLock(config, ctx, {
-  steal = false, suffix, kind, runId, purpose, scope,
+  steal = false, suffix, kind, runId, purpose, scope, guarded = false,
 } = {}) {
   const noop = () => {};
   if (config.lock === false) return noop;
@@ -226,8 +253,13 @@ function acquireLock(config, ctx, {
   const ttl = lockTtlSeconds(config);
   const stateDir = ensureStateDir(config);
   const owned = lockRequiresOwnership(config);
-  const prelude = guardPrelude(config, guard);
-  const writeOwner = ownerWriter(dir, ownerFields({ kind, runId, purpose }));
+  // Apps that did not opt in and do not ask for an owned handle get exactly the v0.32.0 scripts: no guard, no
+  // owner file (src/__tests__/lock-legacy-scripts.test.ts pins them byte for byte).
+  const useGuard = owned || guarded;
+  const prelude = useGuard ? guardPrelude(config, guard) : null;
+  const writeOwner = useGuard
+    ? ownerWriter(dir, ownerFields({ kind, runId, purpose }))
+    : legacyWriteOwner(dir);
 
   if (steal && owned) {
     throw new Error(
@@ -251,8 +283,9 @@ function acquireLock(config, ctx, {
     // both "succeed" silently: whichever loses the mkdir gets the normal
     // held-lock error instead of believing it owns a lock the other racer
     // just recreated.
-    const script = `${stateDir}\n${prelude}\n${disposeStale}\n`
-      + `if mkdir -m 700 "${dir}" 2>/dev/null; then\n${writeOwner}\nelse exit 1; fi`;
+    const script = useGuard
+      ? `${stateDir}\n${prelude}\n${disposeStale}\nif mkdir -m 700 "${dir}" 2>/dev/null; then\n${writeOwner}\nelse exit 1; fi`
+      : `${stateDir}\n${disposeStale}\nif mkdir -m 700 "${dir}" 2>/dev/null; then ${writeOwner}; else exit 1; fi`;
     const res = runOnTarget(script, config, { runtime: ctx.runtime });
     if (!res.ok) {
       if (isConfirmedScriptExit1(res)) {
@@ -280,22 +313,22 @@ function acquireLock(config, ctx, {
         `  echo "deploy-kit: stale lock at ${dir} -- age $age seconds exceeds the ${ttl}s TTL (pid $pid) -- taking it over"`,
         `  ${disposeStale}`,
         `  if mkdir -m 700 "${dir}" 2>/dev/null; then`,
-        writeOwner,
+        useGuard ? writeOwner : `    ${writeOwner}`,
         '    exit 0',
         '  fi',
         'fi',
       ];
     const script = [
       stateDir,
-      prelude,
+      ...(useGuard ? [prelude] : []),
       `if mkdir -m 700 "${dir}" 2>/dev/null; then`,
-      writeOwner,
+      useGuard ? writeOwner : `  ${writeOwner}`,
       '  exit 0',
       'fi',
       ...heldBranch,
       'exit 1',
     ].join('\n');
-    const res = runOnTarget(script, config, { runtime: ctx.runtime, capture: owned });
+    const res = runOnTarget(script, config, owned ? { runtime: ctx.runtime, capture: true } : { runtime: ctx.runtime });
     if (!res.ok) {
       if (isConfirmedScriptExit1(res)) {
         if (owned) throw heldError(`refused lock-held: ${(res.output || '').trim()}`);
@@ -316,12 +349,13 @@ function acquireLock(config, ctx, {
   // exceeds the TTL gets reclaimed by run B, but A's eventual release() would
   // delete B's (not A's) lock, letting a third run C start while B still
   // believes it holds the lock.
-  return () => removeIfNonce(config, ctx, { dir, guard }, nonce);
+  return () => removeIfNonce(config, ctx, { dir, guard, guarded: useGuard }, nonce);
 }
 
-function removeIfNonce(config, ctx, { dir, guard }, nonce) {
+function removeIfNonce(config, ctx, { dir, guard, guarded }, nonce) {
+  const prelude = guarded ? `${guardPrelude(config, guard)}\n` : '';
   return runOnTarget(
-    `${guardPrelude(config, guard)}\n[ "$(cat "${dir}/nonce" 2>/dev/null)" = "${nonce}" ] && rm -rf "${dir}" 2>/dev/null || true`,
+    `${prelude}[ "$(cat "${dir}/nonce" 2>/dev/null)" = "${nonce}" ] && rm -rf "${dir}" 2>/dev/null || true`,
     config,
     { runtime: ctx.runtime },
   );
@@ -376,7 +410,7 @@ function acquireOwnedLocks(config, ctx, {
   if (config.lock === false) throw new Error('deploy-kit: owned locks require locking to be enabled');
   if (!Number.isFinite(notAfter)) throw new Error('deploy-kit: acquireOwnedLocks needs a numeric notAfter (unix seconds)');
   const wait = { notAfter, now, sleep };
-  const common = { kind, runId, purpose };
+  const common = { kind, runId, purpose, guarded: true };
   const releases = [];
   const releaseAll = () => { while (releases.length) releases.pop()(); };
   try {
@@ -437,9 +471,9 @@ function releaseOwnedLocks(handle) {
   if (!held || handle.released) return;
   handle.released = true;
   const { config, ctx } = held;
-  removeIfNonce(config, ctx, { dir: handle.appPath, guard: `${handle.appPath}.guard` }, handle.appNonce);
+  removeIfNonce(config, ctx, { dir: handle.appPath, guard: `${handle.appPath}.guard`, guarded: true }, handle.appNonce);
   if (handle.hostPath) {
-    removeIfNonce(config, ctx, { dir: handle.hostPath, guard: `${handle.hostPath}.guard` }, handle.hostNonce);
+    removeIfNonce(config, ctx, { dir: handle.hostPath, guard: `${handle.hostPath}.guard`, guarded: true }, handle.hostNonce);
   }
 }
 
@@ -500,7 +534,7 @@ function inspectLock(config, ctx, { suffix } = {}) {
 
 module.exports = {
   lockId, lockDir, prevShaFile, legacyPrevShaFile, lockTtlSeconds, ensureStateDir, acquireLock,
-  inspectLock, guardFile, lockRequiresOwnership, hostLockDir, lockLocation,
+  inspectLock, guardFile, lockRequiresOwnership, assertOwnedEntry, hostLockDir, lockLocation,
   acquireOwnedLocks, validateOwnedLocks, releaseOwnedLocks,
 };
 

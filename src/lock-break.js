@@ -13,21 +13,21 @@ const { lockLocation } = require('./lock');
 // Exit codes of the script: 0 broken, 3 refused (reason printed), anything else is a
 // failure to run (2 = no flock / guard unusable / evidence write failed).
 //
-// Test-only environment (read by the script on the target, never set in production;
-// they exist so tests can aim the proofs at a fake /proc, cgroup tree and boot id):
-//   DEPLOY_KIT_TEST_PROC_ROOT      replaces /proc
-//   DEPLOY_KIT_TEST_CGROUP_ROOT    replaces /sys/fs/cgroup
-//   DEPLOY_KIT_TEST_BOOT_ID_FILE   replaces /proc/sys/kernel/random/boot_id
+// Evidence roots (/proc, the cgroup tree, the boot id file) are fixed in the production
+// script. Tests aim the proofs at fixtures through the explicit `proofRoots` argument of
+// buildBreakScript/breakLock, which no CLI path passes, so no environment variable can fake
+// quiescence evidence.
+//
+// One environment seam remains, because it can only pause the script and cannot fake evidence:
 //   DEPLOY_KIT_TEST_BREAK_HOLD     path prefix; after the unguarded first look the script
 //                                  creates <prefix>.reached and waits for <prefix>.go
 
 const NONCE_RE = /^[A-Za-z0-9_.-]+$/;
 const REFUSED_EXIT = 3;
 
+const PRODUCTION_ROOTS = { proc: '/proc', cgroup: '/sys/fs/cgroup', bootIdFile: '/proc/sys/kernel/random/boot_id' };
+
 const SCRIPT_HELPERS = `
-PROC=\${DEPLOY_KIT_TEST_PROC_ROOT:-/proc}
-CGROOT=\${DEPLOY_KIT_TEST_CGROUP_ROOT:-/sys/fs/cgroup}
-BOOTF=\${DEPLOY_KIT_TEST_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}
 refuse() { echo "refused: $*"; exit ${REFUSED_EXIT}; }
 # Value of a key in the flat one-line owner/result JSON (the empty string for null or absent).
 jget() { tr '{},' '\\n\\n\\n' < "$1" | sed -n "s/^\\"$2\\":\\"\\{0,1\\}\\([^\\"]*\\)\\"\\{0,1\\}\\$/\\1/p" | head -1 | sed 's/^null$//'; }
@@ -35,7 +35,9 @@ jget() { tr '{},' '\\n\\n\\n' < "$1" | sed -n "s/^\\"$2\\":\\"\\{0,1\\}\\([^\\"]
 statfield() { sed 's/^.*) //' "$1" | cut -d' ' -f$(($2 - 2)); }
 `;
 
-function buildBreakScript(config, { nonce, reason, host = false, legacyOwnerGone = false, suffix }) {
+function buildBreakScript(config, {
+  nonce, reason, host = false, legacyOwnerGone = false, suffix,
+}, proofRoots = PRODUCTION_ROOTS) {
   if (!NONCE_RE.test(nonce || '')) throw new Error('deploy-kit: --nonce must match [A-Za-z0-9_.-]+');
   if (typeof reason !== 'string' || !reason.trim()) throw new Error('deploy-kit: lock break needs a non-empty --reason');
   if (host && !config.hostLock) throw new Error('deploy-kit: --host needs a hostLock in the config');
@@ -47,6 +49,9 @@ GUARD="${guard}"
 NONCE=${shQuote(nonce)}
 REASONJSON=${shQuote(JSON.stringify(reason))}
 LEGACY_GONE=${legacyOwnerGone ? 1 : 0}
+PROC=${shQuote(proofRoots.proc)}
+CGROOT=${shQuote(proofRoots.cgroup)}
+BOOTF=${shQuote(proofRoots.bootIdFile)}
 ${SCRIPT_HELPERS}
 command -v flock >/dev/null 2>&1 || { echo "deploy-kit: flock(1) is required to break a lock" >&2; exit 2; }
 
@@ -177,8 +182,8 @@ exit 0
 
 // Returns { broken, output }. `broken: false` is a refusal and `output` says why;
 // a failure to run the script at all throws.
-function breakLock(config, ctx, options) {
-  const res = runScriptOnTarget(buildBreakScript(config, options), config, { capture: true, runtime: ctx.runtime });
+function breakLock(config, ctx, options, proofRoots) {
+  const res = runScriptOnTarget(buildBreakScript(config, options, proofRoots), config, { capture: true, runtime: ctx.runtime });
   const output = (res.output || '').trim();
   if (res.ok) return { broken: true, output };
   if (res.error && res.error.status === REFUSED_EXIT) return { broken: false, output };

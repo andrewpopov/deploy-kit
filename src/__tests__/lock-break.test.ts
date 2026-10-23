@@ -56,11 +56,11 @@ const envFor = (fx: Fixture, extra: Record<string, string> = {}) => ({
   HOME: fx.home,
   PATH: `${fx.bin}:${process.env.PATH}`,
   STUB_DIR: fx.stub,
-  DEPLOY_KIT_TEST_PROC_ROOT: fx.proc,
-  DEPLOY_KIT_TEST_CGROUP_ROOT: fx.cg,
-  DEPLOY_KIT_TEST_BOOT_ID_FILE: fx.bootFile,
   ...extra,
 });
+
+// The fixture evidence roots, handed to the script builder as an explicit argument (never via the environment).
+const rootsFor = (fx: Fixture) => ({ proc: fx.proc, cgroup: fx.cg, bootIdFile: fx.bootFile });
 
 function runtimeFor(fx: Fixture, extra: Record<string, string> = {}) {
   const execFileSync = (file: string, args: string[], opts: any = {}) => realExecFileSync(file, args, {
@@ -119,7 +119,7 @@ const procEntry = (fx: Fixture, pid: number, { sid, start }: { sid: number; star
 function breakIt(fx: Fixture, options: Record<string, unknown> = {}) {
   return lockBreak.breakLock(fx.config, { runtime: runtimeFor(fx) }, {
     nonce: 'n0nce1', reason: 'owner confirmed dead', ...options,
-  } as any);
+  } as any, rootsFor(fx));
 }
 
 const archives = (fx: Fixture, dir = appLock(fx)) => (existsSync(join(dir, '..')) ? readdirSync(join(dir, '..')) : [])
@@ -433,7 +433,7 @@ describeBreak('lock break: --host', () => {
 
 // Spawn the break script itself (not breakLock) so a test can hold it mid-flight.
 function spawnBreaker(fx: Fixture, extraEnv: Record<string, string> = {}, options: Record<string, unknown> = {}) {
-  const script = lockBreak.buildBreakScript(fx.config, { nonce: 'n0nce1', reason: 'race', ...options } as any);
+  const script = lockBreak.buildBreakScript(fx.config, { nonce: 'n0nce1', reason: 'race', ...options } as any, rootsFor(fx));
   const child = spawn('sh', ['-se'], { env: envFor(fx, extraEnv), stdio: ['pipe', 'pipe', 'pipe'] });
   child.stdin.end(script);
   let out = '';
@@ -510,24 +510,45 @@ describeBreak('deploy-kit lock break (CLI)', () => {
     vi.stubEnv('HOME', fx.home);
     vi.stubEnv('PATH', `${fx.bin}:${process.env.PATH}`);
     vi.stubEnv('STUB_DIR', fx.stub);
-    vi.stubEnv('DEPLOY_KIT_TEST_PROC_ROOT', fx.proc);
-    vi.stubEnv('DEPLOY_KIT_TEST_CGROUP_ROOT', fx.cg);
-    vi.stubEnv('DEPLOY_KIT_TEST_BOOT_ID_FILE', fx.bootFile);
     const lines: string[] = [];
     vi.spyOn(console, 'log').mockImplementation((m: string) => { lines.push(String(m)); });
     vi.spyOn(console, 'error').mockImplementation(() => {});
     return { code: cli.run(['lock', 'break', ...args], { cwd }), lines };
   };
 
-  it('exits 3 on a refusal and 0 once broken, printing the proof', () => {
+  it('exits 3 on a refusal, printing the reason', () => {
     const fx = fixture();
     plant(appLock(fx), ownerRecord({ bootId: OTHER_BOOT }));
     const refused = cliFor(fx, ['--nonce', 'wrong', '--reason', 'r']);
     expect(refused.code).toBe(3);
     expect(refused.lines.join('\n')).toMatch(/refused: lock owner nonce/);
-    const broken = cliFor(fx, ['--nonce', 'n0nce1', '--reason', 'r']);
-    expect(broken.code).toBe(0);
-    expect(broken.lines.join('\n')).toMatch(/proof: boot differs/);
+  });
+
+  // BRAIN-636 review finding 5: an environment variable must never stand in for the boot id (or /proc, or the
+  // cgroup tree) the proofs read. The owner below is alive in this very boot; a fake boot id file that disagrees
+  // with the owner's record used to make the script conclude "rebooted" and break the lock.
+  it('refuses to break a live same-boot owner even when DEPLOY_KIT_TEST_BOOT_ID_FILE, _PROC_ROOT and _CGROUP_ROOT are set', () => {
+    const fx = fixture();
+    const realBoot = (() => { try { return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(); } catch { return OTHER_BOOT; } })();
+    const stat = (() => { try { return readFileSync('/proc/self/stat', 'utf8').replace(/^.*\) /, '').split(' '); } catch { return []; } })();
+    writeFileSync(fx.bootFile, 'cccc9999-0000\n');
+    plant(appLock(fx), ownerRecord({
+      kind: 'session', bootId: realBoot, pid: process.pid, pstart: Number(stat[19] ?? 1), sid: Number(stat[3] ?? 1),
+    }));
+    vi.stubEnv('DEPLOY_KIT_TEST_BOOT_ID_FILE', fx.bootFile);
+    vi.stubEnv('DEPLOY_KIT_TEST_PROC_ROOT', fx.proc);
+    vi.stubEnv('DEPLOY_KIT_TEST_CGROUP_ROOT', fx.cg);
+    const attempt = cliFor(fx, ['--nonce', 'n0nce1', '--reason', 'r']);
+    expect(attempt.code).toBe(3);
+    expect(attempt.lines.join('\n')).not.toMatch(/boot differs/);
+    expect(existsSync(appLock(fx))).toBe(true);
+    expect(archives(fx)).toHaveLength(0);
+  });
+
+  it('keeps no environment-controlled evidence root in the production script', () => {
+    const script = lockBreak.buildBreakScript(fixture().config, { nonce: 'n0nce1', reason: 'r' } as any);
+    expect(script).not.toMatch(/DEPLOY_KIT_TEST_(PROC_ROOT|CGROUP_ROOT|BOOT_ID_FILE)/);
+    expect(script).toContain("BOOTF='/proc/sys/kernel/random/boot_id'");
   });
 
   it.each([[[]], [['--nonce', 'x']], [['--reason', 'x']], [['--nonce', 'x', '--reason', 'y', '--bogus']], [['--nonce']]])(

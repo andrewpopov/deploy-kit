@@ -202,6 +202,73 @@ describe('the ledger inside deployRelease', () => {
   });
 });
 
+// BRAIN-636 review findings 7 and the unused `recoverInterrupted`: the pipeline tells its caller which release it is about
+// to create, before any step touches it, and honours a caller that refuses to settle an old run's journal.
+describe('ctx.onRelease and ctx.recoverInterrupted', () => {
+  const stoppedJournal = JSON.stringify({ phase: 'stopped', releaseId: 'cafe1234cafe-20260709T090000Z', prevTarget: CURRENT });
+  const withJournal = (journal: string) => (over: Parameters<typeof makeRuntime>[0] = {}) => {
+    const fake = makeRuntime(over);
+    const inner = fake.runtime.execFileSync;
+    return {
+      calls: fake.calls,
+      runtime: {
+        execFileSync: (file: string, args: string[]) => {
+          const cmd = args[args.length - 1];
+          if (cmd.includes('cat') && cmd.includes('deploy-kit-state.json')) { fake.calls.push(cmd); return journal; }
+          return inner(file, args);
+        },
+      },
+    };
+  };
+  const deploy = (fake: { runtime: unknown; calls: string[] }, ctx: Record<string, unknown>) => {
+    try { return { result: release.deployRelease(codeOnly(), {}, { runtime: fake.runtime, sleep: () => {}, now: () => Date.parse('2026-07-10T09:00:00Z'), ...ctx }) }; } catch (thrown) { return { thrown: thrown as any }; }
+  };
+
+  it('onRelease gets the release id and the full sha before the worktree is added', () => {
+    const fake = makeRuntime();
+    const seen: Array<{ releaseId: string; sha: string; callsBefore: number }> = [];
+    const out = deploy(fake, { onRelease: (r: { releaseId: string; sha: string }) => seen.push({ ...r, callsBefore: fake.calls.length }) });
+    expect(out.thrown).toBeUndefined();
+    expect(seen).toEqual([{ releaseId: `${BUILT_SHA.slice(0, 12)}-20260710T090000Z`, sha: BUILT_SHA, callsBefore: expect.any(Number) }]);
+    expect(fake.calls.slice(0, seen[0].callsBefore).some((cmd) => cmd.includes('worktree add'))).toBe(false);
+    expect(fake.calls.slice(seen[0].callsBefore).some((cmd) => cmd.includes('worktree add'))).toBe(true);
+  });
+
+  it('an onRelease that throws fails the deploy before the release exists, with nothing live behind it', () => {
+    const fake = makeRuntime();
+    const out = deploy(fake, { onRelease: () => { throw new Error('release.json already exists'); } });
+    expect(out.thrown.message).toMatch(/release.json already exists/);
+    expect(out.thrown.deployResult).toMatchObject({ status: 'aborted-clean', effectsClean: true });
+    expect(fake.calls.some((cmd) => cmd.includes('worktree add'))).toBe(false);
+  });
+
+  it("recoverInterrupted 'refuse': an interrupted `stopped` journal fails the deploy untouched, without restarting anything", () => {
+    const fake = withJournal(stoppedJournal)();
+    const steps: string[] = [];
+    const out = deploy(fake, { recoverInterrupted: 'refuse', onStep: (e: Step) => steps.push(`${e.step}:${e.class}`) });
+    expect(out.thrown.message).toMatch(/will not recover it as a side effect/);
+    expect(out.thrown.deployResult).toMatchObject({ status: 'aborted-clean', effectsClean: true });
+    expect(steps).not.toContain('recover-interrupted:live');
+    expect(fake.calls.some((cmd) => /pm2 (startOrRestart|start|restart|stop)/.test(cmd))).toBe(false);
+  });
+
+  it('without the policy (or for recoverRelease) the same journal is recovered, as before', () => {
+    const plain = withJournal(stoppedJournal)();
+    const steps: string[] = [];
+    deploy(plain, { onStep: (e: Step) => steps.push(`${e.step}:${e.class}`) });
+    expect(steps).toContain('recover-interrupted:live');
+
+    const recoverFake = withJournal(stoppedJournal)();
+    const recoverSteps: string[] = [];
+    try {
+      release.recoverRelease(codeOnly(), {}, {
+        runtime: recoverFake.runtime, sleep: () => {}, now: () => 0, recoverInterrupted: 'refuse', onStep: (e: Step) => recoverSteps.push(`${e.step}:${e.class}`),
+      });
+    } catch { /* the fake host may not verify the recovery; the point is that it was attempted */ }
+    expect(recoverSteps).toContain('recover-interrupted:live');
+  });
+});
+
 const describeWithFlock = hasFlock ? describe : describe.skip;
 
 describeWithFlock('host-run: effects.jsonl, unresolved admission and full shas', () => {
@@ -297,6 +364,22 @@ describeWithFlock('host-run: effects.jsonl, unresolved admission and full shas',
     expect(blocked.code).toBe(1);
     expect(blocked.deployRelease).not.toHaveBeenCalled();
     expect(t.readJson(`runs/${runIdN(2)}/refused.json`).code).toBe('app-unresolved');
+  });
+
+  it('the real pipeline records runs/<runId>/release.json with the release it created, before any live step', () => {
+    const runId = runIdN(1);
+    t.stage(runId);
+    const productionFile = path.join(t.home, 'production-state');
+    t.go(runId, {
+      pipeline: realPipeline(forApp(), {
+        onCommand: (cmd) => { if (cmd.includes('npm ci')) fs.writeFileSync(productionFile, `release.json present: ${fs.existsSync(path.join(t.runDirOf(runId), 'release.json'))}`); },
+        fail: ['npm ci'],
+      }),
+    });
+    expect(fs.readFileSync(productionFile, 'utf8')).toBe('release.json present: true');
+    expect(t.readJson(`runs/${runId}/release.json`)).toEqual({
+      runId, requestId: REQUEST_ID, releaseId: `${BUILT_SHA.slice(0, 12)}-20260710T090000Z`, sha: BUILT_SHA,
+    });
   });
 
   it('a verified flip-back keeps failed-recovered and writes no unresolved marker', () => {

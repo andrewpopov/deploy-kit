@@ -221,6 +221,52 @@ describe('no gate configured', () => {
   });
 });
 
+// BRAIN-636 review finding 3: a rollback is a live flip like a deploy, so a busy gate refuses it before `current` moves.
+describe('rollback runs the same first-live-step gate as a deploy', () => {
+  function rollbackRun(cfg: any, opts: { alwaysBusy?: boolean; notAfter?: number } = {}) {
+    let clock = Date.parse('2026-07-10T09:00:00Z');
+    const fake = makeRuntime({ failWhen: (cmd) => isGateCheck(cmd) && opts.alwaysBusy === true, runningSha: BUILT_SHA });
+    const steps: Step[] = [];
+    const ctx = {
+      runtime: fake.runtime, now: () => clock, sleep: (s: number) => { clock += s * 1000; },
+      ...(opts.notAfter != null ? { notAfter: opts.notAfter } : {}),
+      onStep: (entry: { step: string; class: string }) => steps.push({ ...entry, callsBefore: fake.calls.length }),
+    };
+    let result: any;
+    let thrown: any;
+    try { result = release.rollbackRelease(cfg, {}, ctx); } catch (error) { thrown = error; }
+    return { steps, calls: fake.calls, result, thrown, failure: thrown?.deployResult };
+  }
+  const flipped = (calls: string[]) => calls.some((cmd) => /ln -s .*mv -Tf/.test(cmd));
+  const restarted = (calls: string[]) => calls.some((cmd) => /pm2 (startOrRestart|start|restart)/.test(cmd));
+
+  it('busy gate: nothing flips or restarts, and the result is aborted-clean with a clean ledger', () => {
+    const out = rollbackRun(withGate(codeOnly({}, CAND)), { alwaysBusy: true });
+    expect(out.thrown).toBeDefined();
+    expect(out.thrown.message).toMatch(/Disruptive gate failed: feeders-idle/);
+    expect(validateDeployResult(out.failure)).toBeNull();
+    expect(out.failure).toMatchObject({ status: 'aborted-clean', stage: 'disruptive-gate', effectsClean: true, recovery: { action: 'none' } });
+    expect(flipped(out.calls)).toBe(false);
+    expect(restarted(out.calls)).toBe(false);
+    expect(out.steps.map((s) => s.step)).not.toContain('current-pointer');
+    expect(gateEntries(out.steps).length).toBeGreaterThan(0);
+  });
+
+  it('a gate that is idle: it runs once, immediately before the flip, and the rollback completes', () => {
+    const out = rollbackRun(withGate(codeOnly({}, CAND)));
+    expect(out.thrown).toBeUndefined();
+    expect(out.steps.map((s) => s.step)).toContain('current-pointer');
+    expect(stepAfterGate(out.steps)).toBe('current-pointer');
+    expect(flipped(out.calls)).toBe(true);
+  });
+
+  it('without a disruptiveGate in the config a rollback behaves as before', () => {
+    const out = rollbackRun(codeOnly({}, CAND));
+    expect(out.thrown).toBeUndefined();
+    expect(gateEntries(out.steps)).toEqual([]);
+  });
+});
+
 const describeWithFlock = hasFlock ? describe : describe.skip;
 
 describeWithFlock('host-run: a refused gate is a clean abort, not an unresolved app', () => {

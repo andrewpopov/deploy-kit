@@ -35,7 +35,11 @@ const stageAndGo = (runId: string, meta: Record<string, unknown>, options: Param
   t.stage(runId, meta);
   return t.go(runId, options);
 };
-const putParent = (runId = PARENT, sha = SHA) => t.put(`runs/${runId}/accepted.json`, { runId, requestId: OTHER_REQUEST_ID, kind: 'deploy', sha });
+// Its release.json is the pipeline's record of exactly which release the run created; accepted.json carries the sha.
+const putParent = (runId = PARENT, releaseId = RELEASE_ID, sha = SHA) => {
+  t.put(`runs/${runId}/accepted.json`, { runId, requestId: OTHER_REQUEST_ID, kind: 'deploy', sha });
+  t.put(`runs/${runId}/release.json`, { runId, requestId: OTHER_REQUEST_ID, releaseId, sha });
+};
 
 // What recoverRelease does on success, as far as the host can see: the live step in the ledger, the journal terminal.
 const recoversInterrupted = (_c: unknown, _o: unknown, ctx: { onStep: (e: { step: string; class: string }) => void }) => {
@@ -197,20 +201,37 @@ describeWithFlock('recover --on-host: the kind gate (plan 4.1)', () => {
     expectRefused(runIdN(1), 'recover-parent-mismatch', t.go(runIdN(1)));
   });
 
-  it('a parent run that is not on the host refuses recover-parent-mismatch', () => {
+  it('a parent run that is not on the host refuses recover-parent-unknown', () => {
     writeJournal();
     t.stage(runIdN(1), recoverMeta({ parentRunId: runIdN(8) }));
-    expectRefused(runIdN(1), 'recover-parent-mismatch', t.go(runIdN(1)));
+    expectRefused(runIdN(1), 'recover-parent-unknown', t.go(runIdN(1)));
   });
 
-  it('a parent whose accepted.json is unreadable refuses; its meta.json is the fallback when accepted.json is absent', () => {
+  // BRAIN-636 review finding 7: the staged meta.json (or an accepted.json sha) is not evidence of which release a run created.
+  it.each([
+    ['an unreadable release.json', () => t.put(`runs/${PARENT}/release.json`, '{nope')],
+    ['a release.json naming another run', () => t.put(`runs/${PARENT}/release.json`, { runId: OTHER_PARENT, releaseId: RELEASE_ID })],
+    ['only a staged meta.json and an accepted.json with the sha', () => {
+      fs.rmSync(t.dk(`runs/${PARENT}/release.json`));
+      t.put(`runs/${PARENT}/meta.json`, { runId: PARENT, sha: SHA });
+    }],
+  ])('a parent with %s refuses recover-parent-unknown', (_name, damage) => {
     writeJournal();
-    t.put(`runs/${PARENT}/accepted.json`, '{nope');
+    putParent();
+    damage();
     t.stage(runIdN(1), recoverMeta());
+    expectRefused(runIdN(1), 'recover-parent-unknown', t.go(runIdN(1)));
+  });
+
+  it('two attempts at the SAME sha created different releases: the journal of one is not recoverable as the other', () => {
+    const attemptA = `${SHA.slice(0, 12)}-20261023T095900Z`;
+    const attemptB = `${SHA.slice(0, 12)}-20261023T095930Z`;
+    putParent(PARENT, attemptA);
+    putParent(OTHER_PARENT, attemptB);
+    writeJournal({ releaseId: attemptB }); // the interrupted journal is attempt B's
+    t.stage(runIdN(1), recoverMeta()); // names attempt A as the parent
     expectRefused(runIdN(1), 'recover-parent-mismatch', t.go(runIdN(1)));
-    fs.rmSync(t.dk(`runs/${PARENT}/accepted.json`));
-    t.put(`runs/${PARENT}/meta.json`, { runId: PARENT, sha: SHA });
-    t.stage(runIdN(5), recoverMeta({ requestId: OTHER_REQUEST_ID }));
+    t.stage(runIdN(5), recoverMeta({ requestId: OTHER_REQUEST_ID, parentRunId: OTHER_PARENT }));
     expect(t.go(runIdN(5), { recoverPipeline: recoversInterrupted }).code).toBe(0);
   });
 

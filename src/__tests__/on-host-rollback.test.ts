@@ -227,6 +227,9 @@ function deployWith(pending: string) {
   const execFileSync = (_file: string, args: string[]) => {
     const cmd = args[args.length - 1];
     calls.push(cmd);
+    // The owned-lock handle (an onHost.required app only deploys with one): the lock scripts and their read-backs.
+    if (/pwd -P/.test(cmd)) return '/canonical/app.lock\n{"nonce":"n1","runId":"r1"}\n';
+    if (/cat ".*\/nonce" 2>\/dev\/null$/.test(cmd)) return 'n1\n';
     if (cmd.includes('check-pending')) return pending;
     if (/pm2 stop /.test(cmd)) { stopped = true; return ''; }
     if (/pm2 (startOrRestart|start|restart)/.test(cmd)) { stopped = false; return ''; }
@@ -254,7 +257,10 @@ function deployWith(pending: string) {
     },
     layout: { type: 'releases', keepReleases: 4, sharedPaths: ['.env'], releaseChecks: [], runningShaCommand: 'get-running-sha' },
   });
-  release.deployRelease(cfg, {}, { runtime: { execFileSync }, sleep: () => {}, now: () => Date.parse('2026-07-10T09:00:00Z') });
+  const runtime = { execFileSync };
+  const ownedLocks = lock.acquireOwnedLocks(cfg, { runtime }, { notAfter: 9999999999, runId: 'r1', purpose: 'deploy', kind: 'unit' });
+  calls.length = 0;
+  release.deployRelease(cfg, {}, { runtime, ownedLocks, sleep: () => {}, now: () => Date.parse('2026-07-10T09:00:00Z') });
   const write = calls.find((cmd) => cmd.includes('.deploy-kit-release.json'));
   const flip = calls.findIndex((cmd) => /mv -Tf .*\/current$/.test(cmd) || (cmd.includes('ln -s') && cmd.includes('releases/') && cmd.endsWith('/current')));
   return { write, calls, written: write ? JSON.parse(/printf '%s\\n' '(.*?)' >/s.exec(write)![1]) : null, flip };

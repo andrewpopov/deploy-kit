@@ -3,7 +3,9 @@
 const path = require('path');
 const { execFileSync: nodeExecFileSync } = require('child_process');
 const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
-const { acquireLock, validateOwnedLocks, lockRequiresOwnership } = require('./lock');
+const {
+  acquireLock, validateOwnedLocks, lockRequiresOwnership, assertOwnedEntry,
+} = require('./lock');
 const { log: defaultLog, logFailureOutput } = require('./log');
 const { backupIdFromOutput, isSafeBackupId, backupReferenceFromId } = require('./backup-reference');
 const { resolveBranch } = require('./branch');
@@ -424,6 +426,33 @@ function readInterruptedDeploy(config, paths, ctx) {
   return null;
 }
 
+// BRAIN-636 D4c: the disruptive gate (layout.disruptiveGate checks, polled every pollSeconds up to maxWaitSeconds and
+// never past ctx.notAfter), evaluated immediately before the FIRST live step of a deploy or a rollback. `report(step)`
+// puts each poll and its outcome in the effects ledger. A refusal throws an error flagged `gateRefused`.
+function runDisruptiveGateChecks(config, paths, c, report) {
+  const gate = config.layout && config.layout.disruptiveGate;
+  if (!gate) return;
+  const nowMs = () => (c.now ? c.now() : Date.now());
+  const pollSeconds = gate.pollSeconds ?? 60;
+  const start = nowMs();
+  const deadline = Math.min(start + (gate.maxWaitSeconds ?? 900) * 1000, c.notAfter != null ? c.notAfter * 1000 : Infinity);
+  for (;;) {
+    report('disruptive-gate');
+    const failing = gate.checks.find((check) => !runInDir(paths.root, check.command, config, c, { tolerate: true }).ok);
+    if (!failing) { report('disruptive-gate'); return; }
+    const remainingMs = deadline - nowMs();
+    if (remainingMs <= 0) {
+      report('disruptive-gate');
+      throw Object.assign(
+        new Error(`Disruptive gate failed: ${failing.name} still failing after ${Math.round((nowMs() - start) / 1000)}s`),
+        { gateRefused: true },
+      );
+    }
+    c.log.info(`Disruptive gate waiting on ${failing.name}`);
+    c.sleep(Math.min(pollSeconds, remainingMs / 1000));
+  }
+}
+
 // recoverRelease() runs deployRelease's own recovery closure and nothing else; the marker is module-private so
 // no caller can ask a deploy to stop after recovery.
 const RECOVER_ONLY = Symbol('recover-only');
@@ -447,6 +476,7 @@ function deployRelease(config, options = {}, ctx = {}) {
   // parse-time checks are not the only way in (PKG-164 review finding 6).
   assertShaOptions(options);
   const recoverOnly = ctx[RECOVER_ONLY] === true;
+  assertOwnedEntry(config, options, ctx, recoverOnly ? 'recover' : 'deploy');
   const log = ctx.log || defaultLog;
   const sleep = ctx.sleep || defaultSleep;
   const c = { ...ctx, log, sleep, runtime: ctx.runtime };
@@ -528,25 +558,13 @@ function deployRelease(config, options = {}, ctx = {}) {
   let gateRefused = false;
   const runDisruptiveGate = () => {
     gateDone = true;
-    const gate = config.layout && config.layout.disruptiveGate;
-    if (!gate) return;
-    const nowMs = () => (c.now ? c.now() : Date.now());
-    const pollSeconds = gate.pollSeconds ?? 60;
-    const start = nowMs();
-    const deadline = Math.min(start + (gate.maxWaitSeconds ?? 900) * 1000, c.notAfter != null ? c.notAfter * 1000 : Infinity);
-    const record = () => { if (typeof c.onStep === 'function') c.onStep({ step: 'disruptive-gate', class: stepClass(config, 'disruptive-gate') }); };
-    for (;;) {
-      record();
-      const failing = gate.checks.find((check) => !runInDir(paths.root, check.command, config, c, { tolerate: true }).ok);
-      if (!failing) { record(); return; }
-      const remainingMs = deadline - nowMs();
-      if (remainingMs <= 0) {
-        record();
-        gateRefused = true;
-        throw new Error(`Disruptive gate failed: ${failing.name} still failing after ${Math.round((nowMs() - start) / 1000)}s`);
-      }
-      log.info(`Disruptive gate waiting on ${failing.name}`);
-      sleep(Math.min(pollSeconds, remainingMs / 1000));
+    try {
+      runDisruptiveGateChecks(config, paths, c, (step) => {
+        if (typeof c.onStep === 'function') c.onStep({ step, class: stepClass(config, step) });
+      });
+    } catch (error) {
+      if (error.gateRefused) gateRefused = true;
+      throw error;
     }
   };
   const ensureDisruptiveGate = () => { if (!gateDone) runDisruptiveGate(); };
@@ -885,6 +903,14 @@ function deployRelease(config, options = {}, ctx = {}) {
     // release is safe whether the stop itself completed or not.
     const saved = readInterruptedDeploy(config, paths, c);
     if (!saved) return null;
+    // A deploy whose caller said `recoverInterrupted: 'refuse'` (host-run) never settles an old run's journal as a
+    // side effect: that is the separate `recover` operation. Refused before the ledger records a live step.
+    if (c.recoverInterrupted === 'refuse' && !recoverOnly) {
+      throw new Error(
+        `A previous deploy was interrupted mid-"${saved.phase}" (release ${saved.releaseId || '?'}); this deploy will not recover it `
+        + 'as a side effect. Settle it with `deploy-kit recover --on-host` first.',
+      );
+    }
     stepStart('recover-interrupted');
 
     const phase = saved.phase;
@@ -1325,6 +1351,9 @@ function deployRelease(config, options = {}, ctx = {}) {
     const releaseId = `${st.sha.slice(0, 12)}-${ts}`;
     st.releaseId = releaseId;
     st.releaseDir = `${paths.releasesDir}/${releaseId}`;
+    // Tell the caller exactly which release this run is about to create, before anything touches it (host-run
+    // persists it as runs/<runId>/release.json, which `recover` later matches against the journal).
+    if (typeof c.onRelease === 'function') c.onRelease({ releaseId, sha: st.sha });
     log.step(`Materializing release ${releaseId} at ${st.sha.slice(0, 12)}`);
     stepStart('worktree-add');
     runInDir(paths.root, `git --git-dir=${paths.repoGit} worktree add --detach ${st.releaseDir} ${st.sha}`, config, c);
@@ -1444,8 +1473,9 @@ function deployRelease(config, options = {}, ctx = {}) {
       if (!probe.ok) logFailureOutput('Pending-migration probe', probe, log);
       const pending = parsePendingCount(probe);
       if (pending === 0) {
+        // Not journaled here: the phase is still `validate`, which the host reads as an interrupted deploy, and this
+        // probe changed nothing. The count rides on the `flipped` journal and the final record.
         st.migrationsPending = 0;
-        journal();
         provenNoMigration = true;
         steps.push('migrate-skipped');
         log.success('No pending database migrations; skipping the writer stop, backup and migrate');
@@ -1723,7 +1753,7 @@ function deployRelease(config, options = {}, ctx = {}) {
 // runs under a fenced child operation and ends the invocation, which is not this operation.
 function recoverRelease(config, options = {}, ctx = {}) {
   assertTransitionAuthorityEntryPoint(config, { supported: false });
-  return deployRelease(config, options, { ...ctx, [RECOVER_ONLY]: true });
+  return deployRelease(config, options, { ...ctx, [RECOVER_ONLY]: true, recoverInterrupted: 'run' });
 }
 
 // Protected mode: inspect the saved authority journal BEFORE any recovery or configured hook.
@@ -1939,6 +1969,7 @@ function recoverFailedRollback(config, paths, originalCurrent, c, reason, restor
 // touched — a schema rollback is a data-loss decision the operator makes explicitly.
 function rollbackRelease(config, options = {}, ctx = {}) {
   assertTransitionAuthorityEntryPoint(config, { supported: true, options });
+  assertOwnedEntry(config, options, ctx, 'rollback');
   const log = ctx.log || defaultLog;
   const sleep = ctx.sleep || defaultSleep;
   const c = { ...ctx, log, sleep, runtime: ctx.runtime };
@@ -1964,7 +1995,12 @@ function rollbackRelease(config, options = {}, ctx = {}) {
   }
 
   // BRAIN-636 D6: each step is reported (ctx.onStep) BEFORE it runs, like deployRelease's, so the effects ledger shows it.
-  const reportStep = (step) => { if (typeof c.onStep === 'function') c.onStep({ step, class: stepClass(config, step) }); };
+  const executedClasses = [];
+  const reportStep = (step) => {
+    const stepClassName = stepClass(config, step);
+    executedClasses.push(stepClassName);
+    if (typeof c.onStep === 'function') c.onStep({ step, class: stepClassName });
+  };
   const rollbackFacts = {
     stage: 'rollback', liveBefore: null, migrated: false, migrationsPending: null, backupId: null, liveAfter: null,
   };
@@ -1983,6 +2019,9 @@ function rollbackRelease(config, options = {}, ctx = {}) {
     const originalCurrent = pointers.current;
     rollbackFacts.liveBefore = shaOfTarget(originalCurrent);
     rollbackFacts.liveAfter = (recovery) => (recovery.verified ? rollbackFacts.liveBefore : null);
+    // The same first-live-step gate as a deploy (D4c): the flip below is the first live step, so a busy gate refuses
+    // before `current` moves. Under a transition authority the gate runs before the operation begins.
+    runDisruptiveGateChecks(config, paths, c, reportStep);
     if (fenced && originalCurrent) assertSafeTarget(originalCurrent, 'current');
     const isRuntimeFailure = (err) => err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED';
     const phaseJournal = (identity, fields) => persistState(config, paths, { ...identity, ...fields }, c);
@@ -2097,7 +2136,17 @@ function rollbackRelease(config, options = {}, ctx = {}) {
       throw Object.assign(new Error(`Rollback aborted: ${reason}; restored the original release ${originalCurrent}.`), { deployRecovery: RESTORED_ORIGINAL });
     }
   } catch (err) {
-    throw attach(err, failureFromError(rollbackFacts, NO_RECOVERY, err));
+    const result = failureFromError(rollbackFacts, NO_RECOVERY, err);
+    if (!err.gateRefused) throw attach(err, result);
+    // Refused before the flip: nothing live ran, if the ledger agrees (never claimed under a transition authority).
+    const clean = config.transitionAuthority == null && isClean(executedClasses);
+    throw attach(err, {
+      ...result,
+      status: clean ? 'aborted-clean' : result.status,
+      stage: 'disruptive-gate',
+      liveAfter: clean ? rollbackFacts.liveBefore : result.liveAfter,
+      effectsClean: clean,
+    });
   } finally {
     release();
   }
