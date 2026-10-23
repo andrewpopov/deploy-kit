@@ -1234,10 +1234,10 @@ function deployRelease(config, options = {}, ctx = {}) {
     const deliveryEvent = emitDeliveryEvent('succeeded');
 
     // ---- Phase: metadata + prune (success; still holding the lock) ----
-    st.phase = 'done';
-    persistState(config, paths, { phase: 'done', current: `releases/${releaseId}`, previous: st.prevTarget, sha: st.sha, backupId: st.backupId, migrated: st.migrated, ...migrationsPendingField(), ts }, c);
-    // Restart, health and every post-deploy check have passed: record it for host monitoring.
-    writeLastDeployRecord(config, { sha: st.sha, layout: 'release', release: releaseId }, c);
+    // Fenced (protected, non-dry-run) candidates stay nonterminal with identity until
+    // the authority completion ACK; only then does recordSuccess run.
+    const fenced = protectedMode && !dryRun;
+    if (!fenced) recordSuccess();
     prune(config, paths, releaseId, c);
     steps.push('prune');
 
@@ -1253,11 +1253,21 @@ function deployRelease(config, options = {}, ctx = {}) {
       }
     }
 
-    log.success(`Deployment completed successfully (release ${releaseId})`);
+    if (!fenced) log.success(`Deployment completed successfully (release ${releaseId})`);
     return {
       branch, mode: config.mode, host: config.host, sha: st.sha, release: releaseId, steps, healthy: true,
       ...(deliveryEvent ? { deliveryEvent } : {}),
     };
+    };
+    // Terminal success metadata: retains operation identity when protected.
+    const recordSuccess = () => {
+      st.phase = 'done';
+      persistState(config, paths, {
+        ...(operationIdentity || {}),
+        phase: 'done', current: `releases/${releaseId}`, previous: st.prevTarget, sha: st.sha, backupId: st.backupId, migrated: st.migrated, ...migrationsPendingField(), ts,
+      }, c);
+      // Restart, health and every post-deploy check have passed: record it for host monitoring.
+      writeLastDeployRecord(config, { sha: st.sha, layout: 'release', release: releaseId }, c);
     };
     if (!protectedMode) return executeCandidate();
     if (dryRun) {
@@ -1281,6 +1291,9 @@ function deployRelease(config, options = {}, ctx = {}) {
     });
     manager.complete(authorityHandle, observation);
     authorityHandle = null;
+    // Post-ACK: persistence failures propagate (no generic recovery in protected mode).
+    recordSuccess();
+    log.success(`Deployment completed successfully (release ${releaseId})`);
     return deployed;
   } catch (err) {
     if (protectedMode) {
