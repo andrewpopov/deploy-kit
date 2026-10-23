@@ -280,14 +280,14 @@ describe('the flow, against a scripted host', () => {
   beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dk-operator-')); receiptsPath = path.join(tmp, 'receipts.jsonl'); });
   afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
 
-  type Kind = 'preflight' | 'upload' | 'verify' | 'submit';
+  type Kind = 'preflight' | 'probe' | 'upload' | 'verify' | 'submit';
   function host(over: Partial<Record<Kind, () => string | Error>> = {}) {
     const calls: { kind: Kind; args: string[]; input?: unknown; receiptBefore: boolean }[] = [];
     const execFileSync = vi.fn((_file: string, args: string[], opts: { input?: unknown }) => {
       const command = args[args.length - 1];
-      const kind: Kind = command === 'sh -se' ? 'preflight' : command.includes('tar -x') ? 'upload' : command.includes('sha256sum -c') ? 'verify' : 'submit';
+      const kind: Kind = command === 'sh -se' ? 'preflight' : command.includes('dk-run-exists') ? 'probe' : command.includes('tar -x') ? 'upload' : command.includes('sha256sum -c') ? 'verify' : 'submit';
       calls.push({ kind, args, input: opts.input, receiptBefore: fs.existsSync(receiptsPath) && fs.readFileSync(receiptsPath, 'utf8').trim() !== '' });
-      const answer = over[kind] ? over[kind]!() : (kind === 'preflight' ? preflight() : '');
+      const answer = over[kind] ? over[kind]!() : ({ preflight: preflight(), probe: 'dk-run-free\n' } as Record<string, string>)[kind] ?? '';
       if (answer instanceof Error) throw answer;
       return answer;
     });
@@ -316,6 +316,53 @@ describe('the flow, against a scripted host', () => {
     expect(messages[0]).toBe(`run: ${runId}  unit: ${receipt.unit}  host: dkapp@host`);
     expect(d.attach).toHaveBeenCalledTimes(1);
     expect(d.attach.mock.calls[0][0]).toEqual(receipt);
+  });
+
+  describe('a controller-supplied --run-id (BRAIN-636 D8)', () => {
+    const RUN_ID = '20261023T101500Z-0123456789ab-0badcafe';
+    const request = { kind: 'deploy', request: 'req-1', epoch: '0', notAfter: '1790000000', expectReservation: '{"state":"none","runId":null,"gen":0}' };
+
+    it('is used instead of a generated one: the run dir, the unit, the receipt and the meta all carry it', () => {
+      const h = host();
+      const d = deps(h);
+      expect(onHostDeploy(baseConfig(), baseOptions({ ...request, runId: RUN_ID }), d)).toBe(0);
+      expect(h.calls.map((c) => c.kind)).toEqual(['preflight', 'probe', 'upload', 'verify', 'submit']);
+      const receipt = JSON.parse(fs.readFileSync(receiptsPath, 'utf8'));
+      expect(receipt).toMatchObject({ runId: RUN_ID, unit: `deploy-kit-srv-app-${RUN_ID}`, runDir: `/srv/dkapp/.deploy-kit/runs/${RUN_ID}` });
+      const upload = h.calls.find((c) => c.kind === 'upload')!;
+      expect(upload.args[upload.args.length - 1]).toContain(`mkdir -m 700 '/srv/dkapp/.deploy-kit/runs/${RUN_ID}'`);
+    });
+
+    it('without --run-id a run id is still generated and no existence probe is made', () => {
+      const h = host();
+      onHostDeploy(baseConfig(), baseOptions({ ...request }), deps(h));
+      expect(h.calls.map((c) => c.kind)).toEqual(['preflight', 'upload', 'verify', 'submit']);
+      expect(JSON.parse(fs.readFileSync(receiptsPath, 'utf8')).runId).toBe('20260930T120000Z-0123456789ab-deadbeef');
+    });
+
+    it('refuses a malformed id by name before contacting the host', () => {
+      const h = host();
+      expect(onHostDeploy(baseConfig(), baseOptions({ ...request, runId: '../../etc' }), deps(h))).toBe(1);
+      expect(h.calls).toEqual([]);
+      expect(messages.join('\n')).toContain('ONHOST_RUN_ID');
+    });
+
+    it('refuses an id whose run dir already exists on the host: no receipt, no upload, no submission', () => {
+      const h = host({ probe: () => 'dk-run-exists\n' });
+      const d = deps(h);
+      expect(onHostDeploy(baseConfig(), baseOptions({ ...request, runId: RUN_ID }), d)).toBe(1);
+      expect(h.calls.map((c) => c.kind)).toEqual(['preflight', 'probe']);
+      expect(fs.existsSync(receiptsPath)).toBe(false);
+      expect(messages.join('\n')).toContain('ONHOST_RUN_EXISTS');
+      expect(d.attach).not.toHaveBeenCalled();
+    });
+
+    it('an unanswered existence probe is a preflight failure, never read as "free"', () => {
+      const h = host({ probe: () => new Error('ssh: connection reset') });
+      expect(onHostDeploy(baseConfig(), baseOptions({ ...request, runId: RUN_ID }), deps(h))).toBe(1);
+      expect(h.calls.map((c) => c.kind)).toEqual(['preflight', 'probe']);
+      expect(messages.join('\n')).toContain('ONHOST_PREFLIGHT');
+    });
   });
 
   it('puts config ssh options on every ssh call and never cd-s into projectDir', () => {

@@ -67,7 +67,7 @@ The steps run in this order; every refusal is named and happens before the lock:
 4. `sha256sum -c` equivalent in Node over `manifest.sha256`. Every listed file must match, and no file under `kit/` may be missing from the manifest.
 5. Parse and validate `meta.json` (schema, a 40-hex sha, `runId` equal to the dir name) and `config.json` (`mode === 'local'`, no `host`, releases layout, `lock !== false`, finite `stepTimeoutSeconds > 0`, `localShell` an absolute path).
 6. **OOM parity**: read `/proc/self/oom_score_adj`. If it is greater than `meta.capture.oomScoreAdj`, refuse (`ONHOST_OOM_SCORE`) and name the fix: a `user@.service` drop-in `OOMScoreAdjust=` plus `DefaultOOMScoreAdjust=` in `/etc/systemd/user.conf.d/`, with the value, as documented in the README.
-7. Call `deployRelease(config, { skipBuild, skipDeps, skipMigrate, verifyPins, sha, autoCut: false, stealLock: false })`. Allowlisted options come first, enforced values last.
+7. Call `deployRelease(config, { skipBuild, skipDeps, skipMigrate, verifyPins, sha, autoCut: false, stealLock: false })`. Allowlisted options come first, enforced values last. A request of kind `rollback` or `recover` calls `rollbackRelease` or `recoverRelease` the same way (README, "Controller requests").
 8. Write `outcome.json` (tmp + rename) as `{runId, ok, error?: message, finishedAt}`. Exit 0 or 1.
 9. After a successful activation, if `$PM2_HOME/pm2.pid`'s PID ≠ `systemctl show -p MainPID --value pm2-$USER.service`, log a loud **warning** `PM2_DAEMON_NOT_SYSTEM_SERVICE`. This never fails the run.
 

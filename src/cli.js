@@ -23,7 +23,7 @@ const KNOWN_FLAGS = [
   '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
   '--dir', '--json', '--local', '--branch', '--no-auto-cut', '--guard-config', '--sha', '--on-host',
-  '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--to',
+  '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--to', '--run-id', '--parent-run',
 ];
 
 // Flags that take a following positional value. Kept in sync with the arity
@@ -33,7 +33,7 @@ const KNOWN_FLAGS = [
 // a used flag; parseOptions consumes it as --service's value).
 const VALUE_FLAGS = new Set([
   '--lines', '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env', '--dir', '--branch',
-  '--guard-config', '--sha', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--to',
+  '--guard-config', '--sha', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--to', '--run-id', '--parent-run',
 ]);
 
 // The set of flags each command actually reads. KNOWN_FLAGS above is only
@@ -51,8 +51,9 @@ const COMMAND_FLAGS = {
   'verify-tunnel-config': ['--dir', '--guard-config', '--json'],
   'verify-no-secrets': ['--dir', '--guard-config', '--json'],
   'clear-pending-release': ['--dir', '--json'],
-  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut', '--sha', '--on-host', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation'],
-  rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock', '--on-host', '--to', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation'],
+  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut', '--sha', '--on-host', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--run-id'],
+  rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock', '--on-host', '--to', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--run-id'],
+  recover: ['--on-host', '--parent-run', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--run-id'],
   monitor: ['--steal-lock', '--no-lock', '--local'],
   status: [],
   health: [],
@@ -102,6 +103,7 @@ function validateCommandFlags(command, args) {
 // On-host request flags (BRAIN-636 D4a): raw strings here, validated by on-host/operator.js.
 const REQUEST_FLAGS = {
   '--kind': 'kind', '--request': 'request', '--epoch': 'epoch', '--not-after': 'notAfter', '--expect-reservation': 'expectReservation',
+  '--run-id': 'runId', '--parent-run': 'parentRun',
 };
 
 const PORT_RE = /^[0-9]+$/;
@@ -275,6 +277,13 @@ Commands:
   rollback --on-host --to <40-hex> --request <id> --epoch <n> --not-after <unix> --expect-reservation <json>
                                             the controller-driven rollback: refuses unless previous is the --to
                                             release and the current release never migrated
+  recover --on-host --parent-run <run-id> --request <id> --epoch <n> --not-after <unix> --expect-reservation <json>
+                                            settle the interrupted deploy <run-id> left: runs ONLY the journal
+                                            recovery; refuses unless the journal is interrupted and names that
+                                            run's release. deploy, rollback and recover also take --run-id <id>
+                                            (the controller's run id; refused if that run dir exists on the host)
+  artifact --json                          print the installed kit's identity (version + tarball sha256 from
+                                            ARTIFACT.json, or source "unpinned")
   monitor [--steal-lock] [--no-lock]       run fleet checks + alert on transitions (cron)
     [--local]                               force mode:'local' for this run — every check
                                             and the alert sink execute on this machine, no
@@ -425,6 +434,22 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     if (result.ok) { log.success(result.message); return 0; }
     log.error(result.message);
     return 1;
+  }
+
+  // artifact: the installed kit's identity (BRAIN-636 D8). No config, no banner: stdout is only the JSON.
+  if (command === 'artifact') {
+    const rest = argv.slice(1);
+    if (rest.length !== 1 || rest[0] !== '--json') {
+      log.error('Usage: deploy-kit artifact --json');
+      return 1;
+    }
+    try {
+      console.log(JSON.stringify(require('./artifact').readArtifact(), null, 2));
+      return 0;
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
   }
 
   // host-run takes a positional <runDir>, like port-guard, and is invoked only by
@@ -744,8 +769,12 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   if (command === 'deploy' && options.onHost) {
     return require('./on-host/operator').onHostDeploy(config, options, { cwd });
   }
+  if (command === 'deploy' && !options.onHost && options.runId !== undefined) {
+    log.error('deploy: --run-id only applies with --on-host');
+    return 1;
+  }
   if (command === 'rollback' && !options.onHost) {
-    const requestFlags = ['to', 'kind', 'request', 'epoch', 'notAfter', 'expectReservation'].filter((key) => options[key] !== undefined);
+    const requestFlags = ['to', 'kind', 'request', 'epoch', 'notAfter', 'expectReservation', 'runId'].filter((key) => options[key] !== undefined);
     if (requestFlags.length > 0) {
       log.error('rollback: --to and the request flags only apply with --on-host; without it rollback returns to `previous`, whatever it is');
       return 1;
@@ -753,6 +782,13 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   }
   if (command === 'rollback' && options.onHost) {
     return require('./on-host/operator').onHostRollback(config, options, { cwd });
+  }
+  if (command === 'recover') {
+    if (!options.onHost) {
+      log.error('recover only exists as `recover --on-host`: it settles an interrupted on-host deploy');
+      return 1;
+    }
+    return require('./on-host/operator').onHostRecover(config, options, { cwd });
   }
 
   switch (command) {

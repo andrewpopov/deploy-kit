@@ -20,6 +20,7 @@ const { lockId } = require('../lock');
 const { log: defaultLog } = require('../log');
 const { FULL_SHA_RE } = require('../sha-options');
 const { OnHostError, listFiles, sha256File } = require('./host-run');
+const { readArtifact: readInstalledArtifact } = require('../artifact');
 const { RUN_ID_RE } = require('./outcome');
 const { REQUEST_ID_RE } = require('./status');
 const { appendReceipt, SAFE_ABS_PATH_RE } = require('./receipts');
@@ -60,6 +61,9 @@ function validateOnHostRequest(config, options) {
   }
   if (!Array.isArray(config.appNames)) refuse('ONHOST_CONFIG', 'config appNames must be an array');
   requestMeta(config, options);
+  if (options.runId !== undefined && !RUN_ID_RE.test(options.runId)) {
+    refuse('ONHOST_RUN_ID', `--run-id ${JSON.stringify(options.runId)} must match YYYYMMDDTHHMMSSZ-<12 hex>-<8 hex>`);
+  }
   if (config.onHost != null) {
     // One rule: the same validator config.js runs at load time (a caller can bypass load-time validation).
     const problems = validateConfig({ onHost: config.onHost }, { source: 'config' });
@@ -68,8 +72,8 @@ function validateOnHostRequest(config, options) {
 }
 
 // BRAIN-636 D4a: the request flags (--kind --request --epoch --not-after --expect-reservation) become
-// meta.json fields. All five or none; an onHost.required app must pass all five. The parent fields stay null
-// until rollback/recover are dispatched (D6/D8). -> the meta fields, or null when no request was given.
+// meta.json fields. All five or none; an onHost.required app must pass all five. A recover names the run it
+// settles (--parent-run); every other kind has no parent run. -> the meta fields, or null when no request was given.
 function requestMeta(config, options) {
   const refuse = (why) => { throw new OnHostError('ONHOST_REQUEST', why); };
   const given = ['kind', 'request', 'epoch', 'notAfter', 'expectReservation'].filter((key) => options[key] !== undefined);
@@ -94,12 +98,17 @@ function requestMeta(config, options) {
   } else if (options.rollbackTo !== undefined) {
     refuse('--to is only valid for a rollback');
   }
+  if (options.kind === 'recover') {
+    if (typeof options.parentRun !== 'string' || !RUN_ID_RE.test(options.parentRun)) refuse('--parent-run must be the run id of the deploy being recovered');
+  } else if (options.parentRun !== undefined) {
+    refuse('--parent-run is only valid for a recover');
+  }
   return {
     kind: options.kind,
     requestId: options.request,
     ...(options.kind === 'rollback' ? { rollbackTo: options.rollbackTo } : {}),
     parentRequestId: null,
-    parentRunId: null,
+    parentRunId: options.kind === 'recover' ? options.parentRun : null,
     epoch: integer('--epoch', options.epoch),
     notAfter: integer('--not-after', options.notAfter),
     expectReservation,
@@ -259,7 +268,7 @@ function jsYamlRoot() {
 
 // Stage bundleDir/{kit/, config.json, meta.json, manifest.sha256}. Everything is a real file
 // (symlinks dereferenced); tests and the host-run cannot tell it from a hand-copied tree.
-function buildBundle(bundleDir, { kitRoot, jsYamlDir, config, meta, withKitArtifact = false }) {
+function buildBundle(bundleDir, { kitRoot, jsYamlDir, config, meta }) {
   const kitDir = path.join(bundleDir, 'kit');
   const copy = (from, to, filter) => fs.cpSync(from, to, { recursive: true, dereference: true, filter });
   fs.mkdirSync(kitDir, { recursive: true });
@@ -267,11 +276,6 @@ function buildBundle(bundleDir, { kitRoot, jsYamlDir, config, meta, withKitArtif
   copy(path.join(kitRoot, 'src'), path.join(kitDir, 'src'), (src) => path.basename(src) !== '__tests__');
   copy(jsYamlDir, path.join(kitDir, 'node_modules', 'js-yaml'));
   fs.writeFileSync(path.join(bundleDir, 'config.json'), `${JSON.stringify(config, null, 2)}\n`);
-  // The kit's identity: its version plus one digest over every file under kit/ (D8 replaces this with ARTIFACT.json).
-  if (withKitArtifact) {
-    const lines = listFiles(kitDir, bundleDir).sort().map((rel) => `${sha256File(path.join(bundleDir, rel))}  ${rel}\n`);
-    meta.kitArtifact = { version: meta.operatorVersion, sha256: crypto.createHash('sha256').update(lines.join('')).digest('hex') };
-  }
   fs.writeFileSync(path.join(bundleDir, 'meta.json'), `${JSON.stringify(meta, null, 2)}\n`);
   const files = [...listFiles(kitDir, bundleDir), 'config.json', 'meta.json'].sort();
   const manifest = files.map((rel) => `${sha256File(path.join(bundleDir, rel))}  ${rel}\n`).join('');
@@ -343,6 +347,23 @@ function readGitHead(cwd) {
   }
 }
 
+// The identity of the kit being uploaded, as the installed ARTIFACT.json states it (src/artifact.js).
+function kitArtifactOf(readArtifact, kitRoot) {
+  try {
+    const { version, sha256, source } = readArtifact({ root: kitRoot });
+    return sha256 === null ? { version, sha256, source } : { version, sha256 };
+  } catch (error) {
+    throw new OnHostError('ONHOST_ARTIFACT', `cannot read the kit's artifact identity: ${error.message}`);
+  }
+}
+
+function assertRunDirFree(ssh, runDir) {
+  const probe = ssh(`if [ -e ${shQuote(runDir)} ] || [ -L ${shQuote(runDir)} ]; then echo dk-run-exists; else echo dk-run-free; fi`, { timeoutSeconds: PREFLIGHT_TIMEOUT_SECONDS });
+  const answer = probe.ok ? String(probe.output).trim() : '';
+  if (answer === 'dk-run-exists') throw new OnHostError('ONHOST_RUN_EXISTS', `run dir ${runDir} already exists on the host; a run id is never reused`);
+  if (answer !== 'dk-run-free') throw new OnHostError('ONHOST_PREFLIGHT', `could not check whether ${runDir} exists: ${(probe.stderr || probe.error?.message || '').trim()}`);
+}
+
 // Returns the process exit code: attach's (0/1/70/75), 1 for a refusal before submission,
 // 75 when the submission's outcome is unknown. Never resubmits.
 function onHostDeploy(config, options, deps = {}) {
@@ -353,6 +374,7 @@ function onHostDeploy(config, options, deps = {}) {
     randomHex = (bytes) => crypto.randomBytes(bytes).toString('hex'),
     receiptsPath,
     kitRoot = path.resolve(__dirname, '..', '..'),
+    readArtifact = readInstalledArtifact,
     jsYamlDir = jsYamlRoot(),
     gitHead = () => readGitHead(deps.cwd || process.cwd()),
     attach = attachReceipt,
@@ -372,9 +394,11 @@ function onHostDeploy(config, options, deps = {}) {
     const capture = parsePreflight(scripted.output, config, log);
 
     const startedAt = now();
-    const runId = newRunId(startedAt, options.sha, randomHex);
+    const runId = options.runId ?? newRunId(startedAt, options.sha, randomHex);
     const unit = `deploy-kit-${lockId(config)}-${runId}`;
     const runDir = `${capture.home}/.deploy-kit/runs/${runId}`;
+    // A controller-supplied id is never reused: the upload's `mkdir` would refuse too, but only after a receipt exists.
+    if (options.runId !== undefined) assertRunDirFree(ssh, runDir);
 
     const resolvedConfig = { ...config, mode: 'local', localShell: capture.shell };
     delete resolvedConfig.host;
@@ -383,6 +407,7 @@ function onHostDeploy(config, options, deps = {}) {
       runId,
       sha: options.sha,
       ...request,
+      ...(request ? { kitArtifact: kitArtifactOf(readArtifact, kitRoot) } : {}),
       options: {
         skipBuild: options.skipBuild === true,
         skipDeps: options.skipDeps === true,
@@ -398,7 +423,7 @@ function onHostDeploy(config, options, deps = {}) {
       },
     };
     buildBundle(bundleRoot, {
-      kitRoot, jsYamlDir, config: resolvedConfig, meta, withKitArtifact: request !== null,
+      kitRoot, jsYamlDir, config: resolvedConfig, meta,
     });
     const tarball = tarBundle(bundleRoot);
 
@@ -452,6 +477,20 @@ function onHostRollback(config, options, deps = {}) {
   }, deps);
 }
 
+// `deploy-kit recover --on-host --parent-run <run-id> ...`: settles the interrupted deploy that run left. It names
+// no commit, so the run carries the all-zero sha (meta.sha must be 40 hex); the host's recover gates read the
+// journal and the parent run, never this value.
+const RECOVER_SHA = '0'.repeat(40);
+function onHostRecover(config, options, deps = {}) {
+  if (options.kind !== undefined && options.kind !== 'recover') {
+    (deps.log || defaultLog).error('recover --on-host takes no --kind other than recover');
+    return 1;
+  }
+  return onHostDeploy(config, {
+    ...options, kind: 'recover', sha: RECOVER_SHA, autoCut: false,
+  }, deps);
+}
+
 module.exports = {
-  onHostDeploy, onHostRollback, validateOnHostRequest, requestMeta, preflightScript, parsePreflight, parseKeyValues, buildBundle, buildSubmitArgv, quoteArgv, newRunId, systemdEscape, jsYamlRoot,
+  onHostDeploy, onHostRollback, onHostRecover, validateOnHostRequest, requestMeta, preflightScript, parsePreflight, parseKeyValues, buildBundle, buildSubmitArgv, quoteArgv, newRunId, systemdEscape, jsYamlRoot,
 };

@@ -138,10 +138,15 @@ function validateRequestMeta(meta, config) {
   const expectOk = (expect.state === 'none' && expect.runId === null && expect.gen === 0)
     || (expect.state === 'clean-abort' && typeof expect.runId === 'string' && RUN_ID_RE.test(expect.runId) && Number.isSafeInteger(expect.gen) && expect.gen >= 1);
   if (!expectOk) throw bad('meta.expectReservation must be {state:"none",runId:null,gen:0} or {state:"clean-abort",runId:<run id>,gen:>=1}');
+  // An unpinned kit (no ARTIFACT.json, see src/artifact.js) is recorded as it is; the controller's `check` refuses it.
   const artifact = meta.kitArtifact;
-  if (!isObject(artifact) || typeof artifact.version !== 'string' || artifact.version === '' || !SHA256_RE.test(artifact.sha256)) {
-    throw bad('meta.kitArtifact must be {version:<string>, sha256:<64 hex>}');
+  const pinned = isObject(artifact) && SHA256_RE.test(artifact.sha256);
+  const unpinned = isObject(artifact) && artifact.sha256 === null && artifact.source === 'unpinned';
+  if (!isObject(artifact) || typeof artifact.version !== 'string' || artifact.version === '' || !(pinned || unpinned)) {
+    throw bad('meta.kitArtifact must be {version:<string>, sha256:<64 hex>} or {version:<string>, sha256:null, source:"unpinned"}');
   }
+  // A recover settles one named run: without its id the gate has no release to compare the journal with.
+  if (meta.kind === 'recover' && meta.parentRunId === null) throw bad('meta.parentRunId is required for a recover');
   // A rollback names the release it returns to (the full sha, equal to meta.sha); no other kind carries one.
   const rollbackTo = meta.rollbackTo ?? null;
   if (meta.kind === 'rollback' ? !(typeof rollbackTo === 'string' && FULL_SHA_RE.test(rollbackTo) && rollbackTo === meta.sha) : rollbackTo !== null) {
@@ -246,6 +251,7 @@ function hostRun(runDir, deps = {}) {
   const {
     deployRelease = (...args) => require('../release').deployRelease(...args),
     rollbackRelease = (...args) => require('../release').rollbackRelease(...args),
+    recoverRelease = (...args) => require('../release').recoverRelease(...args),
     env = process.env,
     uid = process.getuid(),
     log = defaultLog,
@@ -279,7 +285,7 @@ function hostRun(runDir, deps = {}) {
     if (request) {                                                      // 7-9, see accept.js
       deployed = true; // every pre-acceptance failure is handled (and recorded) inside runAccepted
       const code = runAccepted({
-        runDir, runId, request, config, options, deps: { ...deps, deployRelease, rollbackRelease, env, log, now },
+        runDir, runId, request, config, options, deps: { ...deps, deployRelease, rollbackRelease, recoverRelease, env, log, now },
       });
       if (code === 0) warnIfPm2NotSystemService({ env, log, readFile, run });
       return code;

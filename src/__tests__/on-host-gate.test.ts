@@ -10,7 +10,7 @@ import { hasFlock } from './target-state-fixture';
 const require = createRequire(__filename);
 const { resolveRequest } = require('../target-state.js');
 const lock = require('../lock.js');
-const { requestMeta: operatorRequestMeta, buildBundle } = require('../on-host/operator.js');
+const { requestMeta: operatorRequestMeta } = require('../on-host/operator.js');
 
 const describeWithFlock = hasFlock ? describe : describe.skip;
 
@@ -215,14 +215,6 @@ describeWithFlock('host-run request protocol: refusals', () => {
     const first = t.go(runIdN(5), { git: { readLive: () => null } });
     expect(first.code).toBe(0);
     expect(first.git.isAncestor).not.toHaveBeenCalled();
-  });
-
-  it('recover passes its journal gate and then refuses kind-unsupported (D8 adds the pipeline)', () => {
-    fs.writeFileSync(path.join(t.config.projectDir, '.deploy-kit-state.json'), JSON.stringify({ phase: 'stopped', releaseId: 'r1' }));
-    t.stage(runIdN(1), requestMeta({ kind: 'recover', parentRunId: runIdN(2) }));
-    t.go(runIdN(1));
-    expect(t.readJson(`runs/${runIdN(1)}/refused.json`).code).toBe('kind-unsupported');
-    expect(t.has(`runs/${runIdN(1)}/accepted.json`)).toBe(false);
   });
 
   it('recover with nothing interrupted refuses nothing-to-recover; a corrupt journal refuses journal-corrupt', () => {
@@ -482,24 +474,5 @@ describe('request flags: operator -> meta.json', () => {
     ['kind', 'redeploy'], ['request', 'a b'], ['epoch', '-1'], ['epoch', '1.5'], ['notAfter', 'soon'], ['expectReservation', '{nope'],
   ])('rejects --%s %s', (key, value) => {
     expect(() => operatorRequestMeta(cfg({ required: true }), { ...flags, [key]: value })).toThrow(/ONHOST_REQUEST/);
-  });
-
-  it('the bundle carries the kit artifact identity only for a request, and it changes with the kit', () => {
-    const dir = fs.mkdtempSync(path.join(t.home, 'bundle-'));
-    const kitRoot = fs.mkdtempSync(path.join(t.home, 'kit-'));
-    fs.mkdirSync(path.join(kitRoot, 'src'));
-    fs.writeFileSync(path.join(kitRoot, 'package.json'), '{}');
-    fs.writeFileSync(path.join(kitRoot, 'src', 'cli.js'), '//one');
-    const jsYamlDir = fs.mkdtempSync(path.join(t.home, 'yaml-'));
-    const build = (withKitArtifact: boolean) => {
-      const meta: Record<string, unknown> = { operatorVersion: '0.33.0' };
-      buildBundle(fs.mkdtempSync(path.join(dir, 'b-')), { kitRoot, jsYamlDir, config: {}, meta, withKitArtifact });
-      return meta.kitArtifact as { version: string; sha256: string } | undefined;
-    };
-    const first = build(true);
-    expect(first).toMatchObject({ version: '0.33.0', sha256: expect.stringMatching(/^[0-9a-f]{64}$/) });
-    expect(build(false)).toBeUndefined();
-    fs.writeFileSync(path.join(kitRoot, 'src', 'cli.js'), '//two');
-    expect(build(true)?.sha256).not.toBe(first?.sha256);
   });
 });

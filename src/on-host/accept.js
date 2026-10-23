@@ -246,20 +246,57 @@ function checkReservation({ files, request, runId }) {
   return { gen: held.gen + 1, prev: { runId: held.runId, gen: held.gen } };
 }
 
-function checkUnresolved(files) {
-  if (fs.existsSync(files.unresolved)) {
-    throw new Refusal('app-unresolved', `${files.unresolved} exists: an earlier request may have changed production; run deploy-kit resolve`);
+// -> the parsed unresolved marker, or null when it is absent or unreadable.
+function readUnresolved(files) {
+  try {
+    const marker = JSON.parse(fs.readFileSync(files.unresolved, 'utf8'));
+    return marker !== null && typeof marker === 'object' && !Array.isArray(marker) ? marker : null;
+  } catch {
+    return null;
+  }
+}
+
+// A recover is how an unresolved app gets settled, so the marker does not block the one recover whose parent
+// is the run that left it. Any other request, and a marker that cannot be read, still refuse.
+function checkUnresolved(files, request) {
+  if (!fs.existsSync(files.unresolved)) return;
+  const marker = readUnresolved(files);
+  if (request.kind === 'recover' && marker !== null && marker.runId === request.parentRunId) return;
+  throw new Refusal('app-unresolved', `${files.unresolved} exists: an earlier request may have changed production; run deploy-kit resolve`);
+}
+
+// The release a parent run deployed starts with its sha's first 12 characters (`<sha12>-<timestamp>`). accepted.json
+// is the proof the run was accepted; meta.json is the fallback for a run staged before acceptance was written.
+function parentSha(files, parentRunId) {
+  for (const name of ['accepted.json', 'meta.json']) {
+    const raw = readIfPresent(path.join(files.runs, parentRunId, name));
+    if (raw === null) continue;
+    try {
+      const { sha } = JSON.parse(raw);
+      if (typeof sha === 'string') return sha;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function checkRecover({ request, journal, files }) {
+  if (journal.class !== 'interrupted') throw new Refusal('nothing-to-recover', `journal is ${journal.class}`);
+  const sha = parentSha(files, request.parentRunId);
+  if (sha === null) throw new Refusal('recover-parent-mismatch', `parent run ${request.parentRunId} has no readable accepted.json or meta.json sha`);
+  if (journal.releaseId === null || !journal.releaseId.startsWith(`${sha.slice(0, 12)}-`)) {
+    throw new Refusal('recover-parent-mismatch', `journal release ${journal.releaseId} is not a release of parent run ${request.parentRunId} (sha ${sha.slice(0, 12)})`);
   }
 }
 
 // The journal gate of every kind (plan §4.1 table), then the forward-only check for a deploy.
-function checkKind({ request, paths, git }) {
+function checkKind({ request, paths, git, files }) {
   const journal = classifyJournal(readIfPresent(paths.stateFile));
   if (journal.class === 'corrupt') throw new Refusal('journal-corrupt', journal.problem);
   if (request.kind === 'recover') {
-    if (journal.class !== 'interrupted') throw new Refusal('nothing-to-recover', `journal is ${journal.class}`);
-    // TODO(D8): journal.releaseId must equal the parent run's release, then run recoverRelease().
-    throw new Refusal('kind-unsupported', 'recover has no pipeline entry yet');
+    checkRecover({ request, journal, files });
+    return readLiveOrNull(git, paths);
   }
   if (journal.class === 'interrupted') throw new Refusal('recovery-pending', `journal phase ${journal.phase}`);
   if (request.kind === 'rollback') checkRollback({ request, paths, git });
@@ -295,8 +332,8 @@ function checkGates({ files, request, runId, paths, nowSec, deps }) {
   if (hold && (hold.corrupt || !hold.expired)) throw new Refusal('hold', hold.corrupt ? hold.problem : hold.reason);
   if (nowSec() >= request.notAfter) throw new Refusal('late', `notAfter ${request.notAfter}`);
   const plan = checkReservation({ files, request, runId });
-  checkUnresolved(files);
-  const liveBefore = checkKind({ request, paths, git });
+  checkUnresolved(files, request);
+  const liveBefore = checkKind({ request, paths, git, files });
   return { plan, liveBefore };
 }
 
@@ -332,6 +369,12 @@ function resultOf(returned, thrown) {
   return deployed({});
 }
 
+// A recover succeeds when the recovery it ran is verified; every other kind succeeds only by deploying.
+function succeeded(kind, result) {
+  if (kind === 'recover') return result.status === 'failed-recovered' && result.recovery.verified === true;
+  return result.status === 'deployed';
+}
+
 // Success, a verified clean abort and a verified recovery settle themselves; anything else may have changed production.
 function needsResolution(result) {
   if (result.status === 'deployed') return false;
@@ -348,6 +391,20 @@ function readLiveOrNull(git, paths) {
   }
 }
 
+// A verified recovery of the parent run settles that run's unresolved marker: archived next to a resolution record,
+// like `deploy-kit resolve` does, and only when the marker names the parent.
+function clearSettledMarker({ files, runId, request, finishedAt }) {
+  const marker = readUnresolved(files);
+  if (marker === null || marker.runId !== request.parentRunId || typeof marker.requestId !== 'string') return;
+  const archive = path.join(files.resolved, `${finishedAt.replace(/[:.]/g, '')}-${marker.requestId}`);
+  fs.mkdirSync(files.resolved, { recursive: true, mode: 0o700 });
+  createRecord(`${archive}.resolution.json`, {
+    requestId: marker.requestId, reason: `recovered by run ${runId} (request ${request.requestId})`, at: finishedAt,
+  });
+  fs.renameSync(files.unresolved, `${archive}.unresolved.json`);
+  fsyncDir(files.resolved);
+}
+
 function execute({
   files, runDir, runId, request, config, options, handle, deps, crashAt, ledger, liveBefore, paths,
 }) {
@@ -356,7 +413,7 @@ function execute({
     const ctx = {
       ownedLocks: handle, recoverInterrupted: 'refuse', onStep: ledger.record, notAfter: request.notAfter, ...(deps.runtime ? { runtime: deps.runtime } : {}),
     };
-    const pipeline = request.kind === 'rollback' ? deps.rollbackRelease : deps.deployRelease;
+    const pipeline = { deploy: deps.deployRelease, rollback: deps.rollbackRelease, recover: deps.recoverRelease }[request.kind];
     result = resultOf(pipeline(config, options, ctx));
   } catch (error) {
     deps.log.error(error instanceof Error ? error.message : String(error));
@@ -366,7 +423,10 @@ function execute({
   // The full 40-hex shas, read here rather than taken from the pipeline's release-id prefixes.
   result = { ...result, liveBefore, liveAfter: readLiveOrNull(deps.git || defaultGit, paths) };
   const finishedAt = deps.now().toISOString();
-  if (needsResolution(result)) {
+  // A failed recover leaves the marker it was dispatched to settle exactly as it is: rewriting it would name this run
+  // and lock out a retry whose parent is the original one.
+  const ok = succeeded(request.kind, result);
+  if (needsResolution(result) && !(request.kind === 'recover' && fs.existsSync(files.unresolved))) {
     replaceRecord(files.unresolved, {
       requestId: request.requestId, runId, kind: request.kind, status: result.status, error: result.error, at: finishedAt,
     });
@@ -374,7 +434,7 @@ function execute({
   createRecord(path.join(runDir, 'terminal.json'), {
     runId, kind: request.kind, result, effects: ledger.entries, kitArtifact: request.kitArtifact, finishedAt,
   });
-  const ok = result.status === 'deployed';
+  if (request.kind === 'recover' && ok) clearSettledMarker({ files, runId, request, finishedAt });
   replaceRecord(path.join(runDir, 'outcome.json'), { runId, ok, ...(result.error ? { error: result.error } : {}), finishedAt });
   return ok ? 0 : 1;
 }
@@ -395,8 +455,8 @@ function runAccepted({ runDir, runId, request, config, options, deps }) {
     crashAt('after-lock');
     fs.mkdirSync(runDir, { recursive: true });
     ledger = openLedger(path.join(runDir, 'effects.jsonl'));
-    // A rollback fetches nothing: its target is the release already on the host.
-    if (request.kind !== 'rollback') stageObjects({ config, request, paths, nowSec, git: deps.git || defaultGit, ledger });
+    // A rollback and a recover fetch nothing: their target is a release already on the host.
+    if (request.kind === 'deploy') stageObjects({ config, request, paths, nowSec, git: deps.git || defaultGit, ledger });
     crashAt('after-staging');
     const { plan, liveBefore } = checkGates({ files, request, runId, paths, nowSec, deps });
     if (request.kind === 'deploy') runPreDeployChecks({ config, paths, deps });
@@ -423,5 +483,5 @@ function runAccepted({ runDir, runId, request, config, options, deps }) {
 }
 
 module.exports = {
-  runAccepted, writeRefused, targetFiles, CrashSeam, Refusal, resultOf, needsResolution,
+  runAccepted, writeRefused, targetFiles, CrashSeam, Refusal, resultOf, needsResolution, succeeded,
 };

@@ -26,7 +26,7 @@ const CONSERVATIVE_EFFECTS = {
   stop: true, migrate: true, pointerSwap: true, restart: true, databaseRestore: true,
 };
 const {
-  NO_RECOVERY, shaOfTarget, deployed: deployedResult, failureFromError, attach,
+  NO_RECOVERY, shaOfTarget, deployed: deployedResult, failure, failureFromError, attach,
 } = require('./deploy-result');
 const { stepClass, isClean } = require('./effects');
 const recoveryRequired = (message, cause) => new TransitionOperationError('RECOVERY_REQUIRED', message, cause);
@@ -424,6 +424,10 @@ function readInterruptedDeploy(config, paths, ctx) {
   return null;
 }
 
+// recoverRelease() runs deployRelease's own recovery closure and nothing else; the marker is module-private so
+// no caller can ask a deploy to stop after recovery.
+const RECOVER_ONLY = Symbol('recover-only');
+
 // With `ctx.ownedLocks` (host-run's handle) the locks are already held: validate
 // the handle and return a no-op release. Otherwise take the app lock as always.
 function acquireOrAdoptLock(config, c, { steal }) {
@@ -442,6 +446,7 @@ function deployRelease(config, options = {}, ctx = {}) {
   // directly (not just via deploy()'s layout delegation), so the CLI's
   // parse-time checks are not the only way in (PKG-164 review finding 6).
   assertShaOptions(options);
+  const recoverOnly = ctx[RECOVER_ONLY] === true;
   const log = ctx.log || defaultLog;
   const sleep = ctx.sleep || defaultSleep;
   const c = { ...ctx, log, sleep, runtime: ctx.runtime };
@@ -487,7 +492,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     }
   }
 
-  log.header(`🚀 Deploying [release layout] (${config.mode}${config.host ? ` → ${config.host}` : ''})`);
+  log.header(`${recoverOnly ? '🩹 Recovering' : '🚀 Deploying'} [release layout] (${config.mode}${config.host ? ` → ${config.host}` : ''})`);
 
   const steps = [];
   // Mutable state the recovery machine reads. phase names match the failure table.
@@ -879,7 +884,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // symlink flip had, so resuming and re-verifying the untouched previous
     // release is safe whether the stop itself completed or not.
     const saved = readInterruptedDeploy(config, paths, c);
-    if (!saved) return;
+    if (!saved) return null;
     stepStart('recover-interrupted');
 
     const phase = saved.phase;
@@ -911,7 +916,10 @@ function deployRelease(config, options = {}, ctx = {}) {
     recover(new Error(`previous deploy interrupted during ${phase}`));
     recoveringInterrupted = false;
     steps.push(`recover-interrupted:${phase}`);
+    const facts = resultFacts('recover-interrupted');
+    const recovered = { ...facts, liveAfter: facts.liveAfter(recoveryInfo) };
     Object.assign(st, freshState());
+    return recovered; // null above = nothing was journaled to recover
   };
 
   // DO NOT DELETE THIS AS DEAD CODE -- see the fuller note in deploy.js. This
@@ -1180,6 +1188,12 @@ function deployRelease(config, options = {}, ctx = {}) {
     stepStart('preflight');
     preflight(config, paths, c);
     if (protectedMode && !dryRun) initializeTransitionAuthority();
+    if (recoverOnly) {
+      const recovered = recoverInterruptedDeploy();
+      if (!recovered) throw new Error(`Nothing to recover: ${paths.stateFile} holds no interrupted deploy this tool can recover.`);
+      log.success('Recovered the interrupted deploy');
+      return withEffects(failure(recovered, recoveryInfo, null));
+    }
     if (!protectedMode || dryRun) recoverInterruptedDeploy();
     if (!protectedMode) runPreDeployChecks();
 
@@ -1700,6 +1714,17 @@ function deployRelease(config, options = {}, ctx = {}) {
   }
 }
 
+// BRAIN-636 D8: the interrupted-journal recovery as its own operation (plan 4.1, `recover`). It runs the
+// SAME recovery deployRelease used to run before its pre-checks, and nothing else: no fetch, no candidate, no
+// hook. Resolves to a DeployResult (a verified recovery is `failed-recovered` with `recovery.verified`; the
+// journal is left `recovered`); throws, with `deployResult` attached, when nothing was recovered. Takes the same
+// `ctx.ownedLocks` and `ctx.onStep` as deployRelease. A transition-authority config is refused: its recovery
+// runs under a fenced child operation and ends the invocation, which is not this operation.
+function recoverRelease(config, options = {}, ctx = {}) {
+  assertTransitionAuthorityEntryPoint(config, { supported: false });
+  return deployRelease(config, options, { ...ctx, [RECOVER_ONLY]: true });
+}
+
 // Protected mode: inspect the saved authority journal BEFORE any recovery or configured hook.
 // Shared by forward deploy and manual rollback; only forward deploy admits matched stopped recovery.
 // Returns { kind: 'ready', manager }, or (only with the forward-only allowStoppedRecovery option)
@@ -2084,6 +2109,7 @@ module.exports = {
   RELEASE_RECORD,
   deployRelease,
   rollbackRelease,
+  recoverRelease,
   verifyActivation,
   activateSymlink,
   prune,
