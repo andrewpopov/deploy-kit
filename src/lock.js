@@ -503,3 +503,7 @@ module.exports = {
   inspectLock, guardFile, lockRequiresOwnership, hostLockDir,
   acquireOwnedLocks, validateOwnedLocks, releaseOwnedLocks,
 };
+
+// Shell building blocks for callers that take the lock inside their own single
+// script (BRAIN-636 D3: target-state.js), so the owner protocol has one definition.
+Object.assign(module.exports, { guardPrelude, ownerWriter, ownerFields });

@@ -180,4 +180,6 @@ function onHostStatus(config, runId, { requestId, runtime } = {}) {
   return result;
 }
 
-module.exports = { onHostStatus, classifyStatus, statusCommand, STATES };
+module.exports = {
+  onHostStatus, classifyStatus, statusCommand, STATES, readRecord, validateReservation, validateTerminal,
+};

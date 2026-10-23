@@ -233,6 +233,12 @@ Commands:
   on-host-status <run-id> [--request <id>] --json
                                            read-only: classify an --on-host run on the host (absent|staged|
                                            claimed|refused|accepted-running|terminal|unknown); exit 75 = transport lost
+  hold set --reason <text> [--until <iso>] | hold clear
+                                           write or remove the target's deploy hold (locked, as a session
+                                           lock owner; refuses lock-held, never waits)
+  epoch set <n>                            raise the target's epoch fence (refuses to lower it)
+  request cancel <requestId>               tombstone an unstarted deploy request; exit 3 not-cancellable <reason>
+  target-state --json [--request <id>]     read-only: live sha, journal class, hold, epoch, reservation, lock owners
   attach <run-id>                          follow an --on-host run from the local receipts file
                                             (~/.deploy-kit/on-host-runs.jsonl); same exit codes
   rollback [--skip-build|--skip-deps] [--dry-run] [--steal-lock] [--no-lock]
@@ -463,6 +469,18 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
       log.error(error instanceof Error ? error.message : String(error));
       return 1;
     }
+  }
+
+  // Target-state commands (BRAIN-636 D3): holds, the epoch fence, request cancel, and the read-only state.
+  if (['hold', 'epoch', 'request', 'target-state'].includes(command)) {
+    let targetConfig;
+    try {
+      targetConfig = loadConfig({ cwd });
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
+    return require('./target-state').runCommand(command, argv.slice(1), targetConfig, { log });
   }
 
   const options = parseOptions(argv.slice(1));
