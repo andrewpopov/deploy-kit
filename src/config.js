@@ -133,6 +133,10 @@ const DEFAULT_CONFIG = {
   //     effects: { build: 'candidate' },  // hook/step name -> 'candidate' | 'read-only' | 'live'
   //                                       // (BRAIN-636 D4d). A user hook not declared is 'live',
   //                                       // which stops a failed deploy being a clean abort.
+  //     disruptiveGate: { checks: [{ name, command }], pollSeconds: 60, maxWaitSeconds: 900 },
+  //                                       // read-only checks (like preDeployChecks) polled until all pass
+  //                                       // immediately before the FIRST live step (BRAIN-636 D4c). On
+  //                                       // timeout the deploy aborts (aborted-clean if nothing live ran).
   //   }
   layout: null,
   // Fleet monitoring + alerting (SMH-116). null (default) = disabled (no-op), so
@@ -561,7 +565,7 @@ function validateMonitor(m, source) {
 
 // Keys allowed inside a `layout` block, with their validators. Absence of most is
 // fine (deploy normalizes defaults); `type` is the only required key.
-const LAYOUT_KEYS = ['type', 'keepReleases', 'sharedPaths', 'releaseChecks', 'runningShaCommand', 'effects'];
+const LAYOUT_KEYS = ['type', 'keepReleases', 'sharedPaths', 'releaseChecks', 'runningShaCommand', 'effects', 'disruptiveGate'];
 
 // Names the on-host runner sets itself (or that would let a config redirect the
 // unit's identity or runtime); they can never be forwarded via `onHost.env`.
@@ -606,6 +610,22 @@ function validateHostLock(hostLock, source) {
   return problems;
 }
 
+function validateDisruptiveGate(gate, source) {
+  if (typeof gate !== 'object' || Array.isArray(gate)) return [`${source}: "layout.disruptiveGate" must be an object`];
+  const problems = rejectUnknownKeys(gate, ['checks', 'pollSeconds', 'maxWaitSeconds'], source, 'layout.disruptiveGate');
+  if (!Array.isArray(gate.checks) || gate.checks.length === 0) {
+    problems.push(`${source}: "layout.disruptiveGate.checks" must be a non-empty array`);
+  } else {
+    problems.push(...validateDeployChecks(gate.checks, 'layout.disruptiveGate.checks', source));
+  }
+  for (const key of ['pollSeconds', 'maxWaitSeconds']) {
+    if (gate[key] != null && !(typeof gate[key] === 'number' && Number.isFinite(gate[key]) && gate[key] > 0)) {
+      problems.push(`${source}: "layout.disruptiveGate.${key}" must be a positive number`);
+    }
+  }
+  return problems;
+}
+
 // Validate the opt-in `layout` block. Returns human-readable problem strings.
 // Enforces Codex's shared-path safety rules at config time: relative, cannot
 // escape the release, and no two paths overlap (one being a prefix of another
@@ -637,6 +657,7 @@ function validateLayout(layout, source) {
       }
     }
   }
+  if (layout.disruptiveGate != null) problems.push(...validateDisruptiveGate(layout.disruptiveGate, source));
   if (layout.releaseChecks != null) {
     if (!Array.isArray(layout.releaseChecks)) {
       problems.push(`${source}: "layout.releaseChecks" must be an array`);

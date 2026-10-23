@@ -517,8 +517,37 @@ function deployRelease(config, options = {}, ctx = {}) {
   // BRAIN-636 D4d effects ledger: each step is reported (ctx.onStep) BEFORE it runs, and its class decides
   // effectsClean if the pipeline then fails. A step is recorded even when onStep throws: assume it ran.
   const executedClasses = [];
+  // BRAIN-636 D4c disruptive gate: re-checks safety immediately before the FIRST live step, whichever step
+  // that is. It runs at most once; once a live step has started it can no longer abort cleanly.
+  let gateDone = false;
+  let gateRefused = false;
+  const runDisruptiveGate = () => {
+    gateDone = true;
+    const gate = config.layout && config.layout.disruptiveGate;
+    if (!gate) return;
+    const nowMs = () => (c.now ? c.now() : Date.now());
+    const pollSeconds = gate.pollSeconds ?? 60;
+    const start = nowMs();
+    const deadline = Math.min(start + (gate.maxWaitSeconds ?? 900) * 1000, c.notAfter != null ? c.notAfter * 1000 : Infinity);
+    const record = () => { if (typeof c.onStep === 'function') c.onStep({ step: 'disruptive-gate', class: stepClass(config, 'disruptive-gate') }); };
+    for (;;) {
+      record();
+      const failing = gate.checks.find((check) => !runInDir(paths.root, check.command, config, c, { tolerate: true }).ok);
+      if (!failing) { record(); return; }
+      const remainingMs = deadline - nowMs();
+      if (remainingMs <= 0) {
+        record();
+        gateRefused = true;
+        throw new Error(`Disruptive gate failed: ${failing.name} still failing after ${Math.round((nowMs() - start) / 1000)}s`);
+      }
+      log.info(`Disruptive gate waiting on ${failing.name}`);
+      sleep(Math.min(pollSeconds, remainingMs / 1000));
+    }
+  };
+  const ensureDisruptiveGate = () => { if (!gateDone) runDisruptiveGate(); };
   const stepStart = (step) => {
     const stepClassName = stepClass(config, step);
+    if (stepClassName === 'live') ensureDisruptiveGate();
     executedClasses.push(stepClassName);
     if (typeof c.onStep === 'function') c.onStep({ step, class: stepClassName });
   };
@@ -1475,6 +1504,9 @@ function deployRelease(config, options = {}, ctx = {}) {
     }
 
     // ---- Phase: flip (atomic activation) ----
+    // The flip is always live, and journaling `flipped` is already a disruptive write that recovery would
+    // roll back: a gate that has not run yet (nothing earlier was live) must refuse before it.
+    ensureDisruptiveGate();
     st.phase = 'flipped';
     journal();
     // Point `previous` at the old current (the known-good fallback) before flipping
@@ -1602,7 +1634,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     log.success(`Deployment completed successfully (release ${releaseId})`);
     return deployed;
   } catch (err) {
-    const stage = st.phase;
+    const stage = gateRefused ? 'disruptive-gate' : st.phase;
     if (protectedMode) {
       try {
         // Never generic recover(): early hooks may have mutated production.

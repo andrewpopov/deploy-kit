@@ -19,6 +19,7 @@ const BUILT_IN_STEPS = {
   fetch: 'staging', // the pipeline's own fetch into the bare repo
   preflight: 'read-only',
   preDeployChecks: 'read-only', // plan section 4.1 step 6: declared read-only
+  'disruptive-gate': 'read-only', // layout.disruptiveGate polls; recorded per poll and outcome
   'worktree-add': 'candidate',
   'shared-links': 'candidate', // symlinks created inside the candidate directory
   'verify-pins': 'read-only',

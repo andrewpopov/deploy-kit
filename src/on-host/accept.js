@@ -311,7 +311,7 @@ function execute({
   let result;
   try {
     const ctx = {
-      ownedLocks: handle, recoverInterrupted: 'refuse', onStep: ledger.record, ...(deps.runtime ? { runtime: deps.runtime } : {}),
+      ownedLocks: handle, recoverInterrupted: 'refuse', onStep: ledger.record, notAfter: request.notAfter, ...(deps.runtime ? { runtime: deps.runtime } : {}),
     };
     result = resultOf(deps.deployRelease(config, options, ctx));
   } catch (error) {

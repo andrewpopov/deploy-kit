@@ -40,6 +40,16 @@ export interface ReleaseLayout {
   /** Command that returns the SHA the live app reports; asserted == deployed SHA
    * after the flip so an old process answering 200 can't mask a failed activation. */
   runningShaCommand?: string;
+  /** Read-only checks polled until all pass, immediately before the first live step. */
+  disruptiveGate?: DisruptiveGate;
+}
+
+export interface DisruptiveGate {
+  checks: PreDeployCheck[];
+  /** Seconds between polls. Default 60. */
+  pollSeconds?: number;
+  /** Longest wait (also bounded by the request's notAfter). Default 900. */
+  maxWaitSeconds?: number;
 }
 
 export interface PreDeployCheck {
