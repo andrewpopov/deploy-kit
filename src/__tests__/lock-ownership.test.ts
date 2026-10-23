@@ -177,6 +177,83 @@ describeWithFlock('lock guard file', () => {
   });
 });
 
+// The guarded path with onHost.required: true (flock present). The block above runs it for a
+// plain config; the opted-in config is the one whose safety rests on the guard.
+describeWithFlock('lock guard with onHost.required', () => {
+  const holdGuard = (guard: string, seconds: number) => {
+    const holder = spawn('sh', ['-c', `exec 9>> "${guard}"; flock -x 9; echo held; sleep ${seconds}`], { stdio: ['ignore', 'pipe', 'ignore'] });
+    return new Promise<void>((resolve) => { holder.stdout.once('data', () => resolve()); });
+  };
+
+  it('acquire, inspect and release all work and leave the permanent guard behind', () => {
+    const home = freshHome();
+    const config = optedConfig();
+    const runtime = runtimeFor(home);
+    const guard = lock.guardFile(config).replace('$HOME', home);
+
+    const release = lock.acquireLock(config, { runtime });
+    const inode = statSync(guard).ino;
+    expect(lock.inspectLock(config, { runtime }).guard).toMatchObject({ present: true, held: false, inode });
+    release();
+    expect(existsSync(lockPath(config, home))).toBe(false);
+    expect(statSync(guard).ino).toBe(inode);
+  });
+
+  it('a second acquirer blocks while the guard flock is held, then proceeds', async () => {
+    const home = freshHome();
+    const config = optedConfig();
+    const guard = lock.guardFile(config).replace('$HOME', home);
+    lock.acquireLock(config, { runtime: runtimeFor(home) })();
+    await holdGuard(guard, 1.5);
+
+    const started = Date.now();
+    lock.acquireLock(config, { runtime: runtimeFor(home) });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1000);
+    expect(readOwner(config, home).nonce).toMatch(/^[0-9a-f]+$/);
+  });
+
+  it('a release blocks while the guard is held, so it cannot race a breaker', async () => {
+    const home = freshHome();
+    const config = optedConfig();
+    const guard = lock.guardFile(config).replace('$HOME', home);
+    const release = lock.acquireLock(config, { runtime: runtimeFor(home) });
+    await holdGuard(guard, 1.5);
+
+    const started = Date.now();
+    release();
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1000);
+    expect(existsSync(lockPath(config, home))).toBe(false);
+  });
+
+  it('inspect reports the guard as held while another process holds it, without blocking', async () => {
+    const home = freshHome();
+    const config = optedConfig();
+    const guard = lock.guardFile(config).replace('$HOME', home);
+    lock.acquireLock(config, { runtime: runtimeFor(home) });
+    await holdGuard(guard, 1.5);
+
+    const started = Date.now();
+    expect(lock.inspectLock(config, { runtime: runtimeFor(home) }).guard.held).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it('a contender is refused (not queued behind the guard) when the lock is held and the guard is free', () => {
+    const home = freshHome();
+    const config = optedConfig();
+    lock.acquireLock(config, { runtime: runtimeFor(home) });
+    expect(() => lock.acquireLock(config, { runtime: runtimeFor(home) })).toThrow(/refused lock-held/);
+  });
+
+  it('an opted-in app refuses (exit 2) on a host without flock; a plain app proceeds unguarded', () => {
+    if (['/usr/bin/flock', '/bin/flock'].some((p) => existsSync(p))) return; // flock is on the default PATH here
+    const home = freshHome();
+    const noFlock = runtimeFor(home, { PATH: '/usr/bin:/bin' });
+    expect(() => lock.acquireLock(optedConfig(), { runtime: noFlock })).toThrow(/Could not run the lock-check/);
+    expect(existsSync(lockPath(optedConfig(), home))).toBe(false);
+    lock.acquireLock(lockConfig({ appNames: ['brain636-plain'] }), { runtime: noFlock });
+  });
+});
+
 describeOnPosix('lock takeover policy', () => {
   it('a non-opted app still takes over a lock older than the TTL (existing behaviour)', () => {
     const home = freshHome();

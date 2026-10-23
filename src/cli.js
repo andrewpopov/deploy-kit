@@ -105,6 +105,20 @@ const PORT_RE = /^[0-9]+$/;
 // a typo'd `--dry-rn`, or `--dry-run` passed to a version that predates it,
 // would otherwise run a FULL PRODUCTION DEPLOY while the operator believes
 // nothing will happen. That happened on 2026-07-10 (BWK-136).
+// `lock break` flags: --nonce and --reason take a value; --host and --legacy-owner-gone
+// are switches. Returns null on anything else (unknown flag, missing value or nonce/reason).
+function parseLockBreakArgs(args) {
+  const out = { host: false, legacyOwnerGone: false };
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i];
+    if (a === '--host') out.host = true;
+    else if (a === '--legacy-owner-gone') out.legacyOwnerGone = true;
+    else if ((a === '--nonce' || a === '--reason') && i + 1 < args.length) { out[a.slice(2)] = args[i + 1]; i += 1; }
+    else return null;
+  }
+  return out.nonce && out.reason ? out : null;
+}
+
 function parseOptions(args) {
   const options = { lines: 50 };
   for (let i = 0; i < args.length; i += 1) {
@@ -170,6 +184,9 @@ Commands:
     [--guard-config <path>] [--json]       filename is tracked or unignored
   lock inspect [--json]                    print the app lock's owner record and guard
                                             state (read-only; never mutates)
+  lock break --nonce <N> --reason <text>   operator-only: remove a held lock after proving
+    [--host] [--legacy-owner-gone]         its owner is gone (see README). Exit 0 broken,
+                                            3 refused
   clear-pending-release [--dir <path>]     discard the crash-recovery pointer
     [--json]                               auto-cut writes to
                                             .deploy-kit/pending-release.json, so the
@@ -454,11 +471,28 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   }
 
   // lock takes a positional subcommand, so it is dispatched before parseOptions
-  // like attach. Only `inspect` exists (read-only); breaking a lock is a later slice.
+  // like attach. `inspect` is read-only; `break` is the operator-only removal that
+  // first proves the owner is gone (exit 0 broken, 3 refused, 1 usage or failure).
   if (command === 'lock') {
     const rest = argv.slice(1);
+    const lockUsage = 'Usage: deploy-kit lock inspect [--json] | deploy-kit lock break --nonce <N> --reason <text> [--host] [--legacy-owner-gone]';
+    if (rest[0] === 'break') {
+      const parsed = parseLockBreakArgs(rest.slice(1));
+      if (!parsed) {
+        log.error(lockUsage);
+        return 1;
+      }
+      try {
+        const result = require('./lock-break').breakLock(loadConfig({ cwd }), {}, parsed);
+        console.log(result.output);
+        return result.broken ? 0 : require('./lock-break').REFUSED_EXIT;
+      } catch (error) {
+        log.error(error instanceof Error ? error.message : String(error));
+        return 1;
+      }
+    }
     if (rest[0] !== 'inspect' || rest.slice(1).some((a) => a !== '--json')) {
-      log.error('Usage: deploy-kit lock inspect [--json]');
+      log.error(lockUsage);
       return 1;
     }
     try {

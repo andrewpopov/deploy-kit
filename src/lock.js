@@ -500,7 +500,7 @@ function inspectLock(config, ctx, { suffix } = {}) {
 
 module.exports = {
   lockId, lockDir, prevShaFile, legacyPrevShaFile, lockTtlSeconds, ensureStateDir, acquireLock,
-  inspectLock, guardFile, lockRequiresOwnership, hostLockDir,
+  inspectLock, guardFile, lockRequiresOwnership, hostLockDir, lockLocation,
   acquireOwnedLocks, validateOwnedLocks, releaseOwnedLocks,
 };
 
