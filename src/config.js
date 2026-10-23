@@ -87,6 +87,8 @@ const DEFAULT_CONFIG = {
   localShell: null,
   // `deploy --on-host` (PKG-187): { env: [NAMES] } -- extra environment variable
   // names captured from the target's ssh environment and forwarded to host-run.
+  // `required: true` (BRAIN-636) opts the app out of automatic lock takeover: a
+  // held lock is only ever removed by an evidence-checked `lock break`.
   onHost: null,
   // Build before the backup/stop/migrate block (apps stay up during build) so the
   // paused window is just migration. Default false = build after migrate (paused).
@@ -561,7 +563,10 @@ const ON_HOST_FORBIDDEN_ENV = [
 const ON_HOST_ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
 
 function validateOnHost(onHost, source) {
-  const problems = rejectUnknownKeys(onHost, ['env'], source, 'onHost');
+  const problems = rejectUnknownKeys(onHost, ['env', 'required'], source, 'onHost');
+  if ('required' in onHost && typeof onHost.required !== 'boolean') {
+    problems.push(`${source}: "onHost.required" must be a boolean`);
+  }
   if (!('env' in onHost)) return problems;
   if (!Array.isArray(onHost.env)) {
     problems.push(`${source}: "onHost.env" must be an array of environment variable names`);

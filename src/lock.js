@@ -111,29 +111,111 @@ function lockCheckFailedMessage(res, dir, action) {
     + `here. Resolve connectivity/auth to the target, then retry. Underlying error: ${detail}`;
 }
 
-// Take the target lock (atomic mkdir), recording owner metadata (pid + start
-// time, for operator visibility in the stale-lock log line) plus a random
-// nonce inside it. Staleness is judged PURELY by the TTL clock (recorded ts vs
-// now) -- never by the recorded pid: that pid is the ephemeral remote shell's
-// own $$, which exits moments after writing it, so it is printed for a human
-// but never checked as a liveness signal by this code. The nonce is what lets
-// release() below tell "a lock I still hold" from "a lock TTL-reclaimed out
+// `onHost.required` apps never have a held lock taken over by age or by
+// --steal-lock: units run with KillMode=process, so a dead pid or an old
+// timestamp proves nothing about whether the run is still alive. Breaking such a
+// lock is a separate, evidence-checked operation (a later slice).
+function lockRequiresOwnership(config) {
+  return config.onHost != null && config.onHost.required === true;
+}
+
+// Permanent sibling of the lock directory. It is NEVER renamed or unlinked: the
+// lock directory itself is renamed/removed, so an flock on it could not
+// serialize two parties who each saw a different directory at the same path.
+// Every acquire and release (and the future break) holds an exclusive flock on
+// this one inode while it inspects or mutates the owner directory.
+function guardFile(config, suffix) {
+  return `${lockDir(config, suffix)}.guard`;
+}
+
+// Shell prelude that creates the guard (mode 600) and takes its exclusive flock
+// on fd 9 for the rest of the script (the lock drops when the shell exits).
+// flock(1) is util-linux, so stock macOS lacks it: apps that did not opt in keep
+// working unguarded there (exactly the pre-guard behaviour); an opted-in app
+// refuses (exit 2), because its safety rests on the guard.
+function guardPrelude(config, suffix) {
+  const guard = guardFile(config, suffix);
+  const missing = lockRequiresOwnership(config)
+    ? 'echo "deploy-kit: flock(1) is required for onHost.required apps" >&2; exit 2'
+    : ':';
+  return [
+    `( umask 077; : >> "${guard}" ) 2>/dev/null || exit 2`,
+    `exec 9>> "${guard}" || exit 2`,
+    `if command -v flock >/dev/null 2>&1; then flock -x 9 || exit 2; else ${missing}; fi`,
+  ].join('\n');
+}
+
+const SAFE_TOKEN = /^[A-Za-z0-9_.:-]*$/;
+const OWNER_KINDS = ['unit', 'session', 'legacy'];
+
+function ownerFields({ kind = 'legacy', runId = '', purpose = '' } = {}) {
+  if (!OWNER_KINDS.includes(kind)) throw new Error(`deploy-kit: invalid lock owner kind "${kind}"`);
+  for (const [name, value] of [['runId', runId], ['purpose', purpose]]) {
+    if (!SAFE_TOKEN.test(value)) throw new Error(`deploy-kit: lock owner ${name} must match ${SAFE_TOKEN}`);
+  }
+  return { kind, runId, purpose };
+}
+
+// Shell fragment that writes the lock's files: the legacy pid/ts/nonce plus the
+// owner record. Must run inside the guard, right after the successful mkdir, so
+// the record is atomic with acquisition. Fields that do not apply (no /proc on
+// macOS, no systemd unit) are JSON null. Every interpolated value is a
+// sanitized token, so the JSON needs no escaping.
+function ownerWriter(dir, { kind, runId, purpose }) {
+  return [
+    'js() { if [ -n "$1" ]; then printf \'"%s"\' "$1"; else printf null; fi; }',
+    'jn() { case "$1" in ""|*[!0-9]*) printf null ;; *) printf "%s" "$1" ;; esac; }',
+    // Nonce generated ON THE TARGET, not in Node: /dev/urandom (falling back to
+    // pid+timestamp), POSIX-portable (no bashisms, no $RANDOM).
+    'nonce=$(head -c16 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d " \\n"); '
+      + '[ -n "$nonce" ] || nonce="$$-$(date +%s)"',
+    `echo $$ > "${dir}/pid" 2>/dev/null; date +%s > "${dir}/ts" 2>/dev/null; echo "$nonce" > "${dir}/nonce" 2>/dev/null`,
+    'boot=$(tr -cd "a-f0-9-" < /proc/sys/kernel/random/boot_id 2>/dev/null)',
+    'st=$(sed "s/^.*) //" /proc/$$/stat 2>/dev/null)',
+    'pstart=$(echo "$st" | cut -d" " -f20); sid=$(echo "$st" | cut -d" " -f4)',
+    'inv=$(printf "%s" "${INVOCATION_ID:-}" | tr -cd "a-f0-9")',
+    `unit=; kind='${kind}'`,
+    'if [ -n "$inv" ]; then kind=unit; '
+      + 'unit=$(sed -n "s|.*/\\([^/]*\\.service\\)\\$|\\1|p" /proc/self/cgroup 2>/dev/null | tail -1 | tr -cd "A-Za-z0-9_.@:-"); fi',
+    `{ printf '{"kind":'; js "$kind"; printf ',"uid":'; jn "$(id -u)"; `
+      + `printf ',"user":'; js "$(id -un | tr -cd "A-Za-z0-9_.-")"; `
+      + `printf ',"bootId":'; js "$boot"; printf ',"unit":'; js "$unit"; `
+      + `printf ',"invocationId":'; js "$inv"; printf ',"pid":'; jn "$$"; `
+      + `printf ',"pstart":'; jn "$pstart"; printf ',"sid":'; jn "$sid"; `
+      + `printf ',"runId":'; js '${runId}'; printf ',"nonce":'; js "$nonce"; `
+      + `printf ',"purpose":'; js '${purpose}'; printf '}\\n'; } > "${dir}/owner.tmp" 2>/dev/null `
+      + `&& mv "${dir}/owner.tmp" "${dir}/owner"`,
+  ].join('\n');
+}
+
+// Take the target lock (atomic mkdir under the guard flock), recording an owner
+// record (see ownerWriter) plus the legacy pid/ts/nonce files inside it.
+// Staleness for apps that did not opt in is judged PURELY by the TTL clock
+// (recorded ts vs now) -- never by the recorded pid: that pid is the ephemeral
+// remote shell's own $$, which exits moments after writing it. The nonce is what
+// lets release() below tell "a lock I still hold" from "a lock TTL-reclaimed out
 // from under me while I was still running" -- see release() for why that
-// matters. Returns a release fn. --steal-lock forces past a held lock;
+// matters. Returns a release fn. --steal-lock forces past a held lock (refused
+// for onHost.required apps, which never lose a lock to anything but a break);
 // config.lock:false disables locking entirely.
-function acquireLock(config, ctx, { steal = false, suffix } = {}) {
+function acquireLock(config, ctx, {
+  steal = false, suffix, kind, runId, purpose,
+} = {}) {
   const noop = () => {};
   if (config.lock === false) return noop;
   const dir = lockDir(config, suffix);
   const ttl = lockTtlSeconds(config);
   const stateDir = ensureStateDir(config);
-  // Generate the nonce ON THE TARGET, not in Node: /dev/urandom (falling back to
-  // pid+timestamp if it's somehow unavailable) so it's a real per-acquire random
-  // value in production, POSIX-portable (no bashisms, no $RANDOM).
-  const genNonce = 'nonce=$(head -c16 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d " \\n"); '
-    + '[ -n "$nonce" ] || nonce="$$-$(date +%s)"';
-  const writeOwner = `${genNonce}; echo $$ > "${dir}/pid" 2>/dev/null; date +%s > "${dir}/ts" 2>/dev/null; `
-    + `echo "$nonce" > "${dir}/nonce" 2>/dev/null`;
+  const owned = lockRequiresOwnership(config);
+  const prelude = guardPrelude(config, suffix);
+  const writeOwner = ownerWriter(dir, ownerFields({ kind, runId, purpose }));
+
+  if (steal && owned) {
+    throw new Error(
+      `--steal-lock is refused for onHost.required apps (${dir}): a held lock is only ever removed by `
+      + '`deploy-kit lock break`, which proves the owner is gone. Inspect it with `deploy-kit lock inspect --json`.',
+    );
+  }
 
   // Dispose of a stale/held lock dir via RENAME, not `rm -rf`: `mv` of a
   // directory to a fresh, unique (pid-suffixed) name is a single rename(2), so
@@ -150,8 +232,8 @@ function acquireLock(config, ctx, { steal = false, suffix } = {}) {
     // both "succeed" silently: whichever loses the mkdir gets the normal
     // held-lock error instead of believing it owns a lock the other racer
     // just recreated.
-    const script = `${stateDir}\n${disposeStale}\n`
-      + `if mkdir -m 700 "${dir}" 2>/dev/null; then ${writeOwner}; else exit 1; fi`;
+    const script = `${stateDir}\n${prelude}\n${disposeStale}\n`
+      + `if mkdir -m 700 "${dir}" 2>/dev/null; then\n${writeOwner}\nelse exit 1; fi`;
     const res = runOnTarget(script, config, { runtime: ctx.runtime });
     if (!res.ok) {
       if (isConfirmedScriptExit1(res)) {
@@ -162,30 +244,42 @@ function acquireLock(config, ctx, { steal = false, suffix } = {}) {
       throw new Error(lockCheckFailedMessage(res, dir, 'takeover'));
     }
   } else {
+    // Apps that opted in report the owner and refuse; everyone else may take a
+    // lock over once it is older than the TTL (the backward-compatible default).
+    const heldBranch = owned
+      ? [
+        `echo "deploy-kit: refused lock-held at ${dir}"`,
+        `echo "owner: $(cat "${dir}/owner" 2>/dev/null || echo 'null (no owner record)')"`,
+      ]
+      : [
+        `ts=$(cat "${dir}/ts" 2>/dev/null || echo 0)`,
+        'case "$ts" in ""|*[!0-9]*) ts=0 ;; esac',
+        'now=$(date +%s)',
+        'age=$((now - ts))',
+        `if [ "$age" -gt ${ttl} ]; then`,
+        `  pid=$(cat "${dir}/pid" 2>/dev/null || echo '?')`,
+        `  echo "deploy-kit: stale lock at ${dir} -- age $age seconds exceeds the ${ttl}s TTL (pid $pid) -- taking it over"`,
+        `  ${disposeStale}`,
+        `  if mkdir -m 700 "${dir}" 2>/dev/null; then`,
+        writeOwner,
+        '    exit 0',
+        '  fi',
+        'fi',
+      ];
     const script = [
       stateDir,
+      prelude,
       `if mkdir -m 700 "${dir}" 2>/dev/null; then`,
-      `  ${writeOwner}`,
+      writeOwner,
       '  exit 0',
       'fi',
-      `ts=$(cat "${dir}/ts" 2>/dev/null || echo 0)`,
-      'case "$ts" in ""|*[!0-9]*) ts=0 ;; esac',
-      'now=$(date +%s)',
-      'age=$((now - ts))',
-      `if [ "$age" -gt ${ttl} ]; then`,
-      `  pid=$(cat "${dir}/pid" 2>/dev/null || echo '?')`,
-      `  echo "deploy-kit: stale lock at ${dir} -- age $age seconds exceeds the ${ttl}s TTL (pid $pid) -- taking it over"`,
-      `  ${disposeStale}`,
-      `  if mkdir -m 700 "${dir}" 2>/dev/null; then`,
-      `    ${writeOwner}`,
-      '    exit 0',
-      '  fi',
-      'fi',
+      ...heldBranch,
       'exit 1',
     ].join('\n');
-    const res = runOnTarget(script, config, { runtime: ctx.runtime });
+    const res = runOnTarget(script, config, { runtime: ctx.runtime, capture: owned });
     if (!res.ok) {
       if (isConfirmedScriptExit1(res)) {
+        if (owned) throw new Error(`refused lock-held: ${(res.output || '').trim()}`);
         throw new Error(
           `Another deploy holds the lock (${dir}). Wait for it to finish, or pass --steal-lock.`,
         );
@@ -199,18 +293,75 @@ function acquireLock(config, ctx, { steal = false, suffix } = {}) {
   const nonce = (nonceRes.output || '').trim();
 
   // Only remove the lock dir if its nonce still matches the one we wrote at
-  // acquire time. Without this check, an unconditional `rm -rf "$dir"` here
-  // deletes whatever currently sits at that path -- including another run's
-  // lock: a slow-but-still-alive run A that exceeds the TTL gets reclaimed by
-  // run B, but A's eventual release() would delete B's (not A's) lock,
-  // letting a third run C start while B still believes it holds the lock.
+  // acquire time, and only while holding the guard. Without the nonce check, an
+  // unconditional `rm -rf "$dir"` here deletes whatever currently sits at that
+  // path -- including another run's lock: a slow-but-still-alive run A that
+  // exceeds the TTL gets reclaimed by run B, but A's eventual release() would
+  // delete B's (not A's) lock, letting a third run C start while B still
+  // believes it holds the lock.
   return () => runOnTarget(
-    `[ "$(cat "${dir}/nonce" 2>/dev/null)" = "${nonce}" ] && rm -rf "${dir}" 2>/dev/null || true`,
+    `${prelude}\n[ "$(cat "${dir}/nonce" 2>/dev/null)" = "${nonce}" ] && rm -rf "${dir}" 2>/dev/null || true`,
     config,
     { runtime: ctx.runtime },
   );
 }
 
+// Read-only view of the app lock for `deploy-kit lock inspect --json`: owner
+// record, age, and guard state. Mutates nothing -- it never creates the guard
+// (a missing one is reported as absent) and only probes it with a non-blocking
+// shared flock on a read-only descriptor.
+function inspectLock(config, ctx, { suffix } = {}) {
+  const dir = lockDir(config, suffix);
+  const guard = guardFile(config, suffix);
+  const script = [
+    `echo "lockDir=${dir}"`,
+    `echo "guard=${guard}"`,
+    `if [ -e "${guard}" ]; then`,
+    '  echo "guardPresent=yes"',
+    `  echo "guardInode=$(stat -c %i "${guard}" 2>/dev/null || stat -f %i "${guard}" 2>/dev/null)"`,
+    '  if command -v flock >/dev/null 2>&1; then',
+    `    if ( flock -n -s 8 ) 8< "${guard}" 2>/dev/null; then echo "guardHeld=no"; else echo "guardHeld=yes"; fi`,
+    '  else echo "guardHeld=unknown"; fi',
+    'else echo "guardPresent=no"; fi',
+    `if [ -d "${dir}" ]; then`,
+    '  echo "lockPresent=yes"',
+    `  echo "ts=$(cat "${dir}/ts" 2>/dev/null)"`,
+    '  echo "now=$(date +%s)"',
+    `  echo "owner=$(cat "${dir}/owner" 2>/dev/null)"`,
+    'else echo "lockPresent=no"; fi',
+  ].join('\n');
+  const res = runOnTarget(script, config, { capture: true, runtime: ctx.runtime, readOnly: true });
+  if (!res.ok) throw new Error(lockCheckFailedMessage(res, dir, 'inspect'));
+  const kv = {};
+  for (const line of res.output.split('\n')) {
+    const i = line.indexOf('=');
+    if (i > 0) kv[line.slice(0, i)] = line.slice(i + 1);
+  }
+  let owner = null;
+  let ownerError = null;
+  if (kv.owner) {
+    try { owner = JSON.parse(kv.owner); } catch (error) { ownerError = error.message; }
+  }
+  const held = kv.lockPresent === 'yes';
+  const ts = Number(kv.ts);
+  const heldState = { yes: true, no: false };
+  return {
+    lockDir: kv.lockDir,
+    held,
+    owner,
+    ownerError,
+    ageSeconds: held && ts > 0 ? Number(kv.now) - ts : null,
+    guard: {
+      path: kv.guard,
+      present: kv.guardPresent === 'yes',
+      inode: kv.guardInode ? Number(kv.guardInode) : null,
+      held: heldState[kv.guardHeld] ?? null,
+    },
+    requiresOwnership: lockRequiresOwnership(config),
+  };
+}
+
 module.exports = {
   lockId, lockDir, prevShaFile, legacyPrevShaFile, lockTtlSeconds, ensureStateDir, acquireLock,
+  inspectLock, guardFile, lockRequiresOwnership,
 };

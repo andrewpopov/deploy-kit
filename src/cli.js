@@ -168,6 +168,8 @@ Commands:
                                             deploy-kit.guards.json (default)
   verify-no-secrets [--dir <path>]         fail when a configured secret-shaped
     [--guard-config <path>] [--json]       filename is tracked or unignored
+  lock inspect [--json]                    print the app lock's owner record and guard
+                                            state (read-only; never mutates)
   clear-pending-release [--dir <path>]     discard the crash-recovery pointer
     [--json]                               auto-cut writes to
                                             .deploy-kit/pending-release.json, so the
@@ -411,6 +413,24 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
       return 1;
     }
     return require('./on-host/attach').attachRun(rest[0], attachConfig);
+  }
+
+  // lock takes a positional subcommand, so it is dispatched before parseOptions
+  // like attach. Only `inspect` exists (read-only); breaking a lock is a later slice.
+  if (command === 'lock') {
+    const rest = argv.slice(1);
+    if (rest[0] !== 'inspect' || rest.slice(1).some((a) => a !== '--json')) {
+      log.error('Usage: deploy-kit lock inspect [--json]');
+      return 1;
+    }
+    try {
+      const report = require('./lock').inspectLock(loadConfig({ cwd }), {});
+      console.log(JSON.stringify(report, null, 2));
+      return 0;
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
   }
 
   const options = parseOptions(argv.slice(1));
