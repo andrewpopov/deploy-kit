@@ -977,6 +977,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     }
     steps.push('shared');
 
+    const executeCandidate = () => {
     // ---- Phase: install (inside the candidate; current still serving) ----
     st.phase = 'install';
     if (skipDeps) {
@@ -1199,6 +1200,8 @@ function deployRelease(config, options = {}, ctx = {}) {
       branch, mode: config.mode, host: config.host, sha: st.sha, release: releaseId, steps, healthy: true,
       ...(deliveryEvent ? { deliveryEvent } : {}),
     };
+    };
+    return executeCandidate();
   } catch (err) {
     if (recoveringInterrupted) throw err;
     recover(err);
