@@ -36,6 +36,7 @@ const git = (home: string, cwd: string, ...args: string[]) => realExecFileSync('
 interface Fixture {
   home: string; root: string; config: any; commands: string[]; lockSeen: string[]; health: { code: string };
   runtime: any; deps: (over?: any) => any; sha: string;
+  pm2: { cwd: string | null; files: string[]; forceCwd: string | null };
 }
 
 function fixture(configOver: any = {}): Fixture {
@@ -51,6 +52,7 @@ function fixture(configOver: any = {}): Fixture {
   writeFileSync(join(root, 'src', 'index.js'), 'console.log(1)\n');
   writeFileSync(join(root, '.gitignore'), 'node_modules\n');
   writeFileSync(join(root, 'ecosystem.config.cjs'), `module.exports = { apps: [{ name: 'app', cwd: '${root}/current' }] };\n`);
+  writeFileSync(join(root, 'ecosystem.legacy.config.cjs'), `module.exports = { apps: [{ name: 'app', cwd: '${root}' }] };\n`);
   git(home, root, 'add', '-A');
   git(home, root, 'commit', '--quiet', '-m', 'init');
   git(home, root, 'push', '--quiet', 'origin', 'HEAD:refs/heads/master');
@@ -67,7 +69,7 @@ function fixture(configOver: any = {}): Fixture {
     projectDir: root,
     autoCut: false,
     ecosystemFile: 'ecosystem.config.cjs',
-    layout: { type: 'releases', sharedPaths: ['.env', 'data'] },
+    layout: { type: 'releases', sharedPaths: ['.env', 'data'], legacyEcosystemFile: 'ecosystem.legacy.config.cjs' },
     hostLock: { dir: join(home, 'hosts'), key: 'bigpi' },
     hooks: { install: 'true', build: 'true' },
     health: { attempts: 1, delaySeconds: 0 },
@@ -77,6 +79,9 @@ function fixture(configOver: any = {}): Fixture {
   const commands: string[] = [];
   const lockSeen: string[] = [];
   const health = { code: '200' };
+  // A pm2 that keeps the cwd a process was first started with (stop and startOrRestart do not move it); only
+  // `pm2 delete` followed by a start takes the cwd from the ecosystem file given.
+  const pm2 = { cwd: null as string | null, files: [] as string[], forceCwd: null as string | null };
   const lockOwners = () => [
     join(home, '.deploy-kit', `deploy-kit-${lock.lockId(config)}.lock`, 'owner'),
     join(home, 'hosts', 'bigpi.lock', 'owner'),
@@ -85,7 +90,17 @@ function fixture(configOver: any = {}): Fixture {
     execFileSync: (file: string, args: string[], opts: any = {}) => {
       const cmd = args[args.length - 1];
       commands.push(cmd);
+      if (cmd.includes('pm2 jlist')) {
+        const cwd = pm2.forceCwd || pm2.cwd;
+        return JSON.stringify(cwd ? [{ name: 'app', pid: 4242, pm_cwd: cwd, pm2_env: { status: 'online', pm_cwd: cwd } }] : []);
+      }
       if (/pm2 (startOrRestart|stop)/.test(cmd)) {
+        if (cmd.includes('pm2 delete')) pm2.cwd = null;
+        const file = /startOrRestart '?([^' ]+)'?/.exec(cmd);
+        if (file) {
+          pm2.files.push(file[1]);
+          if (pm2.cwd === null) pm2.cwd = /cwd: '([^']+)'/.exec(readFileSync(file[1], 'utf8'))![1];
+        }
         lockSeen.push(lockOwners().every((f) => existsSync(f)) ? 'both' : 'missing');
         return '';
       }
@@ -96,7 +111,7 @@ function fixture(configOver: any = {}): Fixture {
   const silent = { header() {}, info() {}, step() {}, success() {}, warning() {}, error() {}, divider() {} };
   const deps = (over: any = {}) => ({ runtime, sleep: () => {}, log: silent, env: {}, ...over });
   return {
-    home, root, config, commands, lockSeen, health, runtime, deps, sha: git(home, root, 'rev-parse', 'HEAD'),
+    home, root, config, commands, lockSeen, health, runtime, deps, sha: git(home, root, 'rev-parse', 'HEAD'), pm2,
   };
 }
 
@@ -186,6 +201,11 @@ describeOnPosix('layout migrate: forward', () => {
     ['the ecosystem file does not use current', 'ecosystem-cwd-current', (f) => {
       writeFileSync(join(f.root, 'ecosystem.config.cjs'), "module.exports = { apps: [{ cwd: '/elsewhere' }] };\n");
       git(f.home, f.root, 'commit', '--quiet', '-am', 'eco');
+    }],
+    ['no legacy restart config is set', 'legacy-ecosystem-config', () => {}, { layout: { type: 'releases', sharedPaths: ['.env', 'data'] } }],
+    ['the legacy restart config points at current', 'legacy-ecosystem-cwd-root', (f) => {
+      writeFileSync(join(f.root, 'ecosystem.legacy.config.cjs'), `module.exports = { apps: [{ name: 'app', cwd: '${f.root}/current' }] };\n`);
+      git(f.home, f.root, 'commit', '--quiet', '-am', 'legacy eco');
     }],
     ['there is no host lock configured', 'both-locks', () => {}, { hostLock: null }],
     ['the layout block is absent', 'layout-config', () => {}, { layout: null }],
@@ -279,7 +299,62 @@ describeOnPosix('layout migrate: reverse', () => {
     expect(existsSync(join(f.root, 'layout-migrate.journal.json'))).toBe(false);
     expect(readFileSync(join(f.root, 'data', 'db.sqlite'), 'utf8')).toBe('rows');
     expect(f.lockSeen).toEqual(['both', 'both']); // stop and restart both ran under the locks
-    expect(f.commands.find((c) => /pm2 startOrRestart/.test(c))).toContain(`${f.root}/ecosystem.config.cjs`);
+    expect(f.commands.find((c) => /pm2 startOrRestart/.test(c))).toContain(`${f.root}/ecosystem.legacy.config.cjs`);
+    // The app ends up running from the legacy root, not from the removed current.
+    expect(f.pm2.cwd).toBe(f.root);
+    expect(f.pm2.files).toEqual([`${f.root}/ecosystem.config.cjs`, `${f.root}/ecosystem.legacy.config.cjs`]);
+  });
+
+  it('refuses a reverse whose restart config points at current BEFORE stopping anything', () => {
+    const f = fixture();
+    migrateLayout(f.config, { to: 'releases' }, f.deps());
+    writeFileSync(join(f.root, '.legacy-checkout', 'ecosystem.legacy.config.cjs'), `module.exports = { apps: [{ name: 'app', cwd: '${f.root}/current' }] };\n`);
+    const before = snapshot(f.root);
+    f.commands.length = 0;
+    const { exitCode, result } = migrateLayout(f.config, { to: 'legacy' }, f.deps());
+    expect(exitCode).toBe(3);
+    expect(preconditionFailed(result, 'legacy-ecosystem-cwd-root')).toBe(true);
+    expect(f.commands.some((c) => /pm2 /.test(c))).toBe(false);
+    expect(snapshot(f.root)).toEqual(before);
+    expect(f.pm2.cwd).toBe(`${f.root}/current`);
+  });
+
+  it('refuses a reverse when the migration record names no legacy restart config', () => {
+    const f = fixture();
+    migrateLayout(f.config, { to: 'releases' }, f.deps());
+    const markerFile = join(f.root, '.deploy-kit-layout');
+    const marker = JSON.parse(readFileSync(markerFile, 'utf8'));
+    delete marker.migration.legacyEcosystemFile;
+    writeFileSync(markerFile, JSON.stringify(marker));
+    f.commands.length = 0;
+    const { exitCode, result } = migrateLayout(f.config, { to: 'legacy' }, f.deps());
+    expect(exitCode).toBe(3);
+    expect(preconditionFailed(result, 'legacy-ecosystem-cwd-root')).toBe(true);
+    expect(f.commands.some((c) => /pm2 /.test(c))).toBe(false);
+  });
+
+  it('fails verification when the restarted process does not run from the legacy root', () => {
+    const f = fixture();
+    migrateLayout(f.config, { to: 'releases' }, f.deps());
+    f.pm2.forceCwd = `${f.root}/current`;
+    const { exitCode, result } = migrateLayout(f.config, { to: 'legacy' }, f.deps());
+    expect(exitCode).toBe(2);
+    expect(result.verified).toBe(false);
+    expect(result.failed).toMatch(/PM2 process app cwd is .*\/current, expected/);
+  });
+
+  it('fails verification when the running sha is not the forward-time sha', () => {
+    const f = fixture({ layout: { type: 'releases', sharedPaths: ['.env', 'data'], legacyEcosystemFile: 'ecosystem.legacy.config.cjs', runningShaCommand: 'echo 0123456789abcdef' } });
+    migrateLayout(f.config, { to: 'releases' }, f.deps());
+    const { exitCode, result } = migrateLayout(f.config, { to: 'legacy' }, f.deps());
+    expect(exitCode).toBe(2);
+    expect(result.failed).toMatch(/running sha is 0123456789abcdef/);
+  });
+
+  it('passes the running-sha check when the app reports the forward-time sha', () => {
+    const f = fixture({ layout: { type: 'releases', sharedPaths: ['.env', 'data'], legacyEcosystemFile: 'ecosystem.legacy.config.cjs', runningShaCommand: 'git rev-parse HEAD' } });
+    migrateLayout(f.config, { to: 'releases' }, f.deps());
+    expect(migrateLayout(f.config, { to: 'legacy' }, f.deps()).exitCode).toBe(0);
   });
 
   it('keeps data written after the forward migration (it never restores an old snapshot)', () => {

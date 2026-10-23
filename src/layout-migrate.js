@@ -24,6 +24,7 @@ const {
   LAYOUT_VERSION, releasePaths, waitForHealth, pm2Activate,
 } = require('./release');
 const { gitInfo } = require('./remote');
+const { parsePm2List } = require('./pm2-state');
 
 const EXIT_OK = 0;
 const EXIT_FAILED = 2;
@@ -96,8 +97,31 @@ function configChecks(config, paths, list) {
     'D9 mutations need the host lock and the app lock: configure hostLock and leave lock on');
   list.add('ecosystem-file', typeof config.ecosystemFile === 'string' && SAFE_ECOSYSTEM_RE.test(config.ecosystemFile),
     String(config.ecosystemFile));
+  const legacyEco = config.layout && config.layout.legacyEcosystemFile;
+  list.add('legacy-ecosystem-config',
+    typeof legacyEco === 'string' && SAFE_ECOSYSTEM_RE.test(legacyEco) && legacyEco !== config.ecosystemFile,
+    'config.layout.legacyEcosystemFile must name a checkout-relative ecosystem file, other than ecosystemFile, whose cwd is the project root');
   const rels = config.layout && config.layout.sharedPaths;
   list.add('shared-paths-config', Array.isArray(rels), 'config.layout.sharedPaths must be an array');
+}
+
+// The restart configuration a reverse will use must start the app in the legacy checkout (the project root), so a
+// reverse can never restart it from `current`, which the reverse removes. `file` is where it is read now and
+// `finalFile` where a relative cwd will resolve from once restored. '' means valid, else the reason.
+const LEGACY_CWD_CHECK = [
+  "const path=require('path');const [file,finalFile,root,...names]=process.argv.slice(1);",
+  "let apps;try{apps=require(file).apps||[]}catch(e){console.log('unreadable: '+e.message);process.exit(0)}",
+  'const bad=[];for(const n of names){const a=apps.find((x)=>x.name===n);',
+  "if(!a){bad.push(n+' is not defined');continue}",
+  "const cwd=path.resolve(path.dirname(finalFile),a.cwd||'.');if(cwd!==root)bad.push(n+' cwd is '+cwd)}",
+  "console.log(bad.length?bad.join('; '):'ok')",
+].join('');
+
+function legacyEcosystemProblem(run, config, paths, file, finalFile) {
+  const q = shQuote;
+  if (run.read(`[ -f ${q(file)} ] && echo ok`).out !== 'ok') return `${file} does not exist`;
+  const out = run.read(`node -e ${q(LEGACY_CWD_CHECK)} ${[file, finalFile, paths.root, ...config.appNames].map(q).join(' ')}`).out;
+  return out === 'ok' ? '' : `${out || 'could not be evaluated'} (expected cwd ${paths.root})`;
 }
 
 function readJournal(run, paths) {
@@ -163,6 +187,11 @@ function forwardChecks(config, paths, run) {
   const ecoOk = run.read(`[ -f ${q(eco)} ] && grep -qF ${q(`${paths.root}/current`)} ${q(eco)} && echo ok`).out === 'ok';
   list.add('ecosystem-cwd-current', ecoOk, `${eco} must exist and name ${paths.root}/current`);
 
+  const legacyEco = config.layout.legacyEcosystemFile;
+  const legacyProblem = legacyEcosystemProblem(run, config, paths, `${paths.root}/${legacyEco}`, `${paths.root}/${legacyEco}`);
+  list.add('legacy-ecosystem-cwd-root', legacyProblem === '', `${legacyEco}: ${legacyProblem}`);
+  facts.legacyEcosystemFile = legacyEco;
+
   const reserved = reservedEntries(paths);
   facts.entries = run.read('ls -A').out.split('\n').filter((e) => e && !reserved.has(e));
   const badEntry = facts.entries.find((e) => !SAFE_ENTRY_RE.test(e));
@@ -205,6 +234,14 @@ function reverseChecks(config, paths, run) {
   list.add('legacy-checkout-at-sha', legacySha === migration.sha, `${LEGACY_DIR} HEAD ${legacySha || '<none>'}`);
   const entries = run.read(`ls -A ${q(legacy)}`).out.split('\n').filter(Boolean);
   facts.entries = entries;
+  const legacyEco = migration.legacyEcosystemFile;
+  const legacyProblem = SAFE_ECOSYSTEM_RE.test(String(legacyEco))
+    ? legacyEcosystemProblem(run, config, paths, `${legacy}/${legacyEco}`, `${paths.root}/${legacyEco}`)
+    : 'the migration record names no legacy ecosystem file';
+  list.add('legacy-ecosystem-cwd-root', legacyProblem === '', `${legacyEco || '<none>'}: ${legacyProblem}`);
+  if (legacyProblem) return { list, facts };
+  facts.legacyEcosystemFile = legacyEco;
+
   const eco = migration.ecosystemFile;
   const collisions = entries.filter((e) => e !== eco.split('/')[0] && run.read(`{ [ -e ${q(e)} ] || [ -L ${q(e)} ]; } && echo yes`).out === 'yes');
   list.add('no-entry-collisions', collisions.length === 0, collisions.join(', '));
@@ -239,7 +276,7 @@ function forwardPlan(config, paths, facts, releaseId) {
     layout: 'releases',
     version: LAYOUT_VERSION,
     migration: {
-      sha: facts.sha, releaseId, sharedPaths: rels, ecosystemFile: eco, at: new Date().toISOString(),
+      sha: facts.sha, releaseId, sharedPaths: rels, ecosystemFile: eco, legacyEcosystemFile: facts.legacyEcosystemFile, at: new Date().toISOString(),
     },
   };
   return {
@@ -339,8 +376,9 @@ function reversePlan(config, paths, facts) {
       },
       {
         name: 'restart',
-        commands: [config.hooks.restart || pm2Activate(config, paths)],
-        undo: ['(restart the app by hand)'],
+        // The stopped process keeps the cwd it was started with, so drop it and start from the legacy file.
+        commands: [`pm2 delete ${config.appNames.map(q).join(' ')} >/dev/null 2>&1 || true; pm2 startOrRestart ${q(`${paths.root}/${migration.legacyEcosystemFile}`)} --update-env`],
+        undo: ['(restart the app by hand from the legacy ecosystem file)'],
       },
     ],
   };
@@ -384,12 +422,32 @@ function verifyForward({ config, paths, run, ctx, facts, releaseId }) {
   return failures;
 }
 
+// The restored app must run from the legacy checkout (pm2's recorded cwd) at the forward-time sha.
+function runningLegacyFailures({ config, paths, run, facts }) {
+  const failures = [];
+  const list = parsePm2List(run.read('pm2 jlist').out);
+  const canonicalRoot = run.read(`cd ${shQuote(paths.root)} && pwd -P`).out;
+  config.appNames.forEach((name) => {
+    const proc = (list || []).find((p) => p && p.name === name);
+    const cwd = proc && (proc.pm_cwd || (proc.pm2_env && proc.pm2_env.pm_cwd));
+    if (!proc) failures.push(`PM2 process ${name} is not listed`);
+    else if (cwd !== paths.root && cwd !== canonicalRoot) failures.push(`PM2 process ${name} cwd is ${cwd || '<unknown>'}, expected ${paths.root}`);
+  });
+  const shaCommand = config.layout.runningShaCommand;
+  if (shaCommand) {
+    const running = run.read(shaCommand).out;
+    if (running.length < 12 || !facts.sha.startsWith(running)) failures.push(`running sha is ${running || '<none>'}, expected ${facts.sha}`);
+  }
+  return failures;
+}
+
 function verifyReverse({ config, paths, run, ctx, facts }) {
   const failures = [];
   const head = run.read('git rev-parse HEAD').out;
   if (head !== facts.sha) failures.push(`HEAD is ${head || '<none>'}, expected ${facts.sha}`);
   if (!gitInfo(config, { log: ctx.log, runtime: ctx.runtime })) failures.push('deploy-kit git could not read the checkout');
   if (!waitForHealth(config, ctx)) failures.push('health never returned 200');
+  failures.push(...runningLegacyFailures({ config, paths, run, facts }));
   Object.entries(facts.inodes).forEach(([rel, inode]) => {
     const now = run.read(inodeOf(`${paths.root}/${rel}`)).out;
     if (now !== inode) failures.push(`shared path ${rel} is inode ${now || '<none>'}, was ${inode} (moved data must keep its inode)`);

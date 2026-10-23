@@ -570,7 +570,7 @@ function validateMonitor(m, source) {
 
 // Keys allowed inside a `layout` block, with their validators. Absence of most is
 // fine (deploy normalizes defaults); `type` is the only required key.
-const LAYOUT_KEYS = ['type', 'keepReleases', 'sharedPaths', 'releaseChecks', 'runningShaCommand', 'effects', 'disruptiveGate'];
+const LAYOUT_KEYS = ['type', 'keepReleases', 'sharedPaths', 'releaseChecks', 'runningShaCommand', 'legacyEcosystemFile', 'effects', 'disruptiveGate'];
 
 // Names the on-host runner sets itself (or that would let a config redirect the
 // unit's identity or runtime); they can never be forwarded via `onHost.env`.
@@ -648,6 +648,12 @@ function validateLayout(layout, source) {
   }
   if (layout.runningShaCommand != null && typeof layout.runningShaCommand !== 'string') {
     problems.push(`${source}: "layout.runningShaCommand" must be a string`);
+  }
+  if (layout.legacyEcosystemFile != null) {
+    const f = layout.legacyEcosystemFile;
+    if (typeof f !== 'string' || !/^[A-Za-z0-9_.-]+(\/[A-Za-z0-9_.-]+)*$/.test(f) || f.split('/').includes('..')) {
+      problems.push(`${source}: "layout.legacyEcosystemFile" must be a relative path of plain segments (no "..")`);
+    }
   }
   if (layout.effects != null) {
     if (typeof layout.effects !== 'object' || Array.isArray(layout.effects)) {

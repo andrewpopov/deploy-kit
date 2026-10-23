@@ -409,11 +409,14 @@ CAIRN-369).
 
 `deploy-kit layout migrate --to releases|legacy [--dry-run]` converts a host's `projectDir` between the legacy
 in-place checkout and the release layout, and back. It needs `hostLock` (both locks are taken), a `layout`
-block, and an `ecosystemFile` whose `cwd` is `<projectDir>/current`. It only renames: live shared data keeps
+block, an `ecosystemFile` whose `cwd` is `<projectDir>/current`, and `layout.legacyEcosystemFile`: a second,
+checkout-tracked ecosystem file (relative path) whose `cwd` for every app is `<projectDir>` itself, which the
+reverse restarts from, since `current` no longer exists then. It only renames: live shared data keeps
 its inode, and the original checkout is kept as `<projectDir>/.legacy-checkout`.
 
 Forward refuses unless there is no marker, the checkout is clean at a known sha (apart from `sharedPaths`),
-there is no deploy recovery journal or unresolved record, and every shared path exists, is untracked and is on
+there is no deploy recovery journal or unresolved record, the legacy ecosystem file exists with every app's `cwd` at
+the project root (the check evaluates the file with `node`, and the marker records it for the reverse), and every shared path exists, is untracked and is on
 the root's filesystem. Steps, each journaled in `layout-migrate.journal.json` before it runs: `worktree`
 (bare `repo.git` plus `releases/<id>` at the live sha), `shared` (move each shared path into `shared/`, leaving
 a symlink behind), `build` (the configured install/generate/build hooks in the new release), `pointers`
@@ -422,8 +425,11 @@ a symlink behind), `build` (the configured install/generate/build hooks in the n
 sha, health 200, shared inodes unchanged).
 
 Reverse restores the checkout, moves the shared data back (never an older snapshot), removes `current`,
-`previous` and the marker, restarts from the restored ecosystem file (or `hooks.restart`) and checks `HEAD`,
-`deploy-kit git` and health. It refuses with `layout-reverse-after-deploy` once `current` is not the release
+`previous` and the marker, deletes and restarts the pm2 apps from the restored legacy ecosystem file (`hooks.restart` is not used) and checks
+`HEAD`, `deploy-kit git`, health, that pm2's `pm_cwd` for each app is the project root and, when
+`layout.runningShaCommand` is set, that the app reports the forward-time sha. The legacy ecosystem file is
+validated before anything is stopped; a reverse that cannot restart in the legacy checkout refuses
+(`legacy-ecosystem-cwd-root`). It refuses with `layout-reverse-after-deploy` once `current` is not the release
 forward created (a deploy ran since: the database may have migrated). `repo.git`, `releases/` and `shared/` are
 left in place.
 
