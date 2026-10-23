@@ -247,7 +247,7 @@ function deployWith(pending: string) {
   };
   const cfg = mergeConfig(DEFAULT_CONFIG, {
     host: 'app@pi', projectDir: '/srv/app', appNames: ['app'], dbBoundApps: ['app'], branch: 'master', autoCut: false,
-    ecosystemFile: 'shared/ecosystem.config.cjs', health: { attempts: 2, delaySeconds: 0 },
+    ecosystemFile: 'shared/ecosystem.config.cjs', health: { attempts: 2, delaySeconds: 0 }, onHost: { required: true },
     hooks: {
       install: 'npm ci', build: 'npm run build', backup: 'run-backup', migrate: 'run-migrate', restore: 'run-restore',
       pendingMigrations: 'check-pending', migrationsExclusive: true,

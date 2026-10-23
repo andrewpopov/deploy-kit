@@ -3,7 +3,7 @@
 const path = require('path');
 const { execFileSync: nodeExecFileSync } = require('child_process');
 const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
-const { acquireLock, validateOwnedLocks } = require('./lock');
+const { acquireLock, validateOwnedLocks, lockRequiresOwnership } = require('./lock');
 const { log: defaultLog, logFailureOutput } = require('./log');
 const { backupIdFromOutput, isSafeBackupId, backupReferenceFromId } = require('./backup-reference');
 const { resolveBranch } = require('./branch');
@@ -1561,7 +1561,8 @@ function deployRelease(config, options = {}, ctx = {}) {
       activateSymlink(config, paths, st.prevTarget, c, { link: paths.previousLink });
     }
     stepStart('current-pointer');
-    writeReleaseRecord(config, st, c);
+    // Only apps on the on-host protocol roll back through accept.js; every other app's command stream stays byte-identical.
+    if (lockRequiresOwnership(config)) writeReleaseRecord(config, st, c);
     activateSymlink(config, paths, `releases/${releaseId}`, c);
     st.flipped = true;
     steps.push('flip');
