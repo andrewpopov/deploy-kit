@@ -844,34 +844,7 @@ function deployRelease(config, options = {}, ctx = {}) {
   // No old phase journal may bypass authority; anything unsettled fails closed until the
   // recovery integration slice.
   function initializeTransitionAuthority() {
-    manager = (ctx.transitionManagerFactory || createTransitionOperationManager)(config, c);
-    const operations = manager.inspect().journal?.operations || [];
-    const op = operations[operations.length - 1];
-    if (op) {
-      if (['BEGIN_PENDING', 'COMPLETE_PENDING', 'ABANDON_PENDING'].includes(op.state)) {
-        manager.reconcilePending();
-        throw recoveryRequired('pending transition RPC reconciled; start a new invocation');
-      }
-      if (op.state === 'AUTHORIZED') {
-        manager.abandonSaved(op.operationId, 'UNKNOWN');
-        throw recoveryRequired('saved authorized operation abandoned UNKNOWN; start a new invocation');
-      }
-      if (op.state === 'MUTATING') {
-        throw recoveryRequired('saved MUTATING operation requires recovery assessment');
-      }
-    }
-    const file = shQuote(paths.stateFile);
-    const phaseRead = runOnTarget(`if [ -e ${file} ] || [ -L ${file} ]; then printf 'present\n'; cat ${file}; else printf 'absent\n'; fi`, { ...config, projectDir: paths.root }, { capture: true, runtime: c.runtime, readOnly: true });
-    if (!phaseRead.ok || typeof phaseRead.output !== 'string') throw recoveryRequired('deploy state journal could not be read under transition authority');
-    let saved = null;
-    if (phaseRead.output !== 'absent\n') {
-      if (!phaseRead.output.startsWith('present\n')) throw recoveryRequired('invalid deploy state journal read response');
-      try { saved = JSON.parse(phaseRead.output.slice('present\n'.length)); } catch { throw recoveryRequired('unreadable deploy state journal under transition authority'); }
-      if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw recoveryRequired('invalid deploy state journal under transition authority');
-    }
-    if (saved && !['done', 'recovered'].includes(saved.phase)) {
-      throw recoveryRequired(`previous deploy journal in phase "${saved.phase}" requires recovery under transition authority`);
-    }
+    manager = inspectTransitionAuthority(config, paths, c, ctx);
   }
 
   const release = acquireLock(config, c, { steal: stealLock });
@@ -1320,6 +1293,49 @@ function deployRelease(config, options = {}, ctx = {}) {
   }
 }
 
+// Protected mode: inspect the saved authority journal BEFORE any recovery or configured hook.
+// Shared by forward deploy and manual rollback; returns the manager once nothing is unsettled.
+function inspectTransitionAuthority(config, paths, c, ctx) {
+  if (typeof config.layout.runningShaCommand !== 'string' || !config.layout.runningShaCommand.trim()) throw recoveryRequired('transition authority requires a running SHA command for exact activation verification');
+  const manager = (ctx.transitionManagerFactory || createTransitionOperationManager)(config, c);
+  const operations = manager.inspect().journal?.operations || [];
+  const op = operations[operations.length - 1];
+  if (op) {
+    if (['BEGIN_PENDING', 'COMPLETE_PENDING', 'ABANDON_PENDING'].includes(op.state)) {
+      manager.reconcilePending();
+      throw recoveryRequired('pending transition RPC reconciled; start a new invocation');
+    }
+    if (op.state === 'AUTHORIZED') {
+      manager.abandonSaved(op.operationId, 'UNKNOWN');
+      throw recoveryRequired('saved authorized operation abandoned UNKNOWN; start a new invocation');
+    }
+    if (op.state === 'MUTATING') {
+      throw recoveryRequired('saved MUTATING operation requires recovery assessment');
+    }
+  }
+  const file = shQuote(paths.stateFile);
+  const phaseRead = runOnTarget(`if [ -e ${file} ] || [ -L ${file} ]; then printf 'present\n'; cat ${file}; else printf 'absent\n'; fi`, { ...config, projectDir: paths.root }, { capture: true, runtime: c.runtime, readOnly: true });
+  if (!phaseRead.ok || typeof phaseRead.output !== 'string') throw recoveryRequired('deploy state journal could not be read under transition authority');
+  let saved = null;
+  if (phaseRead.output !== 'absent\n') {
+    if (!phaseRead.output.startsWith('present\n')) throw recoveryRequired('invalid deploy state journal read response');
+    try { saved = JSON.parse(phaseRead.output.slice('present\n'.length)); } catch { throw recoveryRequired('unreadable deploy state journal under transition authority'); }
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw recoveryRequired('invalid deploy state journal under transition authority');
+  }
+  if (saved && !['done', 'recovered'].includes(saved.phase)) {
+    throw recoveryRequired(`previous deploy journal in phase "${saved.phase}" requires recovery under transition authority`);
+  }
+  return manager;
+}
+
+// Read-only: the ACTUAL full commit of a release worktree (never inferred from the directory name).
+function resolveReleaseSha(config, paths, target, label, c) {
+  assertSafeTarget(target, label);
+  const sha = capture(`${paths.root}/${target}`, 'git rev-parse HEAD', config, c, { readOnly: true });
+  if (!/^[0-9a-f]{40}$/.test(sha)) throw recoveryRequired(`${label} ${target} did not resolve to a full 40-hex commit SHA`);
+  return sha;
+}
+
 // Atomic symlink swap: create a uniquely-named temp symlink in the same directory,
 // then GNU `mv -T` renames it over the target (a single namespace op on ext4 —
 // readers see the old or new link, never a missing one). Relative target so the
@@ -1389,7 +1405,9 @@ function prune(config, paths, keepId, ctx) {
 // triggered it" error, or MANUAL RECOVERY when the restore itself can't be
 // confirmed (no safe originalCurrent to restore to, or the restored release
 // doesn't come back healthy either).
-function recoverFailedRollback(config, paths, originalCurrent, c, reason) {
+// With `restoredSha` (protected recovery child) a verified restore RETURNS the exact
+// observation instead of throwing, so the caller completes the authority first.
+function recoverFailedRollback(config, paths, originalCurrent, c, reason, restoredSha = null) {
   c.log.error(`${reason}; flipping back to ${originalCurrent}`);
   if (!(originalCurrent && RELEASE_TARGET_RE.test(originalCurrent))) {
     throw new Error(`MANUAL RECOVERY REQUIRED — ${reason} and no safe original release to restore.`);
@@ -1414,10 +1432,11 @@ function recoverFailedRollback(config, paths, originalCurrent, c, reason) {
     );
   }
   runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
-  const back = verifyActivation(config, paths, null, `${paths.root}/${originalCurrent}`, c);
+  const back = verifyActivation(config, paths, restoredSha, `${paths.root}/${originalCurrent}`, c);
   if (!back.ok) {
     throw new Error(`MANUAL RECOVERY REQUIRED — ${reason} AND the original release did not come back (${back.reason}).`);
   }
+  if (restoredSha) return { observedSha: restoredSha, verified: true };
   throw new Error(`Rollback aborted: ${reason}; restored the original release ${originalCurrent}.`);
 }
 
@@ -1454,47 +1473,121 @@ function rollbackRelease(config, options = {}, ctx = {}) {
   const release = acquireLock(config, c, { steal: options.stealLock === true });
   try {
     preflight(config, paths, c);
+    const fenced = config.transitionAuthority != null && c.runtime?.dryRun !== true;
+    const manager = fenced ? inspectTransitionAuthority(config, paths, c, ctx) : null;
     const pointers = readPointers(config, paths, c);
     if (!pointers.previous) throw new Error(`No previous release recorded (${paths.previousLink}); cannot roll back.`);
     assertSafeTarget(pointers.previous, 'previous');
     // Remember what current pointed at so a failed rollback can flip back to it
     // instead of leaving a broken `previous` release serving traffic.
     const originalCurrent = pointers.current;
+    if (fenced && originalCurrent) assertSafeTarget(originalCurrent, 'current');
+    const isRuntimeFailure = (err) => err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED';
+    const phaseJournal = (identity, fields) => persistState(config, paths, { ...identity, ...fields }, c);
 
-    log.step(`Flipping current back to ${pointers.previous}`);
-    activateSymlink(config, paths, pointers.previous, c);
-    // Pre-restart checks: gated, run IMMEDIATELY BEFORE the pm2 restart, same as
-    // the forward deploy — a rollback restart is just as capable of colliding
-    // with a squatting process as a forward one. `current` has ALREADY been
-    // flipped by this point, so a failing check here must not be allowed to
-    // throw straight out of this function (PKG-135 Finding 5) — that would
-    // leave `current` pointing at the rollback target while the original
-    // process (never restarted) is still what's actually running. Route the
-    // failure through the same post-flip recovery the unhealthy-verification
-    // path below uses.
-    for (const check of config.preRestartChecks) {
-      log.step(`Pre-restart check: ${check.name}`);
-      try {
-        runInDir(paths.root, check.command, config, c);
-      } catch (err) {
-        recoverFailedRollback(config, paths, originalCurrent, c, `Pre-restart check "${check.name}" failed during rollback (${err.message})`);
+    // Every flip/check/restart/save/verify effect; `targetSha` is the ACTUAL commit when
+    // fenced (failures then throw into the authority runtime, never unfenced recovery).
+    const executeRollback = (targetSha) => {
+      log.step(`Flipping current back to ${pointers.previous}`);
+      activateSymlink(config, paths, pointers.previous, c);
+      // Pre-restart checks: gated, run IMMEDIATELY BEFORE the pm2 restart, same as
+      // the forward deploy. `current` has ALREADY been flipped, so a failing check must
+      // not throw straight out (PKG-135 Finding 5) when unfenced.
+      for (const check of config.preRestartChecks) {
+        log.step(`Pre-restart check: ${check.name}`);
+        try {
+          runInDir(paths.root, check.command, config, c);
+        } catch (err) {
+          const reason = `Pre-restart check "${check.name}" failed during rollback (${err.message})`;
+          if (targetSha) throw new Error(reason);
+          recoverFailedRollback(config, paths, originalCurrent, c, reason);
+        }
       }
-    }
-    runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
-    runInDir(paths.root, 'pm2 save 2>/dev/null || true', config, c, { tolerate: true });
+      runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
+      runInDir(paths.root, 'pm2 save 2>/dev/null || true', config, c, { tolerate: true });
 
-    const v = verifyActivation(config, paths, null, `${paths.root}/${pointers.previous}`, c);
-    if (!v.ok) {
-      // The target release did not come up. Restore the release that WAS running.
-      recoverFailedRollback(config, paths, originalCurrent, c, `Rollback target ${pointers.previous} was unhealthy (${v.reason})`);
+      const v = verifyActivation(config, paths, targetSha, `${paths.root}/${pointers.previous}`, c);
+      if (!v.ok) {
+        const reason = `Rollback target ${pointers.previous} was unhealthy (${v.reason})`;
+        if (targetSha) throw new Error(reason);
+        recoverFailedRollback(config, paths, originalCurrent, c, reason);
+      }
+      return targetSha ? { observedSha: targetSha, verified: true } : null;
+    };
+    const finish = () => {
+      log.success(`Rolled back to ${pointers.previous}`);
+      if (config.hooks.backup) {
+        log.warning('Code rolled back to the previous release. If the failed deploy ran a migration, the previous '
+          + 'code may not run against the migrated schema — restore the pre-migration DB backup explicitly if needed.');
+      }
+      return { release: pointers.previous, mode: config.mode, host: config.host, healthy: true };
+    };
+
+    if (fenced) {
+      const previousSha = resolveReleaseSha(config, paths, pointers.previous, 'previous', c);
+      const begun = manager.begin({
+        kind: 'manual-rollback', targetSha: previousSha, targetRelease: pointers.previous, priorPointer: originalCurrent,
+        effects: { ...CONSERVATIVE_EFFECTS }, parentOperationId: null,
+      });
+      const identity = { operationId: begun.operationId, targetSha: previousSha };
+      let observation;
+      try {
+        observation = manager.run(begun.handle, () => {
+          phaseJournal(identity, { phase: 'manual-rollback', current: originalCurrent, previous: pointers.previous });
+          return executeRollback(previousSha);
+        });
+      } catch (err) {
+        if (!isRuntimeFailure(err)) throw err;
+        // Uncertainty ends only by an acknowledged UNKNOWN abandon; then a fresh child recovers.
+        try {
+          manager.abandon(begun.handle, 'UNKNOWN');
+        } catch (abandonErr) {
+          throw recoveryRequired('manual rollback failed and abandon was not acknowledged; recovery assessment required', abandonErr);
+        }
+        return recoverFencedRollback(err, begun.operationId);
+      }
+      manager.complete(begun.handle, observation);
+      phaseJournal(identity, { phase: 'done', current: pointers.previous, previous: originalCurrent, sha: previousSha });
+      return finish();
     }
 
-    log.success(`Rolled back to ${pointers.previous}`);
-    if (config.hooks.backup) {
-      log.warning('Code rolled back to the previous release. If the failed deploy ran a migration, the previous '
-        + 'code may not run against the migrated schema — restore the pre-migration DB backup explicitly if needed.');
+    executeRollback(null);
+    return finish();
+
+    // Failed protected rollback: fresh automatic-recovery child back to the original release.
+    function recoverFencedRollback(failure, failedOperationId) {
+      const reason = failure.cause?.message || failure.message;
+      let originalSha;
+      try {
+        originalSha = resolveReleaseSha(config, paths, originalCurrent, 'original current', c);
+      } catch (shaErr) {
+        throw recoveryRequired(`manual rollback failed (${reason}) and no safe original release could be resolved to restore`, shaErr);
+      }
+      const begun = manager.begin({
+        kind: 'automatic-recovery', targetSha: originalSha, targetRelease: originalCurrent, priorPointer: pointers.previous,
+        effects: { ...CONSERVATIVE_EFFECTS }, parentOperationId: failedOperationId,
+      });
+      const identity = { operationId: begun.operationId, targetSha: originalSha };
+      let observation;
+      try {
+        observation = manager.run(begun.handle, () => {
+          phaseJournal(identity, { phase: 'manual-rollback-recovery', current: originalCurrent, previous: pointers.previous });
+          return recoverFailedRollback(config, paths, originalCurrent, c, reason, originalSha);
+        });
+      } catch (err) {
+        if (!isRuntimeFailure(err)) throw err;
+        try {
+          manager.abandon(begun.handle, 'UNKNOWN');
+        } catch (abandonErr) {
+          throw recoveryRequired('manual rollback recovery failed and abandon was not acknowledged; recovery assessment required', abandonErr);
+        }
+        throw recoveryRequired('manual rollback recovery failed and was abandoned UNKNOWN; manual recovery required', err);
+      }
+      manager.complete(begun.handle, observation);
+      phaseJournal(identity, { phase: 'recovered', current: originalCurrent, previous: pointers.previous, sha: originalSha });
+      log.success(`Restored the original release ${originalCurrent}`);
+      throw new Error(`Rollback aborted: ${reason}; restored the original release ${originalCurrent}.`);
     }
-    return { release: pointers.previous, mode: config.mode, host: config.host, healthy: true };
   } finally {
     release();
   }
