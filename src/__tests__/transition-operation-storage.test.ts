@@ -160,7 +160,7 @@ describe('transition journal storage read', () => {
   });
 
   it('rejects empty, invalid JSON and invalid UTF-8 distinctly from absent', () => {
-    for (const bytes of [Buffer.alloc(0), Buffer.from('null'), Buffer.from('[]'), Buffer.from('1'), Buffer.from('{nope'), Buffer.from([0x7b, 0x22, 0xff, 0x22, 0x7d])]) {
+    for (const bytes of [Buffer.alloc(0), Buffer.from('null'), Buffer.from('[]'), Buffer.from('1'), Buffer.from('{nope'), Buffer.concat([Buffer.from('{"a":"'), Buffer.from([0xff]), Buffer.from('"}')])]) {
       expect(() => storageOver(makeFakeFs({ existing: bytes })).read()).toThrow(/journal storage failed/);
     }
   });

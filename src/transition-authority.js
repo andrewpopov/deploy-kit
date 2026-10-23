@@ -119,11 +119,17 @@ function parseAck(output, normalized, requestDigest) {
   return ack;
 }
 
-function sendTransitionAuthority(config, request, { runtime } = {}) {
+// Internal: the single normalization + canonical serialization + digest path.
+function prepareTransitionAuthorityRequest(config, request) {
   const settings = validateConfig(config);
   const normalized = normalizeRequest(request, settings.scope);
   const json = JSON.stringify(normalized);
   const requestDigest = crypto.createHash('sha256').update(json, 'utf8').digest('hex');
+  return { settings, normalized, json, requestDigest };
+}
+
+function sendTransitionAuthority(config, request, { runtime } = {}) {
+  const { settings, normalized, json, requestDigest } = prepareTransitionAuthorityRequest(config, request);
   if (runtime && runtime.dryRun) return { planned: true, requestDigest };
   const result = runOnTarget(settings.command, config, {
     capture: true, runtime, input: json, timeoutSeconds: settings.timeoutSeconds,
@@ -148,4 +154,7 @@ function assertTransitionAuthorityEntryPoint(config, { supported = false, option
   }
 }
 
-module.exports = { sendTransitionAuthority, assertTransitionAuthorityEntryPoint, TransitionAuthorityError };
+module.exports = {
+  sendTransitionAuthority, assertTransitionAuthorityEntryPoint, TransitionAuthorityError,
+  prepareTransitionAuthorityRequest, readExactData,
+};
