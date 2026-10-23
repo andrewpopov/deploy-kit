@@ -17,6 +17,9 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { acquireOwnedLocks, releaseOwnedLocks } = require('../lock');
 const { runOnTarget } = require('../exec');
+const {
+  NO_RECOVERY, deployed, failureFromError, pickDeployResult,
+} = require('../deploy-result');
 const { releasePaths } = require('../release');
 const {
   stateFiles, classifyHold, classifyEpoch, classifyJournal,
@@ -258,12 +261,13 @@ function accept({ files, runDir, runId, request, plan, liveBefore, deps, crashAt
   });
 }
 
-// The placeholder result shape until D4b's DeployResult: {status, error}, plus effectsClean: false when the
-// pipeline threw (nothing yet proves a thrown pipeline touched nothing live; D4d's ledger will). A pipeline
-// that returns an object with a string `status` is passed through as is.
-function normalizeResult(returned) {
-  if (returned !== null && typeof returned === 'object' && typeof returned.status === 'string') return { error: null, ...returned };
-  return { status: 'deployed', error: null };
+// The pipeline's DeployResult (src/deploy-result.js): the fields of what deployRelease returned, or the one
+// attached to what it threw. A pipeline that returns nothing usable is a plain success; a throw without a
+// result (a bug, or a failure before the pipeline's own try) is a bare `failed`.
+function resultOf(returned, thrown) {
+  if (thrown !== undefined) return thrown.deployResult || failureFromError({}, NO_RECOVERY, thrown);
+  if (returned !== null && typeof returned === 'object' && typeof returned.status === 'string') return pickDeployResult(returned);
+  return deployed({});
 }
 
 // Success, a verified clean abort and a verified recovery settle themselves; anything else may have changed production.
@@ -278,11 +282,10 @@ function execute({ files, runDir, runId, request, config, options, handle, deps,
   let result;
   try {
     const ctx = { ownedLocks: handle, recoverInterrupted: 'refuse', ...(deps.runtime ? { runtime: deps.runtime } : {}) };
-    result = normalizeResult(deps.deployRelease(config, options, ctx));
+    result = resultOf(deps.deployRelease(config, options, ctx));
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    deps.log.error(message);
-    result = { status: 'failed', error: message, effectsClean: false };
+    deps.log.error(error instanceof Error ? error.message : String(error));
+    result = resultOf(undefined, error);
   }
   crashAt('after-release-result');
   const finishedAt = deps.now().toISOString();
@@ -336,5 +339,5 @@ function runAccepted({ runDir, runId, request, config, options, deps }) {
 }
 
 module.exports = {
-  runAccepted, writeRefused, targetFiles, CrashSeam, Refusal, normalizeResult, needsResolution,
+  runAccepted, writeRefused, targetFiles, CrashSeam, Refusal, resultOf, needsResolution,
 };

@@ -10,6 +10,7 @@
 // Nothing here writes to the target; the remote command only tests, reads and runs `systemctl show`.
 
 const { runOnTarget, shQuote } = require('../exec');
+const { validateDeployResult } = require('../deploy-result');
 const { lockId } = require('../lock');
 const { RUN_ID_RE, isPlainObject, parseRecord } = require('./outcome');
 const {
@@ -35,7 +36,8 @@ function validateTerminal(record, runId) {
   if (!isPlainObject(record)) return 'not an object';
   if (record.runId !== runId) return `runId ${JSON.stringify(record.runId)} is not ${runId}`;
   if (!KINDS.has(record.kind)) return 'kind is not deploy, rollback or recover';
-  if (!isPlainObject(record.result)) return 'result is not an object';
+  const problem = validateDeployResult(record.result);
+  if (problem) return `result: ${problem}`;
   if (!isNonEmptyString(record.finishedAt)) return 'finishedAt is not a string';
   return null;
 }

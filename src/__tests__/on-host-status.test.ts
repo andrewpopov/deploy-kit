@@ -38,7 +38,7 @@ const put = (rel: string, content: unknown) => {
 };
 const putRun = (name: string, content: unknown = '') => put(`runs/${RUN_ID}/${name}`, content);
 const accepted = { runId: RUN_ID, acceptedAt: 'x' };
-const terminal = { runId: RUN_ID, kind: 'deploy', result: { status: 'deployed' }, effects: [], kitArtifact: {}, finishedAt: '2026-10-23T10:40:00Z' };
+const terminal = { runId: RUN_ID, kind: 'deploy', result: { status: 'deployed', stage: 'done', liveBefore: null, liveAfter: null, migrated: false, migrationsPending: null, backupId: null, effectsClean: null, recovery: { action: 'none', verified: false }, error: null }, effects: [], kitArtifact: {}, finishedAt: '2026-10-23T10:40:00Z' };
 const reservation = { requestId: REQUEST_ID, gen: 1, state: 'accepted', runId: RUN_ID, at: 'x', liveBefore: 'a'.repeat(40), prev: null };
 const status = (opts: Record<string, unknown> = {}) => onHostStatus(config, RUN_ID, { runtime, ...opts });
 

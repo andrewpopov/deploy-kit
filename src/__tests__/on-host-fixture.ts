@@ -29,6 +29,12 @@ export const KIT_ARTIFACT = { version: '0.33.0', sha256: 'd'.repeat(64) };
 
 export type Meta = Record<string, unknown>;
 
+// A well-formed DeployResult (src/deploy-result.js); a test overrides only the fields it is about.
+export const deployResult = (over: Meta = {}): Record<string, unknown> => ({
+  status: 'deployed', stage: 'done', liveBefore: null, liveAfter: null, migrated: false, migrationsPending: null, backupId: null,
+  effectsClean: null, recovery: { action: 'none', verified: false }, error: null, ...over,
+});
+
 export function requestMeta(over: Meta = {}): Meta {
   return {
     kind: 'deploy', requestId: REQUEST_ID, parentRequestId: null, parentRunId: null, epoch: 0, notAfter: NOW_SEC + 3600,
@@ -135,7 +141,7 @@ export function makeTarget() {
   );
   // A finished run's terminal record, written by hand for the reservation table.
   const putTerminal = (runId: string, result: Record<string, unknown>) => put(`runs/${runId}/terminal.json`, {
-    runId, kind: 'deploy', result, effects: null, kitArtifact: KIT_ARTIFACT, finishedAt: '2026-10-23T09:00:00Z',
+    runId, kind: 'deploy', result: deployResult(result), effects: null, kitArtifact: KIT_ARTIFACT, finishedAt: '2026-10-23T09:00:00Z',
   });
   const putReservation = (over: Record<string, unknown> = {}) => put(`requests/${REQUEST_ID}.json`, {
     requestId: REQUEST_ID, gen: 1, state: 'accepted', runId: runIdN(1), at: '2026-10-23T09:00:00Z', liveBefore: LIVE_SHA, prev: null, ...over,

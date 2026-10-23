@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createRequire } from 'module';
 import * as fs from 'fs';
 import {
-  makeTarget, requestMeta, runIdN, CrashSeam, NOW_SEC, REQUEST_ID, Target,
+  makeTarget, requestMeta, deployResult, runIdN, CrashSeam, NOW_SEC, REQUEST_ID, Target,
 } from './on-host-fixture';
 import { hasFlock } from './target-state-fixture';
 
@@ -166,7 +166,7 @@ describeWithFlock('reservation: a stale operator after a retry', () => {
 
 describeWithFlock('reservation: clean abort then a replacement run', () => {
   it('the aborted run keeps the reservation and leaves no unresolved record; the replacement takes gen 2; a third attempt is executed', () => {
-    expect(attempt(runIdN(1), none, { pipeline: () => ({ status: 'aborted-clean', effectsClean: true }) })).toBe(1);
+    expect(attempt(runIdN(1), none, { pipeline: () => deployResult({ status: 'aborted-clean', effectsClean: true }) })).toBe(1);
     expect(t.readJson(`runs/${runIdN(1)}/terminal.json`).result).toMatchObject({ status: 'aborted-clean', effectsClean: true });
     expect(t.readJson(reservationFile)).toMatchObject({ gen: 1, runId: runIdN(1) });
     expect(t.status(runIdN(1)).state).toBe('terminal');

@@ -25,6 +25,9 @@ const { createReleasePhaseStorage } = require('./transition-operation-storage');
 const CONSERVATIVE_EFFECTS = {
   stop: true, migrate: true, pointerSwap: true, restart: true, databaseRestore: true,
 };
+const {
+  NO_RECOVERY, shaOfTarget, deployed: deployedResult, failureFromError, attach,
+} = require('./deploy-result');
 const recoveryRequired = (message, cause) => new TransitionOperationError('RECOVERY_REQUIRED', message, cause);
 
 // Bump when the on-host layout changes shape. The host migration writes this
@@ -55,6 +58,8 @@ const MIN_FREE_KIB = 512 * 1024;
 const RELEASE_ID_BODY = '[0-9a-f]{7,40}-\\d{8}T\\d{6}Z';
 const RELEASE_ID_RE = new RegExp(`^${RELEASE_ID_BODY}$`);
 const RELEASE_TARGET_RE = new RegExp(`^releases\\/${RELEASE_ID_BODY}$`);
+// A failed rollback that flipped `current` back to the release it started from and saw it healthy.
+const RESTORED_ORIGINAL = { action: 'flip-back', verified: true };
 const IDENTICAL_CHECK_FAILURE_NOTE = 'check failed identically on both releases: likely the check or its environment, not the release';
 
 function defaultSleep(seconds) {
@@ -493,6 +498,20 @@ function deployRelease(config, options = {}, ctx = {}) {
   });
   const st = freshState();
   let recoveringInterrupted = false;
+  // What recover() is doing / did, read by the failure path to build the DeployResult.
+  let recoveryInfo = { ...NO_RECOVERY };
+  const resultFacts = (stage) => ({
+    stage,
+    liveBefore: shaOfTarget(st.prevTarget),
+    migrated: st.migrated,
+    migrationsPending: st.migrationsPending,
+    backupId: st.backupId,
+    liveAfter: (recovery) => {
+      if (!st.flipped || (recovery.verified && ['flip-back', 'restore+flip-back', 'resume-previous'].includes(recovery.action))) return shaOfTarget(st.prevTarget);
+      return ['remain-active', 'manual'].includes(recovery.action) ? shaOfTarget(`releases/${st.releaseId}`) : null;
+    },
+  });
+  const rollbackAction = () => (st.migrated ? 'restore+flip-back' : 'flip-back');
 
   // Informational audit field, written only once a probe has answered: a deploy
   // without `hooks.pendingMigrations` keeps a byte-identical journal (the consumer
@@ -638,6 +657,7 @@ function deployRelease(config, options = {}, ctx = {}) {
         { rollbackTargetRestored: true, appsOnline },
       );
     }
+    return resumed.ok;
   };
 
   // Re-run the failed post-deploy check against the rolled-back release. The same
@@ -694,6 +714,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       case 'build':
       case 'validate':
         // current never touched, apps never stopped — just quarantine the candidate.
+        recoveryInfo = { action: st.releaseDir ? 'quarantine' : 'none', verified: false };
         if (st.releaseDir) {
           log.warning(`Quarantining candidate release ${st.releaseDir}`);
           runInDir(paths.root, `git --git-dir=${paths.repoGit} worktree remove --force ${st.releaseDir} 2>/dev/null || rm -rf ${st.releaseDir}`, config, c, { tolerate: true });
@@ -703,13 +724,16 @@ function deployRelease(config, options = {}, ctx = {}) {
         return;
       case 'stopped':
         // writers stopped, nothing migrated/flipped — resume previous, verify.
+        recoveryInfo = { action: 'resume-previous', verified: false };
         if (!resumePrevious().ok) fail('failed to bring the previous release back online after aborting pre-migration');
+        recoveryInfo.verified = true;
         markRecovered();
         return;
       case 'migrated':
       case 'flipped':
       case 'verify': {
-        rollbackToPrevious(fail);
+        recoveryInfo = { action: rollbackAction(), verified: false };
+        recoveryInfo.verified = rollbackToPrevious(fail);
         markRecovered();
         return;
       }
@@ -722,6 +746,7 @@ function deployRelease(config, options = {}, ctx = {}) {
         if (st.failurePolicy === 'remain-active') {
           st.phase = 'post-deploy-degraded';
           st.recoveryOutcome = 'remained-active';
+          recoveryInfo = { action: 'remain-active', verified: true };
           journal();
           emitDeliveryEvent('degraded', {
             ...eventBase,
@@ -732,6 +757,7 @@ function deployRelease(config, options = {}, ctx = {}) {
         if (st.failurePolicy === 'manual') {
           st.phase = 'post-deploy-manual-decision';
           st.recoveryOutcome = 'manual-decision-required';
+          recoveryInfo = { action: 'manual', verified: false };
           journal();
           emitDeliveryEvent('failed', {
             ...eventBase,
@@ -743,8 +769,9 @@ function deployRelease(config, options = {}, ctx = {}) {
         st.phase = 'post-deploy-rollback';
         st.recoveryOutcome = 'pending';
         journal();
+        recoveryInfo = { action: rollbackAction(), verified: false };
         try {
-          rollbackToPrevious(fail);
+          recoveryInfo.verified = rollbackToPrevious(fail);
           st.phase = 'post-deploy-rolled-back';
           st.recoveryOutcome = 'rolled-back';
           // Persist the verified rollback before the diagnostic re-run: a re-run that hangs or
@@ -999,13 +1026,14 @@ function deployRelease(config, options = {}, ctx = {}) {
       });
       if (alertText) postFleetAlert(`${alertText} (${outcome}).${st.recoveryNote ? ` ${st.recoveryNote}.` : ''}`);
     };
-    const settledFailure = (child, message) => {
-      throw withFacts(recoveryRequired(`forward deployment failed (${reason}); ${message}`, failure), child.operationId);
+    const settledFailure = (child, message, deployRecovery) => {
+      throw Object.assign(withFacts(recoveryRequired(`forward deployment failed (${reason}); ${message}`, failure), child.operationId), { deployRecovery });
     };
+    const restoreAction = failedPhase === 'stopped' ? 'resume-previous' : rollbackAction();
     const concludeVerified = (child) => {
       journal({ phase: 'recovered', sha: previousSha });
       log.success(`Restored the previous release ${st.prevTarget}`);
-      return settledFailure(child, `previous release ${st.prevTarget} recovered`);
+      return settledFailure(child, `previous release ${st.prevTarget} recovered`, { action: restoreAction, verified: true });
     };
     const concludeUnverified = (child) => {
       if (!policyPhase) {
@@ -1015,7 +1043,8 @@ function deployRelease(config, options = {}, ctx = {}) {
       }
       return settledFailure(child, policyPhase
         ? `post-deploy policy "${st.failurePolicy}" left the candidate active; manual review required`
-        : 'recovery did not verify the previous release; manual recovery required');
+        : 'recovery did not verify the previous release; manual recovery required',
+      { action: policyPhase ? st.failurePolicy : restoreAction, verified: false });
     };
 
     const firstBody = () => {
@@ -1492,6 +1521,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     return {
       branch, mode: config.mode, host: config.host, sha: st.sha, release: releaseId, steps, healthy: true,
       ...(deliveryEvent ? { deliveryEvent } : {}),
+      ...deployedResult({ ...resultFacts('done'), liveAfter: shaOfTarget(`releases/${releaseId}`) }),
     };
     };
     // Terminal success metadata: retains operation identity when protected.
@@ -1533,25 +1563,34 @@ function deployRelease(config, options = {}, ctx = {}) {
     log.success(`Deployment completed successfully (release ${releaseId})`);
     return deployed;
   } catch (err) {
+    const stage = st.phase;
     if (protectedMode) {
-      // Never generic recover(): early hooks may have mutated production.
-      if (err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED' && authorityHandle && !isPhaseWriteUncertain(err)) {
-        const handle = authorityHandle;
-        const failedOperationId = operationIdentity?.operationId;
-        const failedPhase = st.phase;
-        authorityHandle = null;
-        try {
-          manager.abandon(handle, 'UNKNOWN');
-        } catch (abandonErr) {
-          throw recoveryRequired('forward operation failed and abandon was not acknowledged; recovery assessment required', abandonErr);
+      try {
+        // Never generic recover(): early hooks may have mutated production.
+        if (err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED' && authorityHandle && !isPhaseWriteUncertain(err)) {
+          const handle = authorityHandle;
+          const failedOperationId = operationIdentity?.operationId;
+          const failedPhase = st.phase;
+          authorityHandle = null;
+          try {
+            manager.abandon(handle, 'UNKNOWN');
+          } catch (abandonErr) {
+            throw recoveryRequired('forward operation failed and abandon was not acknowledged; recovery assessment required', abandonErr);
+          }
+          recoverProtectedForward(err, failedOperationId, failedPhase);
         }
-        recoverProtectedForward(err, failedOperationId, failedPhase);
+        throw err;
+      } catch (protectedError) {
+        throw attach(protectedError, failureFromError(resultFacts(stage), NO_RECOVERY, protectedError));
       }
-      throw err;
     }
-    if (recoveringInterrupted) throw err;
-    recover(err);
-    throw err;
+    if (recoveringInterrupted) throw attach(err, failureFromError(resultFacts(stage), recoveryInfo, err));
+    try {
+      recover(err);
+    } catch (recoveryError) {
+      throw attach(recoveryError, failureFromError(resultFacts(stage), recoveryInfo, recoveryError));
+    }
+    throw attach(err, failureFromError(resultFacts(stage), recoveryInfo, err));
   } finally {
     process.removeListener('SIGINT', sigHandlers.SIGINT);
     process.removeListener('SIGTERM', sigHandlers.SIGTERM);
@@ -1751,7 +1790,7 @@ function recoverFailedRollback(config, paths, originalCurrent, c, reason, restor
     throw new Error(`MANUAL RECOVERY REQUIRED — ${reason} AND the original release did not come back (${back.reason}).`);
   }
   if (restoredSha) return { observedSha: restoredSha, verified: true };
-  throw new Error(`Rollback aborted: ${reason}; restored the original release ${originalCurrent}.`);
+  throw Object.assign(new Error(`Rollback aborted: ${reason}; restored the original release ${originalCurrent}.`), { deployRecovery: RESTORED_ORIGINAL });
 }
 
 // Release-layout rollback: flip `current` back to the recorded previous release and
@@ -1783,6 +1822,9 @@ function rollbackRelease(config, options = {}, ctx = {}) {
     );
   }
 
+  const rollbackFacts = {
+    stage: 'rollback', liveBefore: null, migrated: false, migrationsPending: null, backupId: null, liveAfter: null,
+  };
   log.header(`⏪ Rolling back [release layout] (${config.mode}${config.host ? ` → ${config.host}` : ''})`);
   const release = acquireOrAdoptLock(config, c, { steal: options.stealLock === true });
   try {
@@ -1795,6 +1837,8 @@ function rollbackRelease(config, options = {}, ctx = {}) {
     // Remember what current pointed at so a failed rollback can flip back to it
     // instead of leaving a broken `previous` release serving traffic.
     const originalCurrent = pointers.current;
+    rollbackFacts.liveBefore = shaOfTarget(originalCurrent);
+    rollbackFacts.liveAfter = (recovery) => (recovery.verified ? rollbackFacts.liveBefore : null);
     if (fenced && originalCurrent) assertSafeTarget(originalCurrent, 'current');
     const isRuntimeFailure = (err) => err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED';
     const phaseJournal = (identity, fields) => persistState(config, paths, { ...identity, ...fields }, c);
@@ -1834,7 +1878,10 @@ function rollbackRelease(config, options = {}, ctx = {}) {
         log.warning('Code rolled back to the previous release. If the failed deploy ran a migration, the previous '
           + 'code may not run against the migrated schema — restore the pre-migration DB backup explicitly if needed.');
       }
-      return { release: pointers.previous, mode: config.mode, host: config.host, healthy: true };
+      return {
+        release: pointers.previous, mode: config.mode, host: config.host, healthy: true,
+        ...deployedResult({ ...rollbackFacts, stage: 'done', liveAfter: shaOfTarget(pointers.previous) }),
+      };
     };
 
     if (fenced) {
@@ -1900,8 +1947,10 @@ function rollbackRelease(config, options = {}, ctx = {}) {
       manager.complete(begun.handle, observation);
       phaseJournal(identity, { phase: 'recovered', current: originalCurrent, previous: pointers.previous, sha: originalSha });
       log.success(`Restored the original release ${originalCurrent}`);
-      throw new Error(`Rollback aborted: ${reason}; restored the original release ${originalCurrent}.`);
+      throw Object.assign(new Error(`Rollback aborted: ${reason}; restored the original release ${originalCurrent}.`), { deployRecovery: RESTORED_ORIGINAL });
     }
+  } catch (err) {
+    throw attach(err, failureFromError(rollbackFacts, NO_RECOVERY, err));
   } finally {
     release();
   }

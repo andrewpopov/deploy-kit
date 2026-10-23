@@ -3,7 +3,7 @@ import { createRequire } from 'module';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
-  makeTarget, requestMeta, runIdN, CrashSeam, KIT_ARTIFACT, NOW_SEC, SHA, LIVE_SHA, REQUEST_ID, OTHER_REQUEST_ID, Target,
+  makeTarget, requestMeta, deployResult, runIdN, CrashSeam, KIT_ARTIFACT, NOW_SEC, SHA, LIVE_SHA, REQUEST_ID, OTHER_REQUEST_ID, Target,
 } from './on-host-fixture';
 import { hasFlock } from './target-state-fixture';
 
@@ -44,7 +44,7 @@ describeWithFlock('host-run request protocol: the happy path', () => {
     expect(t.readJson(`runs/${runId}/accepted.json`)).toMatchObject({ runId, requestId: REQUEST_ID, kind: 'deploy', gen: 1 });
     expect(t.readJson(`requests/${REQUEST_ID}.json`)).toMatchObject({ requestId: REQUEST_ID, gen: 1, state: 'accepted', runId, liveBefore: LIVE_SHA, prev: null });
     expect(t.readJson(`runs/${runId}/terminal.json`)).toEqual({
-      runId, kind: 'deploy', result: { status: 'deployed', error: null }, effects: null, kitArtifact: KIT_ARTIFACT, finishedAt: '2026-10-23T10:00:00.000Z',
+      runId, kind: 'deploy', result: deployResult({ stage: null }), effects: null, kitArtifact: KIT_ARTIFACT, finishedAt: '2026-10-23T10:00:00.000Z',
     });
     expect(t.readJson(`runs/${runId}/outcome.json`)).toMatchObject({ runId, ok: true });
     expect(t.has('deploy-kit-' + lock.lockId(t.config) + '.unresolved.json')).toBe(false);
@@ -52,11 +52,11 @@ describeWithFlock('host-run request protocol: the happy path', () => {
     expect(t.status(runId).state).toBe('terminal');
   });
 
-  it('a pipeline that returns a structured result has it written verbatim', () => {
+  it('a pipeline that returns a DeployResult has its fields written, without the pipeline\'s legacy fields', () => {
     const runId = runIdN(1);
     t.stage(runId);
-    t.go(runId, { pipeline: () => ({ status: 'deployed', stage: 'done', liveAfter: SHA }) });
-    expect(t.readJson(`runs/${runId}/terminal.json`).result).toEqual({ status: 'deployed', error: null, stage: 'done', liveAfter: SHA });
+    t.go(runId, { pipeline: () => ({ ...deployResult({ liveAfter: SHA }), steps: ['flip'], healthy: true }) });
+    expect(t.readJson(`runs/${runId}/terminal.json`).result).toEqual(deployResult({ liveAfter: SHA }));
   });
 });
 
@@ -337,7 +337,7 @@ describeWithFlock('host-run request protocol: results, unresolved and resolve', 
     t.stage(runId);
     const run = t.go(runId, { pipeline: () => { throw new Error('build exploded'); } });
     expect(run.code).toBe(1);
-    expect(t.readJson(`runs/${runId}/terminal.json`).result).toEqual({ status: 'failed', error: 'build exploded', effectsClean: false });
+    expect(t.readJson(`runs/${runId}/terminal.json`).result).toEqual(deployResult({ status: 'failed', stage: null, error: 'build exploded' }));
     expect(t.readJson(unresolvedFile())).toMatchObject({ requestId: REQUEST_ID, runId, kind: 'deploy', status: 'failed', error: 'build exploded' });
     expect(t.readJson(`requests/${REQUEST_ID}.json`)).toMatchObject({ state: 'accepted', runId });
     expect(t.status(runId).state).toBe('terminal');
@@ -350,7 +350,7 @@ describeWithFlock('host-run request protocol: results, unresolved and resolve', 
     ['a verified recovery', { status: 'failed-recovered', recovery: { verified: true } }],
   ])('%s leaves no unresolved record', (_name, result) => {
     t.stage(runIdN(1));
-    t.go(runIdN(1), { pipeline: () => result });
+    t.go(runIdN(1), { pipeline: () => deployResult(result) });
     expect(t.has(unresolvedFile())).toBe(false);
   });
 
@@ -361,7 +361,7 @@ describeWithFlock('host-run request protocol: results, unresolved and resolve', 
     ['an aborted-clean that does not claim clean effects', { status: 'aborted-clean' }],
   ])('%s leaves an unresolved record', (_name, result) => {
     t.stage(runIdN(1));
-    expect(t.go(runIdN(1), { pipeline: () => result }).code).toBe(1);
+    expect(t.go(runIdN(1), { pipeline: () => deployResult(result) }).code).toBe(1);
     expect(t.has(unresolvedFile())).toBe(true);
   });
 
