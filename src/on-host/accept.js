@@ -17,10 +17,10 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { acquireOwnedLocks, releaseOwnedLocks, lockId } = require('../lock');
+const { acquireOwnedLocks, releaseOwnedLocks } = require('../lock');
 const { runOnTarget } = require('../exec');
 const {
-  NO_RECOVERY, deployed, failureFromError, pickDeployResult,
+  NO_RECOVERY, deployed, failureFromError, pickDeployResult, needsResolution,
 } = require('../deploy-result');
 const { releasePaths, RELEASE_RECORD } = require('../release');
 const { stepClass } = require('../effects');
@@ -102,8 +102,7 @@ function openLedger(file) {
 }
 
 function targetFiles(config, home) {
-  const files = Object.fromEntries(Object.entries(stateFiles(config)).map(([key, value]) => [key, value.replace('$HOME', home)]));
-  return { ...files, inflight: `${files.base}/deploy-kit-${lockId(config)}.inflight.json` };
+  return Object.fromEntries(Object.entries(stateFiles(config)).map(([key, value]) => [key, value.replace('$HOME', home)]));
 }
 
 // ---- default git and check seams (tests inject fakes) ----------------------------------------------
@@ -411,14 +410,6 @@ function resultOf(returned, thrown) {
 function succeeded(kind, result) {
   if (kind === 'recover') return result.status === 'failed-recovered' && result.recovery.verified === true;
   return result.status === 'deployed';
-}
-
-// Success, a verified clean abort and a verified recovery settle themselves; anything else may have changed production.
-function needsResolution(result) {
-  if (result.status === 'deployed') return false;
-  if (result.status === 'aborted-clean') return result.effectsClean !== true;
-  if (result.status === 'failed-recovered') return !(result.recovery && result.recovery.verified === true);
-  return true;
 }
 
 function readLiveOrNull(git, paths) {

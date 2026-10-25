@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createRequire } from 'module';
 import { execFileSync as realExecFileSync } from 'child_process';
 import {
-  mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, readdirSync, lstatSync, statSync, readlinkSync, symlinkSync,
+  mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, readdirSync, lstatSync, statSync, readlinkSync, symlinkSync, realpathSync,
 } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -36,7 +36,7 @@ const git = (home: string, cwd: string, ...args: string[]) => realExecFileSync('
 interface Fixture {
   home: string; root: string; config: any; commands: string[]; lockSeen: string[]; health: { code: string };
   runtime: any; deps: (over?: any) => any; sha: string;
-  pm2: { cwd: string | null; files: string[]; forceCwd: string | null };
+  pm2: { cwd: string | null; files: string[]; forceCwd: string | null; status: string; pid: number; procCwd: string | null };
 }
 
 function fixture(configOver: any = {}): Fixture {
@@ -81,7 +81,7 @@ function fixture(configOver: any = {}): Fixture {
   const health = { code: '200' };
   // A pm2 that keeps the cwd a process was first started with (stop and startOrRestart do not move it); only
   // `pm2 delete` followed by a start takes the cwd from the ecosystem file given.
-  const pm2 = { cwd: null as string | null, files: [] as string[], forceCwd: null as string | null };
+  const pm2 = { cwd: null as string | null, files: [] as string[], forceCwd: null as string | null, status: 'online', pid: 4242, procCwd: null as string | null };
   const lockOwners = () => [
     join(home, '.deploy-kit', `deploy-kit-${lock.lockId(config)}.lock`, 'owner'),
     join(home, 'hosts', 'bigpi.lock', 'owner'),
@@ -92,8 +92,10 @@ function fixture(configOver: any = {}): Fixture {
       commands.push(cmd);
       if (cmd.includes('pm2 jlist')) {
         const cwd = pm2.forceCwd || pm2.cwd;
-        return JSON.stringify(cwd ? [{ name: 'app', pid: 4242, pm_cwd: cwd, pm2_env: { status: 'online', pm_cwd: cwd } }] : []);
+        return JSON.stringify(cwd ? [{ name: 'app', pid: pm2.pid, pm_cwd: cwd, pm2_env: { status: pm2.status, pm_cwd: cwd } }] : []);
       }
+      // Linux /proc is not there on the test machine: a live process runs from the cwd pm2 started it with.
+      if (cmd.includes('readlink -f /proc/')) return realpathSync(pm2.procCwd || pm2.forceCwd || pm2.cwd || '/');
       if (/pm2 (startOrRestart|stop)/.test(cmd)) {
         if (cmd.includes('pm2 delete')) pm2.cwd = null;
         const file = /startOrRestart '?([^' ]+)'?/.exec(cmd);
@@ -341,6 +343,52 @@ describeOnPosix('layout migrate: reverse', () => {
     expect(exitCode).toBe(2);
     expect(result.verified).toBe(false);
     expect(result.failed).toMatch(/PM2 process app cwd is .*\/current, expected/);
+  });
+
+  it('fails verification when the process is errored with pid 0, even though pm2 records the legacy cwd', () => {
+    const f = fixture();
+    migrateLayout(f.config, { to: 'releases' }, f.deps());
+    f.pm2.status = 'errored';
+    f.pm2.pid = 0;
+    const { exitCode, result } = migrateLayout(f.config, { to: 'legacy' }, f.deps());
+    expect(exitCode).toBe(2);
+    expect(result.failed).toMatch(/PM2 process app is errored, expected online/);
+    expect(result.failed).toMatch(/no live pid/);
+  });
+
+  it('fails verification when the live process runs from a different cwd than pm2 records', () => {
+    const f = fixture();
+    migrateLayout(f.config, { to: 'releases' }, f.deps());
+    f.pm2.procCwd = f.home;
+    const { exitCode, result } = migrateLayout(f.config, { to: 'legacy' }, f.deps());
+    expect(exitCode).toBe(2);
+    expect(result.failed).toMatch(/pid 4242\) is running from .*, expected/);
+  });
+
+  it('fails verification when one of two apps (a dead worker behind a healthy API) is not online', () => {
+    const f = fixture({ appNames: ['app', 'worker'] });
+    const twoApps = (cwd: string) => `module.exports = { apps: [{ name: 'app', cwd: '${cwd}' }, { name: 'worker', cwd: '${cwd}' }] };\n`;
+    writeFileSync(join(f.root, 'ecosystem.config.cjs'), twoApps(`${f.root}/current`));
+    writeFileSync(join(f.root, 'ecosystem.legacy.config.cjs'), twoApps(f.root));
+    git(f.home, f.root, 'add', 'ecosystem.config.cjs', 'ecosystem.legacy.config.cjs');
+    git(f.home, f.root, 'commit', '--quiet', '-m', 'two apps');
+    git(f.home, f.root, 'push', '--quiet', 'origin', 'HEAD:refs/heads/master');
+    const base = f.runtime.execFileSync;
+    let reversing = false;
+    let restarted = false; // the worker is healthy until the reverse restart, then dies while the API comes up
+    f.runtime.execFileSync = (file: string, args: string[], opts: any) => {
+      const cmd = String(args[args.length - 1]);
+      if (reversing && cmd.includes('pm2 startOrRestart')) restarted = true;
+      const out = base(file, args, opts);
+      if (!cmd.includes('pm2 jlist') || !f.pm2.cwd) return out;
+      const worker = restarted ? { pid: 0, status: 'errored' } : { pid: 5000, status: 'online' };
+      return JSON.stringify([...JSON.parse(out), { name: 'worker', pid: worker.pid, pm_cwd: f.pm2.cwd, pm2_env: { status: worker.status, pm_cwd: f.pm2.cwd } }]);
+    };
+    expect(migrateLayout(f.config, { to: 'releases' }, f.deps()).exitCode).toBe(0);
+    reversing = true;
+    const { exitCode, result } = migrateLayout(f.config, { to: 'legacy' }, f.deps());
+    expect(exitCode).toBe(2);
+    expect(result.failed).toMatch(/PM2 process worker is errored/);
   });
 
   it('fails verification when the running sha is not the forward-time sha', () => {

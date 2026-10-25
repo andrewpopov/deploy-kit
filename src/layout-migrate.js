@@ -430,8 +430,16 @@ function runningLegacyFailures({ config, paths, run, facts }) {
   config.appNames.forEach((name) => {
     const proc = (list || []).find((p) => p && p.name === name);
     const cwd = proc && (proc.pm_cwd || (proc.pm2_env && proc.pm2_env.pm_cwd));
-    if (!proc) failures.push(`PM2 process ${name} is not listed`);
-    else if (cwd !== paths.root && cwd !== canonicalRoot) failures.push(`PM2 process ${name} cwd is ${cwd || '<unknown>'}, expected ${paths.root}`);
+    if (!proc) { failures.push(`PM2 process ${name} is not listed`); return; }
+    const status = proc.pm2_env && proc.pm2_env.status;
+    if (status !== 'online') failures.push(`PM2 process ${name} is ${status || '<unknown>'}, expected online`);
+    if (cwd !== paths.root && cwd !== canonicalRoot) failures.push(`PM2 process ${name} cwd is ${cwd || '<unknown>'}, expected ${paths.root}`);
+    // The recorded cwd is what pm2 was told; the live process's own cwd is what it is doing.
+    if (!Number.isInteger(proc.pid) || proc.pid <= 0) failures.push(`PM2 process ${name} has no live pid (${proc.pid})`);
+    else {
+      const actual = run.read(`readlink -f /proc/${proc.pid}/cwd`).out;
+      if (actual !== canonicalRoot) failures.push(`PM2 process ${name} (pid ${proc.pid}) is running from ${actual || '<unknown>'}, expected ${canonicalRoot}`);
+    }
   });
   const shaCommand = config.layout.runningShaCommand;
   if (shaCommand) {

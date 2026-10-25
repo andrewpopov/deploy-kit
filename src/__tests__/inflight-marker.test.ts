@@ -11,6 +11,7 @@ import { hasFlock } from './target-state-fixture';
 
 const require = createRequire(__filename);
 const lock = require('../lock.js');
+const { resolveRequest } = require('../target-state.js');
 
 const describeWithFlock = hasFlock ? describe : describe.skip;
 const RELEASE_ID = `${SHA.slice(0, 12)}-20261023T095900Z`;
@@ -114,5 +115,58 @@ describeWithFlock('the in-flight marker', () => {
     expect(run.code).toBe(1);
     expect(run.deployRelease).not.toHaveBeenCalled();
     expect(t.readJson(`runs/${runIdN(1)}/refused.json`).code).toBe('app-unresolved');
+  });
+
+  it('crash after a live step, lock break, then `resolve` settles the in-flight marker and a new request is admitted', () => {
+    const runId = runIdN(1);
+    t.stage(runId);
+    expect(() => t.go(runId, { crashAt: 'after-release-result', pipeline: stopsWriters })).toThrow(CrashSeam);
+    breakLocks();
+    expect(t.has(unresolvedRel())).toBe(false);
+
+    expect(resolveRequest(t.config, OTHER_REQUEST_ID, 'wrong request', { runtime: t.runtime })).toMatchObject({ outcome: 'refused' });
+    expect(t.has(inflightRel())).toBe(true);
+    const resolved = resolveRequest(t.config, REQUEST_ID, 'assessed: stopped at stop-writers, restarted by hand', { runtime: t.runtime });
+    expect(resolved).toMatchObject({ outcome: 'ok', message: `resolved ${REQUEST_ID}` });
+    expect(t.has(inflightRel())).toBe(false);
+    const archived = fs.readdirSync(t.dk('resolved')).sort();
+    expect(archived.some((n) => n.endsWith('.inflight.json'))).toBe(true);
+    expect(JSON.parse(fs.readFileSync(t.dk(`resolved/${archived.find((n) => n.endsWith('.resolution.json'))}`), 'utf8')))
+      .toMatchObject({ requestId: REQUEST_ID, reason: 'assessed: stopped at stop-writers, restarted by hand' });
+
+    t.stage(runIdN(2), requestMeta({ requestId: OTHER_REQUEST_ID }));
+    // resolve settles the app-level marker only; the interrupted release journal is the operator's recovery to finish.
+    expect(t.go(runIdN(2)).code).toBe(1);
+    expect(t.readJson(`runs/${runIdN(2)}/refused.json`).code).toBe('recovery-pending');
+    fs.writeFileSync(journalFile(), JSON.stringify({ phase: 'recovered', releaseId: RELEASE_ID }));
+    t.stage(runIdN(3), requestMeta({ requestId: OTHER_REQUEST_ID }));
+    expect(t.go(runIdN(3)).code).toBe(0);
+  });
+
+  it('resolve works with a hold set (a hold stops admission, not the operator\'s settlement)', () => {
+    const runId = runIdN(1);
+    t.stage(runId);
+    expect(() => t.go(runId, { crashAt: 'after-release-result', pipeline: stopsWriters })).toThrow(CrashSeam);
+    breakLocks();
+    t.put(`deploy-kit-${lock.lockId(t.config)}.hold.json`, { reason: 'cutover', until: null, at: 'x', epoch: null });
+    expect(resolveRequest(t.config, REQUEST_ID, 'assessed under the hold', { runtime: t.runtime }).outcome).toBe('ok');
+    expect(t.has(inflightRel())).toBe(false);
+  });
+
+  it('resolve refuses an in-flight marker whose run finished with a result that needs no resolution', () => {
+    t.put(inflightRel(), { requestId: REQUEST_ID, runId: runIdN(7), kind: 'deploy', at: '2026-10-23T09:00:00.000Z' });
+    t.putTerminal(runIdN(7), { status: 'deployed' });
+    expect(resolveRequest(t.config, REQUEST_ID, 'why', { runtime: t.runtime })).toMatchObject({ outcome: 'refused', message: 'not-unresolved' });
+    expect(t.has(inflightRel())).toBe(true);
+  });
+
+  it('resolve archives an in-flight marker whose run finished with a result that needs resolution, and an unreadable one on the operator\'s word', () => {
+    t.put(inflightRel(), { requestId: REQUEST_ID, runId: runIdN(7), kind: 'deploy', at: '2026-10-23T09:00:00.000Z' });
+    t.putTerminal(runIdN(7), { status: 'failed', effectsClean: false, error: 'x' });
+    expect(resolveRequest(t.config, REQUEST_ID, 'assessed', { runtime: t.runtime }).outcome).toBe('ok');
+    expect(t.has(inflightRel())).toBe(false);
+    t.put(inflightRel(), '{nope');
+    expect(resolveRequest(t.config, REQUEST_ID, 'looked at it', { runtime: t.runtime }).outcome).toBe('ok');
+    expect(t.has(inflightRel())).toBe(false);
   });
 });

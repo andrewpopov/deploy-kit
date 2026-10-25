@@ -17,6 +17,7 @@ const { DEFAULT_GUARD_CONFIG, loadGuardConfig } = require('./guard-config');
 const { verifyTunnelConfig } = require('./tunnel-config-guard');
 const { verifyNoSecrets } = require('./secret-file-guard');
 const { assertShaOptions } = require('./sha-options');
+const { markPlanningRuntime } = require('./lock');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
@@ -370,13 +371,13 @@ function dryRunContext(config, options = {}) {
   };
   return {
     sleep: () => {},
-    runtime: {
+    runtime: markPlanningRuntime({
       dryRun: true,
       execFileSync: executePlan,
       // runOnTarget normally sends readOnly dry-run probes through this seam.
       // Point it at the same planner so even preflight cannot contact the host.
       realExecFileSync: executePlan,
-    },
+    }),
   };
 }
 
@@ -793,7 +794,8 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   if (options.lock === false) config = { ...config, lock: false };
 
   // An onHost.required app deploys and rolls back only as an accepted request (`--on-host`), under owned locks.
-  if (['deploy', 'rollback'].includes(command) && require('./lock').lockRequiresOwnership(config)) {
+  // `--dry-run` is the config-only planner: it opens no ssh and runs no target command (dryRunContext), so it is not an execution.
+  if (['deploy', 'rollback'].includes(command) && !(options.dryRun && !options.onHost) && require('./lock').lockRequiresOwnership(config)) {
     const refusal = !options.onHost
       ? `${command}: this app sets onHost.required, so it only runs as \`deploy-kit ${command} --on-host ...\` (an accepted request under the host and app locks)`
       : (options.stealLock || options.lock === false) && `${command}: --steal-lock and --no-lock are refused for an onHost.required app`;

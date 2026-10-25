@@ -146,7 +146,15 @@ function lockRequiresOwnership(config) {
 // pipeline adopts it (validateOwnedLocks).
 function assertOwnedEntry(config, options, ctx, command) {
   if (!lockRequiresOwnership(config)) return;
+  // A planning context (dry-run) executes nothing, so it needs no locks; real executors are unreachable from it.
+  if (isPlanningRuntime(ctx.runtime)) return;
   const entry = `deploy-kit ${command} --on-host`;
+  if (config.layout?.type !== 'releases') {
+    throw new Error(
+      `deploy-kit: ${command} is refused for an onHost.required app on the legacy layout: the on-host protocol requires the releases layout. `
+      + 'Migrate the layout first (`deploy-kit layout migrate --to releases`), then run it as an accepted request.',
+    );
+  }
   if (ctx.ownedLocks == null) {
     throw new Error(
       `deploy-kit: ${command} is refused for an onHost.required app outside an accepted request (no owned lock handle). `
@@ -156,6 +164,18 @@ function assertOwnedEntry(config, options, ctx, command) {
   if (options.stealLock === true || config.lock === false) {
     throw new Error(`deploy-kit: ${command} for an onHost.required app never runs with --steal-lock or --no-lock; \`${entry}\` owns the locks.`);
   }
+  validateOwnedLocks(config, ctx, ctx.ownedLocks);
+}
+
+// Runtimes built by the dry-run planner (cli.js dryRunContext): they print commands and execute none, so a pipeline
+// handed one needs no owned locks. Membership is by identity -- a hand-built `{ dryRun: true }` runtime does not count.
+const PLANNING_RUNTIMES = new WeakSet();
+function markPlanningRuntime(runtime) {
+  PLANNING_RUNTIMES.add(runtime);
+  return runtime;
+}
+function isPlanningRuntime(runtime) {
+  return runtime != null && PLANNING_RUNTIMES.has(runtime);
 }
 
 // Permanent sibling of the lock directory. It is NEVER renamed or unlinked: the
@@ -534,7 +554,7 @@ function inspectLock(config, ctx, { suffix } = {}) {
 
 module.exports = {
   lockId, lockDir, prevShaFile, legacyPrevShaFile, lockTtlSeconds, ensureStateDir, acquireLock,
-  inspectLock, guardFile, lockRequiresOwnership, assertOwnedEntry, hostLockDir, lockLocation,
+  inspectLock, guardFile, lockRequiresOwnership, assertOwnedEntry, markPlanningRuntime, isPlanningRuntime, hostLockDir, lockLocation,
   acquireOwnedLocks, validateOwnedLocks, releaseOwnedLocks,
 };
 

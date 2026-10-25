@@ -163,6 +163,20 @@ describeWithFlock('request cancel: reservation held by a run', () => {
 });
 
 describeWithFlock('request cancel: unreadable accepted-run metadata', () => {
+  it.each([
+    ['an empty object', {}],
+    ['a requestId that is not a string', { requestId: 7 }],
+    ['a requestId that is not a request id', { requestId: 'not a request id!' }],
+  ])('fails closed (not-cancellable corrupt, no tombstone) when meta.json beside an accepted.json is %s and no reservation exists', (_name, meta) => {
+    const { home, cancel } = setup();
+    put(home, `runs/${RUN_ID}/meta.json`, meta);
+    put(home, `runs/${RUN_ID}/accepted.json`, { runId: RUN_ID });
+    const result = cancel();
+    expect(result.outcome).toBe('refused');
+    expect(result.message).toMatch(/^not-cancellable corrupt\n/);
+    expect(exists(home, RES_FILE)).toBe(false);
+  });
+
   it('fails closed (not-cancellable corrupt) when meta.json beside an accepted.json cannot be parsed, with no reservation', () => {
     const { home, cancel } = setup();
     put(home, `runs/${RUN_ID}/meta.json`, '{"requestId":"' + REQUEST_ID); // truncated

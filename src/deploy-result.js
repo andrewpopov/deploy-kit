@@ -86,6 +86,14 @@ function validateDeployResult(result) {
   return null;
 }
 
+// Success, a verified clean abort and a verified recovery settle themselves; anything else may have changed production.
+function needsResolution(result) {
+  if (result.status === 'deployed') return false;
+  if (result.status === 'aborted-clean') return result.effectsClean !== true;
+  if (result.status === 'failed-recovered') return !(result.recovery && result.recovery.verified === true);
+  return true;
+}
+
 module.exports = {
-  STATUSES, RECOVERY_ACTIONS, NO_RECOVERY, shaOfTarget, deployed, failure, failureFromError, attach, pickDeployResult, validateDeployResult,
+  needsResolution, STATUSES, RECOVERY_ACTIONS, NO_RECOVERY, shaOfTarget, deployed, failure, failureFromError, attach, pickDeployResult, validateDeployResult,
 };

@@ -56,6 +56,7 @@ function stateFiles(config) {
     hold: `${base}/deploy-kit-${lockId(config)}.hold.json`,
     epoch: `${base}/.last-epoch`,
     unresolved: `${base}/deploy-kit-${lockId(config)}.unresolved.json`,
+    inflight: `${base}/deploy-kit-${lockId(config)}.inflight.json`,
     resolved: `${base}/resolved`,
     requests: `${base}/requests`,
     runs: `${base}/runs`,
@@ -190,7 +191,7 @@ function setEpoch(config, value, { runtime, pauseFifo } = {}) {
 const VALIDATOR_BODY = String.raw`
 const fs = require('fs');
 const path = require('path');
-const { readRecord, validateReservation, validateTerminal, parseRecord, isPlainObject } = loadValidators();
+const { readRecord, validateReservation, validateTerminal, parseRecord, isPlainObject, REQUEST_ID_RE } = loadValidators();
 const { DK_RID: rid, DK_RF: reservationFile, DK_RUNS: runsDir } = process.env;
 const readOptional = (file) => {
   try { return fs.readFileSync(file, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
@@ -204,7 +205,8 @@ function acceptedRunNamingRequest() {
   for (const name of names) {
     if (readOptional(path.join(runsDir, name, 'accepted.json')) === null) continue;
     const meta = parseRecord(readOptional(path.join(runsDir, name, 'meta.json')));
-    if (meta.absent || meta.error || !isPlainObject(meta.record)) return { unreadable: name };
+    if (meta.absent || meta.error || !isPlainObject(meta.record)
+      || typeof meta.record.requestId !== 'string' || !REQUEST_ID_RE.test(meta.record.requestId)) return { unreadable: name };
     if (meta.record.requestId === rid) return { name };
   }
   return null;
@@ -240,7 +242,7 @@ if (raw === null) {
 // rest of deploy-kit uses (about 19 KB together); status.js's other requires (exec, lock, attach) are only
 // used by its remote readers, never by the validators, so the loader gives them an empty module.
 const VALIDATOR_FILES = { 'on-host/status': 'status', 'on-host/outcome': 'outcome', 'deploy-result': 'deploy-result' };
-function validatorSource() {
+function validatorSource(body = VALIDATOR_BODY) {
   const sources = {};
   for (const [file, name] of Object.entries(VALIDATOR_FILES)) sources[name] = fs.readFileSync(path.join(__dirname, `${file}.js`), 'utf8');
   return `const SOURCES = ${JSON.stringify(sources)};
@@ -254,10 +256,35 @@ function loadValidators() {
     new Function('require', 'module', 'exports', SOURCES[name])(need, module, module.exports);
     return module.exports;
   };
-  return { ...load('status'), ...load('outcome') };
+  return { ...load('status'), ...load('outcome'), ...load('deploy-result') };
 }
-${VALIDATOR_BODY}`;
+${body}`;
 }
+
+// The resolve decision for an app with only an in-flight marker (no unresolved one). Prints ONE verdict line:
+// `unreadable` (names no run: the operator vouches for production), `mismatch <requestId>`, `finished` (the run wrote a
+// valid terminal.json that needs no resolution, so the marker vouches for nothing) or `archive`.
+const INFLIGHT_VALIDATOR_BODY = String.raw`
+const fs = require('fs');
+const path = require('path');
+const { readRecord, validateTerminal, parseRecord, isPlainObject, needsResolution } = loadValidators();
+const { DK_RID: rid, DK_INFLIGHT: inflightFile, DK_RUNS: runsDir } = process.env;
+const readOptional = (file) => {
+  try { return fs.readFileSync(file, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+};
+const marker = parseRecord(readOptional(inflightFile));
+if (marker.error || marker.absent || !isPlainObject(marker.record)
+  || typeof marker.record.requestId !== 'string' || typeof marker.record.runId !== 'string') console.log('unreadable');
+else if (marker.record.requestId !== rid) console.log('mismatch', marker.record.requestId);
+else {
+  const terminal = readRecord(readOptional(path.join(runsDir, marker.record.runId, 'terminal.json')), validateTerminal, marker.record.runId);
+  console.log(terminal.state === 'valid' && !needsResolution(terminal.value.result) ? 'finished' : 'archive');
+}
+`;
+
+// An absolute node binary to run a validator with, or empty when there is none (the caller then refuses).
+const FIND_NODE_BIN = String.raw`  node_bin=$(command -v node 2>/dev/null) && node_bin=$(readlink -f "$node_bin" 2>/dev/null)
+  case "$node_bin" in /*) [ -x "$node_bin" ] || node_bin= ;; *) node_bin= ;; esac`;
 
 // The cancel decision. The shell owns the lock and the one write (the tombstone); node owns every
 // parse and validation (validatorSource()). A validator that fails, prints nothing usable or cannot
@@ -278,8 +305,7 @@ function cancelBody(config, requestId, at) {
     mv "$tmp" "$rf" || return 2
     echo "cancelled $rid gen=$1"
   }
-  node_bin=$(command -v node 2>/dev/null) && node_bin=$(readlink -f "$node_bin" 2>/dev/null)
-  case "$node_bin" in /*) [ -x "$node_bin" ] || node_bin= ;; *) node_bin= ;; esac
+${FIND_NODE_BIN}
   if [ -z "$node_bin" ]; then refuse corrupt "no absolute node binary to validate with"; return $?; fi
   verdict_file="${base}/cancel-verdict.$$"
   if ! DK_RID="$rid" DK_RF="$rf" DK_RUNS="${runs}" \
@@ -320,22 +346,48 @@ function resolveRequest(config, requestId, reason, { now = new Date(), runtime, 
     throw new Error(`deploy-kit: ${JSON.stringify(requestId)} is not a request id`);
   }
   if (typeof reason !== 'string' || reason.trim() === '') throw new Error('deploy-kit: resolve needs a non-empty --reason');
-  const { unresolved, resolved } = stateFiles(config);
+  const {
+    base, unresolved, inflight, resolved, runs,
+  } = stateFiles(config);
   const at = now.toISOString();
   const archive = `${resolved}/${at.replace(/[:.]/g, '')}-${requestId}`;
+  const reasonJson = shQuote(JSON.stringify(reason));
+  // Only the in-flight marker exists when a run was killed after acceptance and its lock then broken: the marker is
+  // archived the way the unresolved one is, once the run is shown to have no terminal.json that settled it.
   const body = String.raw`
   rid=${shQuote(requestId)}
   uf="${unresolved}"
-  if [ ! -e "$uf" ]; then echo "not-unresolved"; return ${EXIT_REFUSED}; fi
+  inflight="${inflight}"
+  archive_to() {
+    mkdir -p -m 700 "${resolved}" || return 2
+    printf '{"requestId":"%s","reason":%s,"at":"%s"}
+' "$rid" ${reasonJson} ${shQuote(at)} > "${archive}.resolution.json" || return 2
+    mv "$1" "${archive}.$2.json" || return 2
+    echo "resolved $rid"
+  }
+  if [ ! -e "$uf" ]; then
+    if [ ! -e "$inflight" ]; then echo "not-unresolved"; return ${EXIT_REFUSED}; fi
+${FIND_NODE_BIN}
+    if [ -z "$node_bin" ]; then echo "not-resolvable no absolute node binary to validate with"; return ${EXIT_REFUSED}; fi
+    verdict_file="${base}/resolve-verdict.$$"
+    if ! DK_RID="$rid" DK_INFLIGHT="$inflight" DK_RUNS="${runs}" \
+      "$node_bin" -e ${shQuote(validatorSource(INFLIGHT_VALIDATOR_BODY))} > "$verdict_file" 2>/dev/null; then
+      rm -f "$verdict_file"; echo "not-resolvable the validator did not complete"; return ${EXIT_REFUSED}
+    fi
+    verdict=; named=
+    read -r verdict named < "$verdict_file"; rm -f "$verdict_file"
+    case "$verdict" in
+      mismatch) echo "request-mismatch $named"; return ${EXIT_REFUSED} ;;
+      finished) echo "not-unresolved"; return ${EXIT_REFUSED} ;;
+      unreadable|archive) archive_to "$inflight" inflight; return $? ;;
+      *) echo "not-resolvable $verdict"; return ${EXIT_REFUSED} ;;
+    esac
+  fi
   c=$(tr -d ' 	
 ' < "$uf")
   named=$(printf '%s' "$c" | sed -n 's/.*"requestId":"\([^"]*\)".*/\1/p' | head -n 1)
   if [ -n "$named" ] && [ "$named" != "$rid" ]; then echo "request-mismatch $named"; return ${EXIT_REFUSED}; fi
-  mkdir -p -m 700 "${resolved}" || return 2
-  printf '{"requestId":"%s","reason":%s,"at":"%s"}
-' "$rid" ${shQuote(JSON.stringify(reason))} ${shQuote(at)} > "${archive}.resolution.json" || return 2
-  mv "$uf" "${archive}.unresolved.json" || return 2
-  echo "resolved $rid"
+  archive_to "$uf" unresolved
 `;
   return runSession(config, runtime, sessionScript(config, { purpose: 'resolve', body, pauseFifo }));
 }

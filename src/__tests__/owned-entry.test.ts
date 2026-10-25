@@ -47,6 +47,19 @@ describe('the CLI', () => {
     expect(out).toMatch(/--steal-lock and --no-lock are refused|deploy-kit \w+ --on-host/);
   });
 
+  it.each([['deploy'], ['rollback']])('%s --dry-run plans an onHost.required app without locks, ssh or a target command, while the real run is still refused', (command) => {
+    spies();
+    const execFileSync = vi.spyOn(require('child_process'), 'execFileSync');
+    inProject({ onHost: { required: true }, ecosystemFile: 'ecosystem.config.cjs' }, (cwd) => {
+      expect(cli.run([command, '--dry-run'], { cwd })).toBe(0);
+      expect(out).toContain('[dry-run]');
+      expect(execFileSync).not.toHaveBeenCalled();
+      out = '';
+      expect(cli.run([command], { cwd })).toBe(1);
+      expect(out).toContain(`deploy-kit ${command} --on-host`);
+    });
+  });
+
   it('an app that did not opt in is not affected by the check', () => {
     spies();
     inProject({}, (cwd) => {
@@ -83,8 +96,36 @@ describe('the pipeline entry points', () => {
   it('a legacy-layout deploy() and rollback() of an opted-in app are refused too', () => {
     const fake = untouched();
     const legacy = cfg({ layout: { type: 'legacy' } });
-    expect(() => deployMod.deploy(legacy, {}, { runtime: fake.runtime })).toThrow(/deploy --on-host/);
-    expect(() => deployMod.rollback(legacy, {}, { runtime: fake.runtime })).toThrow(/rollback --on-host/);
+    expect(() => deployMod.deploy(legacy, {}, { runtime: fake.runtime })).toThrow(/legacy layout.*layout migrate --to releases/);
+    expect(() => deployMod.rollback(legacy, {}, { runtime: fake.runtime })).toThrow(/legacy layout.*layout migrate --to releases/);
+    expect(fake.execFileSync).not.toHaveBeenCalled();
+  });
+
+  it.each([['legacy layout', { layout: { type: 'legacy' } }], ['no layout', { layout: null }]])(
+    'a forged handle does not open the legacy deploy() and rollback() of an opted-in app (%s, host lock configured)', (_name, over) => {
+      const fake = untouched();
+      const config = cfg({ hostLock: '/var/lock/host.lock', ...over });
+      const ctx = { runtime: fake.runtime, ownedLocks: {} };
+      expect(() => deployMod.deploy(config, {}, ctx)).toThrow(/layout migrate --to releases/);
+      expect(() => deployMod.rollback(config, {}, ctx)).toThrow(/layout migrate --to releases/);
+      expect(fake.execFileSync).not.toHaveBeenCalled();
+    });
+
+  it.each([
+    ['deployRelease', (c: any, x: any) => release.deployRelease(c, {}, x)],
+    ['rollbackRelease', (c: any, x: any) => release.rollbackRelease(c, {}, x)],
+    ['recoverRelease', (c: any, x: any) => release.recoverRelease(c, {}, x)],
+    ['deploy()', (c: any, x: any) => deployMod.deploy(c, {}, x)],
+    ['rollback()', (c: any, x: any) => deployMod.rollback(c, {}, x)],
+  ])('%s rejects a forged handle `{}` at the entry, before any step', (_name, call) => {
+    const fake = untouched();
+    expect(() => call(cfg({ hostLock: '/var/lock/host.lock' }), { runtime: fake.runtime, ownedLocks: {} })).toThrow(/owned lock handle rejected/);
+    expect(fake.execFileSync).not.toHaveBeenCalled();
+  });
+
+  it('a hand-built dryRun runtime does not stand in for the planner: it is still refused', () => {
+    const fake = untouched();
+    expect(() => deployMod.deploy(cfg(), {}, { runtime: { ...fake.runtime, dryRun: true } })).toThrow(/deploy --on-host/);
     expect(fake.execFileSync).not.toHaveBeenCalled();
   });
 
