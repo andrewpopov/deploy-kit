@@ -5,6 +5,7 @@ import {
   mkdirSync, writeFileSync, existsSync, readdirSync, symlinkSync, statSync, readFileSync,
 } from 'fs';
 import { join } from 'path';
+import { makeTarget, CrashSeam } from './on-host-fixture';
 import {
   hasFlock, hasProc, freshHome, runtimeFor, appConfig, put, read, readJson, exists, dkPath, lockPathFor,
   holdAppLock, cleanupHomes, REQUEST_ID, RUN_ID,
@@ -320,6 +321,50 @@ describeWithFlock('target-state (read-only)', () => {
     expect(ts.readTargetState(config, { requestId: REQUEST_ID, runtime, now: fixedNow }).reservation).toMatchObject({ state: 'corrupt' });
     put(home, '.last-epoch', 'x');
     expect(ts.readTargetState(config, { runtime, now: fixedNow })).toMatchObject({ lastEpoch: null, lastEpochProblem: expect.any(String) });
+  });
+
+  describe('unresolved / inflight markers', () => {
+    const markerFile = (config: any, kind: 'unresolved' | 'inflight') => `deploy-kit-${lock.lockId(config)}.${kind}.json`;
+    const marker = { requestId: REQUEST_ID, runId: RUN_ID, kind: 'deploy', at: 'x' };
+    const read2 = (home: string, config: any) => ts.readTargetState(config, { runtime: runtimeFor(home), now: fixedNow });
+    const corrupt = { present: true, corrupt: true, requestId: null, runId: null, kind: null };
+
+    it.each(['unresolved', 'inflight'] as const)('%s: absent is null', (kind) => {
+      const home = freshHome();
+      expect(read2(home, appConfig({ projectDir: join(home, 'nowhere') }))[kind]).toBeNull();
+    });
+
+    it.each(['unresolved', 'inflight'] as const)('%s: present reports the ids and kind, and the other stays null', (kind) => {
+      const home = freshHome();
+      const config = appConfig({ projectDir: join(home, 'nowhere') });
+      put(home, markerFile(config, kind), { ...marker, status: 'unknown', error: null });
+      const state = read2(home, config);
+      expect(state[kind]).toEqual({ present: true, requestId: REQUEST_ID, runId: RUN_ID, kind: 'deploy' });
+      expect(state[kind === 'inflight' ? 'unresolved' : 'inflight']).toBeNull();
+    });
+
+    it.each(['unresolved', 'inflight'] as const)('%s: invalid JSON, or JSON missing requestId, is corrupt, never null', (kind) => {
+      const home = freshHome();
+      const config = appConfig({ projectDir: join(home, 'nowhere') });
+      put(home, markerFile(config, kind), '{not json');
+      expect(read2(home, config)[kind]).toEqual(corrupt);
+      put(home, markerFile(config, kind), { runId: RUN_ID, kind: 'deploy' });
+      expect(read2(home, config)[kind]).toEqual(corrupt);
+      put(home, markerFile(config, kind), '[]');
+      expect(read2(home, config)[kind]).toEqual(corrupt);
+    });
+
+    it('reports the in-flight marker the real accept path wrote', () => {
+      const t = makeTarget();
+      try {
+        const runId = '20261023T095900Z-0123456789ab-deadbeef';
+        t.stage(runId);
+        expect(() => t.go(runId, { crashAt: 'after-release-result', pipeline: () => undefined })).toThrow(CrashSeam);
+        const state = ts.readTargetState(t.config, { runtime: t.runtime, now: fixedNow });
+        expect(state.inflight).toEqual({ present: true, requestId: t.readJson(`deploy-kit-${lock.lockId(t.config)}.inflight.json`).requestId, runId, kind: 'deploy' });
+        expect(state.unresolved).toBeNull();
+      } finally { t.cleanup(); }
+    });
   });
 
   it('an unreadable host is an error, not an empty state', () => {
