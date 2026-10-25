@@ -6,16 +6,27 @@
 // installed that way (a checkout, a plain `npm i`) has no such file and reports itself `unpinned`: the controller's
 // `check` refuses an unpinned kit, and every request and terminal.json records exactly what ran.
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
 const ARTIFACT_FILE = 'ARTIFACT.json';
+const TARBALL_FILE = 'ARTIFACT.tgz';
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const PACKAGE_ROOT = path.resolve(__dirname, '..');
 
 const readIfPresent = (file) => {
   try {
     return fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+};
+
+const readBytesIfPresent = (file) => {
+  try {
+    return fs.readFileSync(file);
   } catch (error) {
     if (error.code === 'ENOENT') return null;
     throw error;
@@ -32,7 +43,17 @@ function artifactProblem(record, installedVersion) {
   return null;
 }
 
-// -> {name, version, sha256, installedAt, source:'pinned'} from ARTIFACT.json, or {version, sha256:null,
+// Recomputes the sha256 of the tarball scripts/install-artifact.sh kept beside ARTIFACT.json: ARTIFACT.json alone is
+// only a claim, the bytes are the evidence. -> {verified:true} or {verified:false, problem}.
+function verifyTarball(root, sha256) {
+  const bytes = readBytesIfPresent(path.join(root, TARBALL_FILE));
+  if (bytes === null) return { verified: false, problem: `${TARBALL_FILE} is missing` };
+  const actual = crypto.createHash('sha256').update(bytes).digest('hex');
+  if (actual !== sha256) return { verified: false, problem: `${TARBALL_FILE} sha256 ${actual} does not match ${ARTIFACT_FILE}'s ${sha256}` };
+  return { verified: true };
+}
+
+// -> {name, version, sha256, installedAt, source:'pinned', verified[, problem]} from ARTIFACT.json, or {version, sha256:null,
 // source:'unpinned'} when there is none. A file that is unreadable, malformed, or for a different version than the
 // package beside it throws: a wrong identity must never be quietly downgraded to "unpinned".
 function readArtifact({ root = PACKAGE_ROOT } = {}) {
@@ -48,8 +69,8 @@ function readArtifact({ root = PACKAGE_ROOT } = {}) {
   const problem = artifactProblem(record, version);
   if (problem) throw new Error(`${ARTIFACT_FILE} in ${root}: ${problem}`);
   return {
-    name: record.name, version: record.version, sha256: record.sha256, installedAt: record.installedAt, source: 'pinned',
+    name: record.name, version: record.version, sha256: record.sha256, installedAt: record.installedAt, source: 'pinned', ...verifyTarball(root, record.sha256),
   };
 }
 
-module.exports = { readArtifact, ARTIFACT_FILE };
+module.exports = { readArtifact, ARTIFACT_FILE, TARBALL_FILE };

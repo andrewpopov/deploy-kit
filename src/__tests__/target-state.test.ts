@@ -318,11 +318,41 @@ describeWithFlock('target-state (read-only)', () => {
     expect(state.liveProblem).toMatch(/could not be read/);
   });
 
+  describe('the live sha follows the physical layout, not the supplied config', () => {
+    it('a releases config against an unmigrated legacy host reads HEAD of the checkout', () => {
+      const home = freshHome();
+      const projectDir = join(home, 'app');
+      const sha = repoWithCommit(projectDir);
+      const state = ts.readTargetState(appConfig({ projectDir, layout: { type: 'releases' } }), { runtime: runtimeFor(home), now: fixedNow });
+      expect(state).toMatchObject({ layout: 'releases', physicalLayout: 'legacy', liveSha: sha });
+      expect(state.liveProblem).toBeUndefined();
+    });
+
+    it('a legacy config against a migrated host reads the current release', () => {
+      const home = freshHome();
+      const root = join(home, 'app');
+      const sha = repoWithCommit(join(root, 'releases', 'r1'));
+      symlinkSync('releases/r1', join(root, 'current'));
+      writeFileSync(join(root, '.deploy-kit-layout'), '{"layout":"releases","version":1}');
+      const state = ts.readTargetState(appConfig({ projectDir: root }), { runtime: runtimeFor(home), now: fixedNow });
+      expect(state).toMatchObject({ layout: 'legacy', physicalLayout: 'releases', liveSha: sha });
+    });
+
+    it('an unknown physical layout has a null sha and a problem', () => {
+      const home = freshHome();
+      const root = join(home, 'app');
+      mkdirSync(root);
+      const state = ts.readTargetState(appConfig({ projectDir: root }), { runtime: runtimeFor(home), now: fixedNow });
+      expect(state).toMatchObject({ physicalLayout: 'unknown', liveSha: null, liveProblem: expect.stringMatching(/physical layout is unknown/) });
+    });
+  });
+
   describe('releases layout', () => {
     function releasesApp(home: string) {
       const root = join(home, 'app');
       const sha = repoWithCommit(join(root, 'releases', 'r1'));
       symlinkSync('releases/r1', join(root, 'current'));
+      writeFileSync(join(root, '.deploy-kit-layout'), '{"layout":"releases","version":1}');
       return { config: appConfig({ projectDir: root, layout: { type: 'releases' } }), root, sha };
     }
 
@@ -540,7 +570,7 @@ describeWithFlock('target-state capability facts (BRAIN-636)', () => {
   const framedWith = (records: Record<string, string | null>) => ({
     framed: {
       records: {
-        hold: null, lastEpoch: null, liveSha: null, unresolved: null, inflight: null, appLock: null, appOwner: null, ...records,
+        hold: null, lastEpoch: null, liveSha: null, liveHead: null, unresolved: null, inflight: null, appLock: null, appOwner: null, ...records,
       },
     },
     now: fixedNow,
