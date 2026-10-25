@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.33.0
+
+- Lock owner records, a permanent flock guard file, no automatic takeover for onHost.required apps, and `deploy-kit lock inspect --json`
+  Every lock acquisition now writes an `owner` JSON record (kind, uid, user, bootId, unit, invocationId, pid, pstart, sid, runId, nonce, purpose) inside the lock directory, under an exclusive flock on a permanent sibling `<lock>.guard` file that acquire and release both take. With `onHost.required: true` a held lock is never taken over by age or `--steal-lock`; the contender refuses with `refused lock-held` and the owner record. Apps that do not opt in keep age-based takeover. `deploy-kit lock inspect --json` prints the owner record and guard state without mutating anything.
+- An opt-in on-host deploy protocol (`onHost.required`) for a controller that dispatches deploys by request id
+  Opting in (`onHost.required: true`, release layout only) makes `deploy`, `rollback` and `recover` run only through `--on-host` as an accepted request under owned locks; direct, `--no-lock` and `--steal-lock` runs are refused, while the config-only `--dry-run` planner still works.
+  
+  - **Locks:** an opt-in `hostLock` serializes every app on a host. Held locks are never taken over automatically; `lock break` is an operator command that needs proof the owner is gone (same boot: unit inactive with an empty cgroup, or no process left in the owner's session; otherwise a changed boot id).
+  - **Acceptance:** host-run checks, in order, the epoch fence, hold, start deadline (`--not-after`), the per-request reservation and the per-kind journal gates, then writes immutable `accepted.json`, an in-flight marker and `release.json` before anything live runs. The controller supplies the run id (`--run-id`).
+  - **Results:** every branch returns a structured `DeployResult`; an effects ledger classifies each step, and `aborted-clean` (retryable) is reported only when no live step ran. A failure after a live step, or a crash, leaves the app unresolved until `recover` or `resolve` settles it.
+  - **Gates:** `layout.disruptiveGate` checks run once, immediately before the first live step, for deploy and rollback.
+  - **Migrations:** with `hooks.migrationsExclusive`, the `pendingMigrations` probe runs first and an exact zero skips the writer stop, backup and migrate.
+  - **Layout:** `layout migrate --to releases|legacy [--dry-run]` converts a host and back, refusing the reverse after a deploy and verifying the restored processes.
+  - **Status:** `on-host-status <run-id>` reports a run fail-closed (an accepted run with no terminal record is `unknown`).
+  
+  Apps that do not opt in keep the 0.32.0 behaviour, including byte-identical lock scripts.
+- `recover --on-host`, a controller-supplied `--run-id`, and an exact kit artifact identity (`ARTIFACT.json`, `artifact --json`)
+  `deploy-kit recover --on-host --parent-run <run-id> --request <id> --epoch <n> --not-after <unix> --expect-reservation <json>` runs only the interrupted-journal recovery as its own request kind (`recoverRelease`, ledger step `recover-interrupted`, class `live`). The host admits it only when the journal is `interrupted` and names the release the parent run deployed (`nothing-to-recover`, `journal-corrupt`, `recover-parent-mismatch` otherwise); an `app-unresolved` marker blocks every request except the recover whose parent is the run that left it, and a verified recovery archives that marker like `resolve` does while any other outcome leaves it in place. `deploy`, `rollback` and `recover --on-host` take `--run-id <id>`: the operator uses it instead of generating one and refuses (`ONHOST_RUN_EXISTS`) when that run dir already exists on the host. `scripts/install-artifact.sh <tarball>` installs the npm tarball globally and writes `ARTIFACT.json {name, version, sha256, installedAt}` into the package root; `deploy-kit artifact --json` prints it (or `source: "unpinned"` with a null sha256), and the operator records it as `meta.kitArtifact` and `terminal.json` carries it.
+- `hold set|clear`, `epoch set`, `request cancel` and a read-only `target-state --json` for the deploy controller
+  Each mutating command is one remote shell script run as a single process under `setsid`: it takes the app lock as a `kind: session` owner through the lock guard, refuses with `refused lock-held` instead of waiting, writes by temp file and rename, and releases the lock nonce-matched. `hold set|clear` manages `deploy-kit-<lockId>.hold.json`, `epoch set <n>` raises the `.last-epoch` fence and never lowers it, and `request cancel <requestId>` tombstones an unstarted request's reservation only when nothing accepted it or its run ended `aborted-clean` with `effectsClean: true` (otherwise `not-cancellable <reason>`, exit 3). `target-state --json` reads the live sha, journal class, hold, epoch, reservation and lock owners without taking a lock.
+
 ## 0.32.0
 
 - opt-in transition authority fences release-layout deploys and rollbacks and recovers durably from interrupted transitions
