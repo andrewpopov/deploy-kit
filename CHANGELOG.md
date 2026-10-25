@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.35.1
+
+- artifact identity is verified against the installed tarball bytes
+  `scripts/install-artifact.sh` keeps the installed tarball as `ARTIFACT.tgz` beside `ARTIFACT.json`. `readArtifact()` and `deploy-kit artifact --json` recompute its sha256 and report `verified: true` only when it equals `ARTIFACT.json`'s; a missing tarball or a hash mismatch gives `verified: false` with a `problem`. An unpinned kit is unchanged.
+- target-state reads the live sha by the host's physical layout, not the supplied config
+  `target-state --json` used to read the live sha through `current` whenever the supplied config said releases, so an unmigrated host (and a reversed one) had no readable sha. It now follows `physicalLayout`: `releases` reads the `current` release, `legacy` reads `git rev-parse HEAD` in `projectDir`, and `unknown` gives a null `liveSha` with a `liveProblem`.
+
 ## 0.35.0
 
 - deploy-kit epoch clear --reason drops the epoch fence

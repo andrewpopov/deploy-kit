@@ -38,7 +38,7 @@ const operator = () => require('./on-host/operator');
 
 
 const REMOTE_CALL_TIMEOUT_SECONDS = 30;
-const BASE_FRAMES = ['hold', 'lastEpoch', 'liveSha', 'unresolved', 'inflight', 'appLock', 'appOwner', 'layoutMarker', 'projectGit'];
+const BASE_FRAMES = ['hold', 'lastEpoch', 'liveSha', 'liveHead', 'unresolved', 'inflight', 'appLock', 'appOwner', 'layoutMarker', 'projectGit'];
 const REQUEST_ID_RE = /^[A-Za-z0-9_.-]+$/;
 const MAX_EPOCH_DIGITS = 15;
 
@@ -452,16 +452,18 @@ function capabilityLines(config) {
 function stateReadScript(config, requestId) {
   const files = stateFiles(config);
   const releases = isReleaseLayout(config);
+  const paths = releasePaths(config);
   const lines = [emitFile('hold', `"${files.hold}"`), emitFile('lastEpoch', `"${files.epoch}"`)];
+  // Both live-sha candidates are read whatever the config says; classifyLive picks by the PHYSICAL layout.
+  lines.push(
+    emitCommand('liveSha', `cd ${paths.currentLink} 2>/dev/null && git rev-parse HEAD 2>/dev/null`),
+    emitCommand('liveHead', `cd ${config.projectDir} 2>/dev/null && git rev-parse HEAD 2>/dev/null`),
+  );
   if (releases) {
-    const paths = releasePaths(config);
     lines.push(
-      emitCommand('liveSha', `cd ${paths.currentLink} 2>/dev/null && git rev-parse HEAD 2>/dev/null`),
       emitCommand('liveTarget', `readlink ${paths.currentLink} 2>/dev/null`),
       emitFile('journal', paths.stateFile),
     );
-  } else {
-    lines.push(emitCommand('liveSha', `cd ${config.projectDir} 2>/dev/null && git rev-parse HEAD 2>/dev/null`));
   }
   lines.push(emitFile('unresolved', `"${files.unresolved}"`), emitFile('inflight', `"${files.inflight}"`));
   lines.push(emitDir('appLock', `"${lockDir(config)}"`), emitFile('appOwner', `"${lockDir(config)}/owner"`));
@@ -534,8 +536,12 @@ function classifyLock(held, raw) {
   return { held: true, owner: parsed.record };
 }
 
-function classifyLive(records) {
-  const sha = records.liveSha === null ? null : records.liveSha.trim();
+// The live sha follows the host's PHYSICAL layout, never the supplied config: a releases host reads its `current`
+// release, a legacy host its checkout's HEAD, and a host that is neither has no readable sha.
+function classifyLive(records, physicalLayout) {
+  if (physicalLayout === 'unknown') return { sha: null, problem: 'the live sha could not be read: the host\'s physical layout is unknown' };
+  const raw = physicalLayout === 'releases' ? records.liveSha : records.liveHead;
+  const sha = raw === null ? null : raw.trim();
   if (sha !== null && !/^[0-9a-f]{40}$/.test(sha)) return { sha: null, problem: `${JSON.stringify(sha)} is not a full commit sha` };
   return { sha, ...(sha === null ? { problem: 'the live sha could not be read' } : {}) };
 }
@@ -577,10 +583,11 @@ function classifyPreflight(config, raw) {
 function classifyTargetState(config, { framed, requestId, now }) {
   const records = framed.records;
   const releases = isReleaseLayout(config);
-  const live = classifyLive(records);
+  const physicalLayout = classifyPhysicalLayout(records.layoutMarker, records.projectGit);
+  const live = classifyLive(records, physicalLayout);
   const state = {
     layout: releases ? 'releases' : 'legacy',
-    physicalLayout: classifyPhysicalLayout(records.layoutMarker, records.projectGit),
+    physicalLayout,
     liveSha: live.sha,
     ...(releases ? { liveTarget: records.liveTarget === null ? null : records.liveTarget.trim() } : {}),
     ...(live.problem ? { liveProblem: live.problem } : {}),

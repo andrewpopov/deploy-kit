@@ -4,7 +4,8 @@
 #   scripts/install-artifact.sh <deploy-kit-X.Y.Z.tgz>
 #
 # Computes the tarball's sha256, installs it globally, and writes ARTIFACT.json
-# {name, version, sha256, installedAt} into the installed package root (src/artifact.js reads it back).
+# {name, version, sha256, installedAt} and keeps a copy of the tarball as ARTIFACT.tgz in the installed package root
+# (src/artifact.js reads them back and verifies the one against the other).
 # Test seams, so a test never installs globally:
 #   DEPLOY_KIT_INSTALL_CMD   the install command, run as `$DEPLOY_KIT_INSTALL_CMD <tarball>` (default `npm i -g`)
 #   DEPLOY_KIT_PACKAGE_ROOT  the installed package root (default `$(npm root -g)/<name>`)
@@ -46,4 +47,6 @@ fi
 ARTIFACT_NAME=$name ARTIFACT_VERSION=$version ARTIFACT_SHA256=$sha256 ARTIFACT_AT=${DEPLOY_KIT_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)} \
   node -e "process.stdout.write(JSON.stringify({ name: process.env.ARTIFACT_NAME, version: process.env.ARTIFACT_VERSION, sha256: process.env.ARTIFACT_SHA256, installedAt: process.env.ARTIFACT_AT }, null, 2) + '\n')" \
   > "$root/ARTIFACT.json"
+# The bytes behind that sha256, so readArtifact can recompute it and prove ARTIFACT.json describes what is installed.
+cp "$tarball" "$root/ARTIFACT.tgz"
 echo "install-artifact: $name@$version sha256 $sha256 -> $root/ARTIFACT.json"

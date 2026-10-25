@@ -59,8 +59,16 @@ describe('scripts/install-artifact.sh', () => {
     expect(fs.readFileSync(path.join(tmp, 'installs.log'), 'utf8').trim()).toBe(tgz);
     // readArtifact reads back exactly what the script wrote
     expect(readArtifact({ root })).toEqual({
-      name: '@andrewpopov/deploy-kit', version: '0.33.0', sha256, installedAt: '2026-10-23T10:00:00Z', source: 'pinned',
+      name: '@andrewpopov/deploy-kit', version: '0.33.0', sha256, installedAt: '2026-10-23T10:00:00Z', source: 'pinned', verified: true,
     });
+  });
+
+  it('keeps the installed tarball as ARTIFACT.tgz, byte for byte', () => {
+    const tgz = makeTarball();
+    const root = path.join(tmp, 'global', 'kit');
+    const run = runScript([tgz], { DEPLOY_KIT_INSTALL_CMD: `sh ${fakeInstaller(root)}`, DEPLOY_KIT_PACKAGE_ROOT: root });
+    expect(run.status, run.stderr).toBe(0);
+    expect(fs.readFileSync(path.join(root, 'ARTIFACT.tgz')).equals(fs.readFileSync(tgz))).toBe(true);
   });
 
   it('two different tarballs of the same version have different identities', () => {
@@ -99,10 +107,39 @@ describe('readArtifact', () => {
     expect(readArtifact({ root: packageRoot() })).toEqual({ version: '0.33.0', sha256: null, source: 'unpinned' });
   });
 
-  it('reads the installed ARTIFACT.json', () => {
+  it('reads the installed ARTIFACT.json, unverified when there is no tarball to hash', () => {
     const root = packageRoot();
     fs.writeFileSync(path.join(root, 'ARTIFACT.json'), JSON.stringify({ name: 'n', version: '0.33.0', sha256: 'a'.repeat(64), installedAt: 'x' }));
-    expect(readArtifact({ root })).toEqual({ name: 'n', version: '0.33.0', sha256: 'a'.repeat(64), installedAt: 'x', source: 'pinned' });
+    expect(readArtifact({ root })).toEqual({
+      name: 'n', version: '0.33.0', sha256: 'a'.repeat(64), installedAt: 'x', source: 'pinned', verified: false, problem: 'ARTIFACT.tgz is missing',
+    });
+  });
+
+  describe('tarball verification', () => {
+    const install = () => {
+      const root = path.join(tmp, 'global', 'kit');
+      const run = runScript([makeTarball()], { DEPLOY_KIT_INSTALL_CMD: `sh ${fakeInstaller(root)}`, DEPLOY_KIT_PACKAGE_ROOT: root });
+      expect(run.status, run.stderr).toBe(0);
+      return root;
+    };
+
+    it('a matching tarball verifies', () => {
+      const artifact = readArtifact({ root: install() });
+      expect(artifact).toMatchObject({ source: 'pinned', verified: true });
+      expect(artifact).not.toHaveProperty('problem');
+    });
+
+    it('an altered tarball fails with a hash mismatch', () => {
+      const root = install();
+      fs.appendFileSync(path.join(root, 'ARTIFACT.tgz'), 'tampered');
+      expect(readArtifact({ root })).toMatchObject({ verified: false, problem: expect.stringMatching(/sha256 .* does not match/) });
+    });
+
+    it('a missing tarball fails', () => {
+      const root = install();
+      fs.rmSync(path.join(root, 'ARTIFACT.tgz'));
+      expect(readArtifact({ root })).toMatchObject({ verified: false, problem: 'ARTIFACT.tgz is missing' });
+    });
   });
 
   it.each([
