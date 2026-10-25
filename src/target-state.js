@@ -34,7 +34,7 @@ const { readRecord, validateReservation } = require('./on-host/status');
 
 
 const REMOTE_CALL_TIMEOUT_SECONDS = 30;
-const BASE_FRAMES = ['hold', 'lastEpoch', 'liveSha', 'appLock', 'appOwner'];
+const BASE_FRAMES = ['hold', 'lastEpoch', 'liveSha', 'unresolved', 'inflight', 'appLock', 'appOwner'];
 const REQUEST_ID_RE = /^[A-Za-z0-9_.-]+$/;
 const MAX_EPOCH_DIGITS = 15;
 
@@ -412,6 +412,7 @@ function stateReadScript(config, requestId) {
   } else {
     lines.push(emitCommand('liveSha', `cd ${config.projectDir} 2>/dev/null && git rev-parse HEAD 2>/dev/null`));
   }
+  lines.push(emitFile('unresolved', `"${files.unresolved}"`), emitFile('inflight', `"${files.inflight}"`));
   lines.push(emitDir('appLock', `"${lockDir(config)}"`), emitFile('appOwner', `"${lockDir(config)}/owner"`));
   if (config.hostLock) lines.push(emitDir('hostLock', `"${hostLockDir(config)}"`), emitFile('hostOwner', `"${hostLockDir(config)}/owner"`));
   if (requestId) lines.push(emitFile('reservation', `"${files.requests}/${requestId}.json"`));
@@ -453,6 +454,15 @@ function classifyHold(raw, now) {
   };
 }
 
+// An unresolved / in-flight marker that exists but cannot be read still blocks the app, so it is `corrupt`, never null.
+function classifyMarker(raw) {
+  if (raw === null || raw === undefined) return null;
+  const { record, error } = parseRecord(raw);
+  const valid = !error && isPlainObject(record) && ['requestId', 'runId', 'kind'].every((key) => typeof record[key] === 'string');
+  if (!valid) return { present: true, corrupt: true, requestId: null, runId: null, kind: null };
+  return { present: true, requestId: record.requestId, runId: record.runId, kind: record.kind };
+}
+
 function classifyEpoch(raw) {
   if (raw === null || raw === undefined) return { value: null };
   const text = raw.trim();
@@ -487,6 +497,8 @@ function classifyTargetState(config, { framed, requestId, now }) {
     journal: releases ? classifyJournal(records.journal) : { class: 'none', phase: null, releaseId: null },
     hold: classifyHold(records.hold, now),
     lastEpoch: null,
+    unresolved: classifyMarker(records.unresolved),
+    inflight: classifyMarker(records.inflight),
     locks: { app: classifyLock(records.appLock, records.appOwner) },
   };
   const epoch = classifyEpoch(records.lastEpoch);
