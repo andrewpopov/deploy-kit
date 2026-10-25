@@ -373,6 +373,136 @@ describeWithFlock('target-state (read-only)', () => {
   });
 });
 
+describeWithFlock('target-state capability facts (BRAIN-636)', () => {
+  const writeShim = (home: string, name: string, body: string) => {
+    const dir = join(home, 'caps-bin');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+    return { PATH: `${dir}:${process.env.PATH}` };
+  };
+  const readWith = (home: string, config: any, env: Record<string, string> = {}) => ts.readTargetState(config, { runtime: runtimeFor(home, env), now: fixedNow });
+  const withHostLock = (home: string) => {
+    const dir = join(home, 'hosts');
+    mkdirSync(dir);
+    return appConfig({ projectDir: join(home, 'nowhere'), hostLock: { dir, key: 'bigpi' } });
+  };
+
+  it.each([['yes', true], ['no', false]])('linger: loginctl says %s -> %s', (answer, expected) => {
+    const home = freshHome();
+    const env = writeShim(home, 'loginctl', `echo "Linger=${answer}"`);
+    const state = readWith(home, appConfig({ projectDir: join(home, 'nowhere') }), env);
+    expect(state.linger).toBe(expected);
+    expect(state.lingerProblem).toBeUndefined();
+  });
+
+  it('linger: an unreadable answer (loginctl fails, or is missing) is null with a problem, never false or true', () => {
+    const home = freshHome();
+    const config = appConfig({ projectDir: join(home, 'nowhere') });
+    const failing = readWith(home, config, writeShim(home, 'loginctl', 'exit 1'));
+    expect(failing).toMatchObject({ linger: null, lingerProblem: expect.stringMatching(/could not be read/) });
+    const garbage = readWith(home, config, writeShim(home, 'loginctl', 'echo "Linger=maybe"'));
+    expect(garbage.linger).toBeNull();
+  });
+
+  it('hostLockDir: null when no hostLock is configured', () => {
+    const home = freshHome();
+    expect(readWith(home, appConfig({ projectDir: join(home, 'nowhere') })).hostLockDir).toBeNull();
+  });
+
+  it('hostLockDir: present reports group, mode and whether this user can write it', () => {
+    const home = freshHome();
+    const config = withHostLock(home);
+    const dir = lock.hostLockDir(config);
+    mkdirSync(dir);
+    const env = writeShim(home, 'stat', 'echo "deploy 2770"');
+    expect(readWith(home, config, env).hostLockDir).toEqual({ path: dir, group: 'deploy', mode: '2770', writable: true });
+    execFileSync('chmod', ['555', dir]);
+    try {
+      const state = readWith(home, config, env).hostLockDir;
+      expect(state).toMatchObject({ path: dir, group: 'deploy', mode: '2770' });
+      if (process.getuid && process.getuid() !== 0) expect(state.writable).toBe(false);
+    } finally { execFileSync('chmod', ['755', dir]); }
+  });
+
+  it('hostLockDir: a missing directory, or a stat that cannot answer, is a problem with the path', () => {
+    const home = freshHome();
+    const config = withHostLock(home);
+    const dir = lock.hostLockDir(config);
+    expect(readWith(home, config).hostLockDir).toEqual({ path: dir, problem: expect.stringMatching(/does not exist/) });
+    mkdirSync(dir);
+    const env = writeShim(home, 'stat', 'exit 1');
+    expect(readWith(home, config, env).hostLockDir).toEqual({ path: dir, problem: expect.stringMatching(/could not be read/) });
+  });
+
+  // The framed reply for classifyTargetState, with only the capability records varying.
+  const framedWith = (records: Record<string, string | null>) => ({
+    framed: {
+      records: {
+        hold: null, lastEpoch: null, liveSha: null, unresolved: null, inflight: null, appLock: null, appOwner: null, ...records,
+      },
+    },
+    now: fixedNow,
+  });
+  const hexLines = (over: Record<string, string> = {}) => Object.entries({
+    DK_USER: 'dkapp', DK_UID: '1000', DK_LINGER: 'yes', DK_USER_MANAGER: 'yes', DK_NODE: '/usr/bin/node', DK_NODE_MAJOR: '24', DK_ACTIVE_UNITS: '0',
+    DK_SHELL: '/bin/bash', DK_GID: '1000', DK_GROUPS: '1000', DK_GROUP_NAMES: 'dkapp', DK_MANAGER_GROUPS: '1000', DK_UMASK: '0027', DK_OOM: '100',
+    DK_PATH: '/usr/bin', DK_HOME: '/srv/dkapp', DK_LOGNAME: 'dkapp', ENV_LANG: 'C', ENVABSENT_PM2_HOME: '1', DK_END: '1', ...over,
+  }).map(([k, v]) => `${k}=${Buffer.from(v, 'utf8').toString('hex')}`).join('\n');
+
+  it('preflight: a healthy host is {ok: true, problems: []}; a failing check is reported, not thrown', () => {
+    const config = appConfig();
+    expect(ts.classifyTargetState(config, framedWith({ preflight: hexLines() })).preflight).toEqual({ ok: true, problems: [] });
+    const noLinger = ts.classifyTargetState(config, framedWith({ preflight: hexLines({ DK_LINGER: 'no' }) })).preflight;
+    expect(noLinger.ok).toBe(false);
+    expect(noLinger.problems).toEqual([expect.stringMatching(/^ONHOST_NO_LINGER:/)]);
+  });
+
+  it('preflight: no output, or output that is not the preflight protocol, is a problem', () => {
+    const config = appConfig();
+    expect(ts.classifyTargetState(config, framedWith({ preflight: null })).preflight).toEqual({ ok: false, problems: [expect.stringMatching(/no output/)] });
+    expect(ts.classifyTargetState(config, framedWith({ preflight: 'garbage' })).preflight).toMatchObject({ ok: false, problems: [expect.stringMatching(/^ONHOST_PREFLIGHT:/)] });
+  });
+
+  it('preflight: the real script runs on this host and answers with a verdict, whatever tools are missing', () => {
+    const home = freshHome();
+    const state = readWith(home, appConfig({ projectDir: join(home, 'nowhere') }), writeShim(home, 'loginctl', 'echo Linger=no'));
+    expect(state.preflight.ok).toBe(false);
+    expect(state.preflight.problems).toHaveLength(1);
+  });
+
+  it('proofReadable: present, absent and unreadable evidence', () => {
+    const config = appConfig();
+    const proof = (records: Record<string, string | null>) => ts.classifyTargetState(config, framedWith(records)).proofReadable;
+    expect(proof({ proofCgroup: 'yes', proofSessions: 'yes' })).toEqual({ cgroup: true, procSessions: true });
+    expect(proof({ proofCgroup: 'yes', proofSessions: null })).toEqual({ cgroup: true, procSessions: false });
+    expect(proof({ proofCgroup: null, proofSessions: 'yes' })).toEqual({ cgroup: false, procSessions: true });
+    expect(proof({})).toEqual({ cgroup: false, procSessions: false });
+  });
+
+  it('proofReadable: the real probes answer booleans, and false where /proc and the cgroup tree do not exist', () => {
+    const home = freshHome();
+    const { proofReadable } = readWith(home, appConfig({ projectDir: join(home, 'nowhere') }));
+    expect(typeof proofReadable.cgroup).toBe('boolean');
+    expect(typeof proofReadable.procSessions).toBe('boolean');
+    if (!hasProc) expect(proofReadable).toEqual({ cgroup: false, procSessions: false });
+  });
+
+  it('takes no lock and writes nothing: the script has no lock or write step and the host is left as found', () => {
+    const home = freshHome();
+    const config = withHostLock(home);
+    mkdirSync(lock.hostLockDir(config));
+    const script = ts.stateReadScript(config);
+    expect(script).not.toMatch(/flock|mkdir|\brm\b|\bmv\b|\btouch\b|\bsync\b|setsid/);
+    const listing = () => execFileSync('find', [home, '-print'], { encoding: 'utf8' });
+    const before = listing();
+    readWith(home, config, writeShim(home, 'loginctl', 'echo Linger=yes'));
+    const after = listing();
+    expect(after.split('\n').filter((l: string) => !l.includes('caps-bin')).join('\n')).toBe(before.split('\n').filter((l: string) => !l.includes('caps-bin')).join('\n'));
+    expect(existsSync(dkPath(home, ''))).toBe(false);
+    expect(readdirSync(lock.hostLockDir(config))).toEqual([]);
+  });
+});
+
 describe('cli', () => {
   const run = (args: string[], config = appConfig(), runtime = runtimeFor(freshHome())) => {
     const errors: string[] = [];

@@ -31,6 +31,10 @@ const { isReleaseLayout, releasePaths } = require('./release');
 const { parseFramedReply } = require('./on-host/attach');
 const { isPlainObject, parseRecord } = require('./on-host/outcome');
 const { readRecord, validateReservation } = require('./on-host/status');
+const { PRODUCTION_ROOTS } = require('./lock-break');
+
+// operator.js pulls in host-run, which pulls in accept, which requires this file: load it on first use.
+const operator = () => require('./on-host/operator');
 
 
 const REMOTE_CALL_TIMEOUT_SECONDS = 30;
@@ -398,6 +402,26 @@ const emitFile = (name, file) => `printf 'DK_FILE %s\\n' ${name}; if [ -e ${file
 const emitDir = (name, dir) => `printf 'DK_FILE %s\\n' ${name}; if [ -d ${dir} ]; then printf 'DK_PRESENT\\n'; else printf 'DK_ABSENT\\n'; fi`;
 const emitCommand = (name, command) => `printf 'DK_FILE %s\\n' ${name}; if out=$(${command}) && [ -n "$out" ]; then printf '%s\\nDK_PRESENT\\n' "$out"; else printf 'DK_ABSENT\\n'; fi`;
 
+// Capability facts the deploy controller checks before it trusts this host. Every probe is a read and
+// a missing tool reports absent (never fails the script): the verdict is classified on this side.
+const HOST_LOCK_PROBE = (dir) => `if [ -d ${dir} ]; then if s=$(stat -c '%G %a' ${dir} 2>/dev/null); then if test -w ${dir}; then echo "ok $s w"; else echo "ok $s n"; fi; else echo unreadable; fi; fi`;
+const READS_CGROUP_PROBE = (base) => `[ -r ${base}/cgroup.events ] && find ${base} -maxdepth 1 >/dev/null 2>&1 && echo yes`;
+const READS_SESSIONS_PROBE = (proc) => `sed 's/^.*) //' ${proc}/1/stat 2>/dev/null | cut -d' ' -f4 | grep -Eq '^[0-9]+$' && echo yes`;
+
+function capabilityLines(config) {
+  const uid = '$(id -u)';
+  const cgroupBase = `"${PRODUCTION_ROOTS.cgroup}/user.slice/user-${uid}.slice/user@${uid}.service"`;
+  const lines = [
+    "u=${USER:-$(id -un)}",
+    emitCommand('linger', operator().LINGER_PROBE),
+    emitCommand('preflight', `sh -c ${shQuote(operator().preflightScript(config))}`),
+    emitCommand('proofCgroup', READS_CGROUP_PROBE(cgroupBase)),
+    emitCommand('proofSessions', READS_SESSIONS_PROBE(PRODUCTION_ROOTS.proc)),
+  ];
+  if (config.hostLock) lines.push(emitCommand('hostLockDir', HOST_LOCK_PROBE(`"${hostLockDir(config)}"`)));
+  return lines;
+}
+
 function stateReadScript(config, requestId) {
   const files = stateFiles(config);
   const releases = isReleaseLayout(config);
@@ -415,6 +439,7 @@ function stateReadScript(config, requestId) {
   lines.push(emitFile('unresolved', `"${files.unresolved}"`), emitFile('inflight', `"${files.inflight}"`));
   lines.push(emitDir('appLock', `"${lockDir(config)}"`), emitFile('appOwner', `"${lockDir(config)}/owner"`));
   if (config.hostLock) lines.push(emitDir('hostLock', `"${hostLockDir(config)}"`), emitFile('hostOwner', `"${hostLockDir(config)}/owner"`));
+  lines.push(...capabilityLines(config));
   if (requestId) lines.push(emitFile('reservation', `"${files.requests}/${requestId}.json"`));
   lines.push("printf 'DK_UNIT\\n'", "printf 'DK_END\\n'");
   return lines.join('\n');
@@ -484,6 +509,28 @@ function classifyLive(records) {
   return { sha, ...(sha === null ? { problem: 'the live sha could not be read' } : {}) };
 }
 
+// -> { linger, [lingerProblem] }: true/false from the preflight's probe, null when it could not say.
+function classifyLinger(raw) {
+  const answer = raw === null || raw === undefined ? '' : raw.trim();
+  if (answer === 'yes') return { linger: true };
+  if (answer === 'no') return { linger: false };
+  return { linger: null, lingerProblem: 'lingering could not be read (loginctl show-user -p Linger gave no yes or no)' };
+}
+
+function classifyHostLockDir(config, raw) {
+  if (!config.hostLock) return null;
+  const dir = hostLockDir(config);
+  if (raw === null || raw === undefined) return { path: dir, problem: 'the host lock directory does not exist' };
+  const match = /^ok (\S+) (\d+) ([wn])$/.exec(raw.trim());
+  if (!match) return { path: dir, problem: 'the host lock directory group and mode could not be read (stat -c)' };
+  return { path: dir, group: match[1], mode: match[2], writable: match[3] === 'w' };
+}
+
+function classifyPreflight(config, raw) {
+  if (raw === null || raw === undefined) return { ok: false, problems: ['the on-host preflight produced no output'] };
+  return operator().preflightVerdict(`${raw}\n`, config);
+}
+
 // Pure: the framed reply -> the state document.
 function classifyTargetState(config, { framed, requestId, now }) {
   const records = framed.records;
@@ -500,6 +547,10 @@ function classifyTargetState(config, { framed, requestId, now }) {
     unresolved: classifyMarker(records.unresolved),
     inflight: classifyMarker(records.inflight),
     locks: { app: classifyLock(records.appLock, records.appOwner) },
+    ...classifyLinger(records.linger),
+    hostLockDir: classifyHostLockDir(config, records.hostLockDir),
+    preflight: classifyPreflight(config, records.preflight),
+    proofReadable: { cgroup: records.proofCgroup === 'yes', procSessions: records.proofSessions === 'yes' },
   };
   const epoch = classifyEpoch(records.lastEpoch);
   state.lastEpoch = epoch.value;
@@ -586,5 +637,5 @@ function runCommand(command, args, config, { log, out = console.log, runtime, no
 
 module.exports = {
   setHold, clearHold, setEpoch, cancelRequest, resolveRequest, readTargetState, classifyJournal, classifyHold, classifyEpoch,
-  classifyTargetState, stateFiles, runCommand,
+  classifyTargetState, stateReadScript, stateFiles, runCommand,
 };

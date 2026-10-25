@@ -191,4 +191,4 @@ function breakLock(config, ctx, options, proofRoots) {
   throw new Error(`deploy-kit: could not run lock break on the target: ${detail.trim()}`);
 }
 
-module.exports = { breakLock, buildBreakScript, REFUSED_EXIT };
+module.exports = { breakLock, buildBreakScript, REFUSED_EXIT, PRODUCTION_ROOTS };
