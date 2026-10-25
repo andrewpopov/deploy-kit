@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.35.0
+
+- deploy-kit epoch clear --reason drops the epoch fence
+  An operator verb under the same locked session as `epoch set`. It removes `.last-epoch` only when the app has no in-flight or unresolved marker and its lock is free (exit 3 `refused epoch-clear ...` otherwise), archiving the old value and the reason to `$HOME/.deploy-kit/epoch-cleared/<ts>.json`.
+- target-state reports physicalLayout from the host
+  `target-state --json` adds `physicalLayout` (`releases`, `legacy` or `unknown`), read from the host's `.deploy-kit-layout` marker and git checkout whichever config was supplied. `layout` still echoes the config.
+- On-host runs re-check notAfter immediately before acceptance
+  A `preDeployChecks` command (or any other wait) that outlived `notAfter` no longer lets the run be accepted: the deadline is checked again right before `accepted.json` is written, and a late run is refused `late` with a `refused.json` and no acceptance.
+- target-state hostLockDir probes the provisioned parent, not the transient lock
+  `target-state --json` `hostLockDir` now reports the permanent `hostLock.dir` (group, mode, whether this user can create entries there) and whether the permanent `<key>.lock.guard` exists, as `{path, group, mode, writable, guard: {exists}}`. It used to probe `<key>.lock`, which is absent when idle and 0700 while held.
+
 ## 0.34.0
 
 - `target-state --json` now reports the capability facts the controller's deploy check needs
