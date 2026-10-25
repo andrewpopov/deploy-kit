@@ -123,6 +123,9 @@ const captureEnvNames = (config) => [...new Set([...OPTIONAL_CAPTURE_ENV, ...((c
 // The remote script speaks a line protocol of KEY=<hex> lines. EVERY value is hex-encoded before
 // it is printed, so no captured byte (a newline in an env value, say) can ever be read back as a
 // protocol line of its own. Absence is explicit: ENVABSENT_<name>=.
+// Shared with target-state's read-only `linger` probe: prints `yes` or `no`, empty when loginctl cannot say.
+const LINGER_PROBE = 'loginctl show-user "$u" -p Linger 2>/dev/null | cut -d= -f2';
+
 function preflightScript(config) {
   const unitPattern = `^deploy-kit-${lockId(config).replace(/\./g, '\\.')}-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}-[0-9a-f]{8}\\.service$`;
   return [
@@ -130,7 +133,7 @@ function preflightScript(config) {
     'u=${USER:-$(id -un)}; uid=$(id -u)',
     'XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$uid}; export XDG_RUNTIME_DIR',
     'dk_emit DK_USER "$u"; dk_emit DK_UID "$uid"',
-    'dk_emit DK_LINGER "$(loginctl show-user "$u" -p Linger 2>/dev/null | cut -d= -f2)"',
+    `dk_emit DK_LINGER "$(${LINGER_PROBE})"`,
     'if systemctl --user show-environment >/dev/null 2>&1; then dk_emit DK_USER_MANAGER yes; else dk_emit DK_USER_MANAGER no; fi',
     'node_bin=$(command -v node 2>/dev/null) || true',
     'dk_emit DK_NODE "$(readlink -f "$node_bin" 2>/dev/null)"',
@@ -252,6 +255,19 @@ function parsePreflight(output, config, log = defaultLog) {
   return {
     user, uid, home, shell, umask, oomScoreAdj, node, logname, path: pathValue, env, absentEnv,
   };
+}
+
+const SILENT_LOG = { warning() {} };
+
+// The preflight as a read-only verdict: parsePreflight's refusal, reported instead of thrown.
+function preflightVerdict(output, config) {
+  try {
+    parsePreflight(output, config, SILENT_LOG);
+    return { ok: true, problems: [] };
+  } catch (error) {
+    if (!(error instanceof OnHostError)) throw error;
+    return { ok: false, problems: [error.message] };
+  }
 }
 
 // ---- 3. bundle ----------------------------------------------------------------------
@@ -492,5 +508,5 @@ function onHostRecover(config, options, deps = {}) {
 }
 
 module.exports = {
-  onHostDeploy, onHostRollback, onHostRecover, validateOnHostRequest, requestMeta, preflightScript, parsePreflight, parseKeyValues, buildBundle, buildSubmitArgv, quoteArgv, newRunId, systemdEscape, jsYamlRoot,
+  onHostDeploy, onHostRollback, onHostRecover, validateOnHostRequest, requestMeta, preflightScript, parsePreflight, preflightVerdict, LINGER_PROBE, parseKeyValues, buildBundle, buildSubmitArgv, quoteArgv, newRunId, systemdEscape, jsYamlRoot,
 };
