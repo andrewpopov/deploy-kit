@@ -235,6 +235,13 @@ describeWithFlock('host-run request protocol: refusals', () => {
     expectRefused(runIdN(1), 'pre-check-failed', run);
   });
 
+  it('refuses `late` when a preDeployCheck outlives notAfter: the deadline is re-checked right before acceptance', () => {
+    t.config.preDeployChecks.push({ name: 'slow-feeders', command: 'slow-check' });
+    t.stage(runIdN(1), requestMeta({ notAfter: NOW_SEC + 300 }), { preDeployChecks: t.config.preDeployChecks });
+    const run = t.go(runIdN(1), { deps: { runCheck: () => { t.clock.advance(600); return { ok: true }; } } });
+    expectRefused(runIdN(1), 'late', run);
+  });
+
   it('an unexpected error before acceptance is a refusal (`gate-error`), never an acceptance', () => {
     fs.mkdirSync(t.dk('deploy-kit-' + lock.lockId(t.config) + '.hold.json'), { recursive: true }); // a directory where the hold file belongs
     t.stage(runIdN(1));

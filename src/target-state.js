@@ -25,9 +25,9 @@ const fs = require('fs');
 const path = require('path');
 const { runOnTarget, shQuote } = require('./exec');
 const {
-  lockDir, lockId, guardFile, ensureStateDir, guardPrelude, ownerWriter, ownerFields, hostLockDir,
+  lockDir, lockId, guardFile, ensureStateDir, guardPrelude, ownerWriter, ownerFields, hostLockDir, lockLocation,
 } = require('./lock');
-const { isReleaseLayout, releasePaths } = require('./release');
+const { isReleaseLayout, releasePaths, LAYOUT_VERSION } = require('./release');
 const { parseFramedReply } = require('./on-host/attach');
 const { isPlainObject, parseRecord } = require('./on-host/outcome');
 const { readRecord, validateReservation } = require('./on-host/status');
@@ -38,7 +38,7 @@ const operator = () => require('./on-host/operator');
 
 
 const REMOTE_CALL_TIMEOUT_SECONDS = 30;
-const BASE_FRAMES = ['hold', 'lastEpoch', 'liveSha', 'unresolved', 'inflight', 'appLock', 'appOwner'];
+const BASE_FRAMES = ['hold', 'lastEpoch', 'liveSha', 'unresolved', 'inflight', 'appLock', 'appOwner', 'layoutMarker', 'projectGit'];
 const REQUEST_ID_RE = /^[A-Za-z0-9_.-]+$/;
 const MAX_EPOCH_DIGITS = 15;
 
@@ -185,6 +185,30 @@ function setEpoch(config, value, { runtime, pauseFifo } = {}) {
     `  echo "epoch set ${text}"`,
   ].join('\n');
   return runSession(config, runtime, sessionScript(config, { purpose: 'epoch-set', body, pauseFifo }));
+}
+
+// The operator's way to drop the fence (a reinstalled controller restarts its counter). It refuses while this app
+// has an in-flight or unresolved marker, since the fence is what stops a stale request reaching a run that may have
+// changed production; a held app lock is the session's own lock-held refusal. The old value and the reason are
+// archived to $HOME/.deploy-kit/epoch-cleared/<ts>.json before .last-epoch is removed.
+function clearEpoch(config, reason, { now = new Date(), runtime, pauseFifo } = {}) {
+  if (typeof reason !== 'string' || reason.trim() === '') throw new Error('deploy-kit: epoch clear needs a non-empty --reason');
+  const files = stateFiles(config);
+  const at = now.toISOString();
+  const archiveDir = `${files.base}/epoch-cleared`;
+  const archive = `${archiveDir}/${at.replace(/[:.]/g, '')}.json`;
+  const body = [
+    `  if [ -e "${files.inflight}" ]; then echo "refused epoch-clear inflight"; return ${EXIT_REFUSED}; fi`,
+    `  if [ -e "${files.unresolved}" ]; then echo "refused epoch-clear unresolved"; return ${EXIT_REFUSED}; fi`,
+    `  if [ ! -e "${files.epoch}" ]; then echo "epoch already clear"; return 0; fi`,
+    `  cur=$(cat "${files.epoch}" 2>/dev/null)`,
+    '  case "$cur" in ""|*[!0-9]*) prev=null ;; *) prev=$cur ;; esac',
+    `  mkdir -p -m 700 "${archiveDir}" || return 2`,
+    atomicWrite(archive, `'{"epoch":%s,"reason":%s,"at":"%s"}\n' "$prev" ${shQuote(JSON.stringify(reason))} ${shQuote(at)}`),
+    `  rm -f "${files.epoch}" || return 2`,
+    '  echo "epoch cleared (was $prev)"',
+  ].join('\n');
+  return runSession(config, runtime, sessionScript(config, { purpose: 'epoch-clear', body, pauseFifo }));
 }
 
 // The validator the locked cancel script runs once, synchronously, as `node -e`. It parses and
@@ -404,7 +428,10 @@ const emitCommand = (name, command) => `printf 'DK_FILE %s\\n' ${name}; if out=$
 
 // Capability facts the deploy controller checks before it trusts this host. Every probe is a read and
 // a missing tool reports absent (never fails the script): the verdict is classified on this side.
-const HOST_LOCK_PROBE = (dir) => `if [ -d ${dir} ]; then if s=$(stat -c '%G %a' ${dir} 2>/dev/null); then if test -w ${dir}; then echo "ok $s w"; else echo "ok $s n"; fi; else echo unreadable; fi; fi`;
+// Probes the permanent provisioned parent (hostLock.dir), never the transient <key>.lock directory, which is
+// absent when idle and 0700 while held. `ok <group> <mode> <w|n> <g|-> `: w = this user can create entries
+// there, g = the permanent guard file exists.
+const HOST_LOCK_PROBE = (dir, guard) => `if [ -d ${dir} ]; then if s=$(stat -c '%G %a' ${dir} 2>/dev/null); then if test -w ${dir} && test -x ${dir}; then w=w; else w=n; fi; if [ -e ${guard} ]; then g=g; else g=-; fi; echo "ok $s $w $g"; else echo unreadable; fi; fi`;
 const READS_CGROUP_PROBE = (base) => `[ -r ${base}/cgroup.events ] && find ${base} -maxdepth 1 >/dev/null 2>&1 && echo yes`;
 const READS_SESSIONS_PROBE = (proc) => `sed 's/^.*) //' ${proc}/1/stat 2>/dev/null | cut -d' ' -f4 | grep -Eq '^[0-9]+$' && echo yes`;
 
@@ -418,7 +445,7 @@ function capabilityLines(config) {
     emitCommand('proofCgroup', READS_CGROUP_PROBE(cgroupBase)),
     emitCommand('proofSessions', READS_SESSIONS_PROBE(PRODUCTION_ROOTS.proc)),
   ];
-  if (config.hostLock) lines.push(emitCommand('hostLockDir', HOST_LOCK_PROBE(`"${hostLockDir(config)}"`)));
+  if (config.hostLock) lines.push(emitCommand('hostLockDir', HOST_LOCK_PROBE(`"${config.hostLock.dir}"`, `"${lockLocation(config, { scope: 'host' }).guard}"`)));
   return lines;
 }
 
@@ -439,6 +466,10 @@ function stateReadScript(config, requestId) {
   lines.push(emitFile('unresolved', `"${files.unresolved}"`), emitFile('inflight', `"${files.inflight}"`));
   lines.push(emitDir('appLock', `"${lockDir(config)}"`), emitFile('appOwner', `"${lockDir(config)}/owner"`));
   if (config.hostLock) lines.push(emitDir('hostLock', `"${hostLockDir(config)}"`), emitFile('hostOwner', `"${hostLockDir(config)}/owner"`));
+  lines.push(
+    emitFile('layoutMarker', `"${releasePaths(config).markerFile}"`),
+    emitCommand('projectGit', `[ -e "${config.projectDir}/.git" ] && echo yes`),
+  );
   lines.push(...capabilityLines(config));
   if (requestId) lines.push(emitFile('reservation', `"${files.requests}/${requestId}.json"`));
   lines.push("printf 'DK_UNIT\\n'", "printf 'DK_END\\n'");
@@ -519,11 +550,22 @@ function classifyLinger(raw) {
 
 function classifyHostLockDir(config, raw) {
   if (!config.hostLock) return null;
-  const dir = hostLockDir(config);
+  const dir = config.hostLock.dir;
   if (raw === null || raw === undefined) return { path: dir, problem: 'the host lock directory does not exist' };
-  const match = /^ok (\S+) (\d+) ([wn])$/.exec(raw.trim());
+  const match = /^ok (\S+) (\d+) ([wn]) ([g-])$/.exec(raw.trim());
   if (!match) return { path: dir, problem: 'the host lock directory group and mode could not be read (stat -c)' };
-  return { path: dir, group: match[1], mode: match[2], writable: match[3] === 'w' };
+  return {
+    path: dir, group: match[1], mode: match[2], writable: match[3] === 'w', guard: { exists: match[4] === 'g' },
+  };
+}
+
+// What the host IS, whatever the supplied config says: the layout marker (as release.js checks it) or a git checkout.
+function classifyPhysicalLayout(markerRaw, gitCheckout) {
+  const marker = parseRecord(markerRaw === null || markerRaw === undefined ? null : markerRaw);
+  if (!marker.error && !marker.absent && isPlainObject(marker.record)
+    && marker.record.layout === 'releases' && marker.record.version === LAYOUT_VERSION) return 'releases';
+  if (markerRaw) return 'unknown';
+  return gitCheckout === 'yes' ? 'legacy' : 'unknown';
 }
 
 function classifyPreflight(config, raw) {
@@ -538,6 +580,7 @@ function classifyTargetState(config, { framed, requestId, now }) {
   const live = classifyLive(records);
   const state = {
     layout: releases ? 'releases' : 'legacy',
+    physicalLayout: classifyPhysicalLayout(records.layoutMarker, records.projectGit),
     liveSha: live.sha,
     ...(releases ? { liveTarget: records.liveTarget === null ? null : records.liveTarget.trim() } : {}),
     ...(live.problem ? { liveProblem: live.problem } : {}),
@@ -578,7 +621,7 @@ function readTargetState(config, { requestId, runtime, now = new Date() } = {}) 
 
 const USAGE = {
   hold: 'Usage: deploy-kit hold set --reason <text> [--until <iso>] | deploy-kit hold clear',
-  epoch: 'Usage: deploy-kit epoch set <n>',
+  epoch: 'Usage: deploy-kit epoch set <n> | deploy-kit epoch clear --reason <text>',
   request: 'Usage: deploy-kit request cancel <requestId>',
   resolve: 'Usage: deploy-kit resolve --request <requestId> --reason <text>',
   'target-state': 'Usage: deploy-kit target-state --json [--request <id>]',
@@ -616,6 +659,11 @@ function runCommand(command, args, config, { log, out = console.log, runtime, no
     }
     if (command === 'hold' && sub === 'clear' && rest.length === 0) return report(clearHold(config, { runtime }));
     if (command === 'epoch' && sub === 'set' && rest.length === 1) return report(setEpoch(config, rest[0], { runtime }));
+    if (command === 'epoch' && sub === 'clear') {
+      const parsed = parseFlags(rest, ['--reason']);
+      if (!parsed || parsed.positional.length > 0 || !parsed.flags['--reason']) return usage();
+      return report(clearEpoch(config, parsed.flags['--reason'], { runtime, now }));
+    }
     if (command === 'request' && sub === 'cancel' && rest.length === 1) return report(cancelRequest(config, rest[0], { runtime, now }));
     if (command === 'resolve') {
       const parsed = parseFlags(args, ['--request', '--reason']);
@@ -636,6 +684,6 @@ function runCommand(command, args, config, { log, out = console.log, runtime, no
 }
 
 module.exports = {
-  setHold, clearHold, setEpoch, cancelRequest, resolveRequest, readTargetState, classifyJournal, classifyHold, classifyEpoch,
+  setHold, clearHold, setEpoch, clearEpoch, cancelRequest, resolveRequest, readTargetState, classifyJournal, classifyHold, classifyEpoch,
   classifyTargetState, stateReadScript, stateFiles, runCommand,
 };

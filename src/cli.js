@@ -269,6 +269,8 @@ Commands:
                                            write or remove the target's deploy hold (locked, as a session
                                            lock owner; refuses lock-held, never waits)
   epoch set <n>                            raise the target's epoch fence (refuses to lower it)
+  epoch clear --reason <text>              drop the fence, archiving the old value; exit 3 while an in-flight or
+                                           unresolved marker exists
   request cancel <requestId>               tombstone an unstarted deploy request; exit 3 not-cancellable <reason>
   resolve --request <requestId> --reason <text>
                                            clear the app's unresolved record after assessing production (locked, as

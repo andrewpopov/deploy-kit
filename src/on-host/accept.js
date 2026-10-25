@@ -354,6 +354,10 @@ function checkKind({ request, paths, git, files }) {
   return live;
 }
 
+function assertBeforeDeadline(request, nowSec) {
+  if (nowSec() >= request.notAfter) throw new Refusal('late', `notAfter ${request.notAfter}`);
+}
+
 function checkGates({ files, request, runId, paths, nowSec, deps }) {
   const git = deps.git || defaultGit;
   const epoch = readIfPresent(files.epoch);
@@ -365,7 +369,7 @@ function checkGates({ files, request, runId, paths, nowSec, deps }) {
   }
   const hold = classifyHold(readIfPresent(files.hold), deps.now());
   if (hold && (hold.corrupt || !hold.expired)) throw new Refusal('hold', hold.corrupt ? hold.problem : hold.reason);
-  if (nowSec() >= request.notAfter) throw new Refusal('late', `notAfter ${request.notAfter}`);
+  assertBeforeDeadline(request, nowSec);
   const plan = checkReservation({ files, request, runId });
   checkUnresolved(files, request, deps);
   const liveBefore = checkKind({ request, paths, git, files });
@@ -498,6 +502,7 @@ function runAccepted({ runDir, runId, request, config, options, deps }) {
     const { plan, liveBefore } = checkGates({ files, request, runId, paths, nowSec, deps });
     if (request.kind === 'deploy') runPreDeployChecks({ config, paths, deps });
     crashAt('after-gate');
+    assertBeforeDeadline(request, nowSec); // the checks above may have outlived notAfter (plan §4.1 step 5)
     // From accepted.json on, a bookkeeping failure is never dressed as a refusal.
     accept({
       files, runDir, runId, request, plan, liveBefore, deps, crashAt, onAccepted: () => { accepted = true; },

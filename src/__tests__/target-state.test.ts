@@ -90,6 +90,65 @@ describeWithFlock('hold set / clear', () => {
   });
 });
 
+describeWithFlock('epoch clear', () => {
+  const markerOf = (config: any, kind: 'unresolved' | 'inflight') => `deploy-kit-${lock.lockId(config)}.${kind}.json`;
+  const marker = { requestId: REQUEST_ID, runId: RUN_ID, kind: 'deploy', at: 'x' };
+  const archives = (home: string) => (exists(home, 'epoch-cleared') ? readdirSync(dkPath(home, 'epoch-cleared')) : []);
+
+  it('removes .last-epoch and archives the old value, the reason and the time', () => {
+    const home = freshHome();
+    const config = appConfig();
+    put(home, '.last-epoch', '7\n');
+    const result = ts.clearEpoch(config, 'controller reinstalled "fresh"', { now: fixedNow, runtime: runtimeFor(home) });
+    expect(result).toMatchObject({ outcome: 'ok', message: 'epoch cleared (was 7)' });
+    expect(exists(home, '.last-epoch')).toBe(false);
+    const files = archives(home);
+    expect(files).toHaveLength(1);
+    expect(readJson(home, `epoch-cleared/${files[0]}`)).toEqual({ epoch: 7, reason: 'controller reinstalled "fresh"', at: fixedNow.toISOString() });
+    expect(existsSync(lockPathFor(config, home))).toBe(false);
+  });
+
+  it('refuses while an in-flight marker exists, and changes nothing', () => {
+    const home = freshHome();
+    const config = appConfig();
+    put(home, '.last-epoch', '7');
+    put(home, markerOf(config, 'inflight'), marker);
+    expect(ts.clearEpoch(config, 'r', { runtime: runtimeFor(home) })).toEqual({ outcome: 'refused', message: 'refused epoch-clear inflight' });
+    expect(read(home, '.last-epoch')).toBe('7');
+    expect(archives(home)).toEqual([]);
+  });
+
+  it('refuses while an unresolved marker exists, and changes nothing', () => {
+    const home = freshHome();
+    const config = appConfig();
+    put(home, '.last-epoch', '7');
+    put(home, markerOf(config, 'unresolved'), marker);
+    expect(ts.clearEpoch(config, 'r', { runtime: runtimeFor(home) })).toEqual({ outcome: 'refused', message: 'refused epoch-clear unresolved' });
+    expect(read(home, '.last-epoch')).toBe('7');
+    expect(archives(home)).toEqual([]);
+  });
+
+  it('refuses lock-held while the app lock is held, and changes nothing', () => {
+    const home = freshHome();
+    const config = appConfig();
+    put(home, '.last-epoch', '7');
+    holdAppLock(config, home);
+    expect(ts.clearEpoch(config, 'r', { runtime: runtimeFor(home) }).outcome).toBe('lock-held');
+    expect(read(home, '.last-epoch')).toBe('7');
+    expect(archives(home)).toEqual([]);
+  });
+
+  it('with no .last-epoch there is nothing to clear and nothing is archived', () => {
+    const home = freshHome();
+    expect(ts.clearEpoch(appConfig(), 'r', { runtime: runtimeFor(home) })).toEqual({ outcome: 'ok', message: 'epoch already clear' });
+    expect(archives(home)).toEqual([]);
+  });
+
+  it('needs a non-empty reason before touching the target', () => {
+    expect(() => ts.clearEpoch(appConfig(), ' ', { runtime: runtimeFor(freshHome()) })).toThrow(/reason/);
+  });
+});
+
 describeWithFlock('epoch set', () => {
   const epochOf = (home: string) => read(home, '.last-epoch').trim();
 
@@ -409,29 +468,72 @@ describeWithFlock('target-state capability facts (BRAIN-636)', () => {
     expect(readWith(home, appConfig({ projectDir: join(home, 'nowhere') })).hostLockDir).toBeNull();
   });
 
-  it('hostLockDir: present reports group, mode and whether this user can write it', () => {
+  it('hostLockDir: probes the permanent provisioned parent, idle or held, with the guard file', () => {
     const home = freshHome();
     const config = withHostLock(home);
-    const dir = lock.hostLockDir(config);
-    mkdirSync(dir);
+    const parent = config.hostLock.dir;
     const env = writeShim(home, 'stat', 'echo "deploy 2770"');
-    expect(readWith(home, config, env).hostLockDir).toEqual({ path: dir, group: 'deploy', mode: '2770', writable: true });
-    execFileSync('chmod', ['555', dir]);
+    expect(readWith(home, config, env).hostLockDir).toEqual({
+      path: parent, group: 'deploy', mode: '2770', writable: true, guard: { exists: false },
+    });
+    writeFileSync(`${lock.hostLockDir(config)}.guard`, '');
+    expect(readWith(home, config, env).hostLockDir).toMatchObject({ writable: true, guard: { exists: true } });
+    mkdirSync(lock.hostLockDir(config), { mode: 0o700 }); // held: the transient dir is 0700 and must not be what is reported
+    expect(readWith(home, config, env).hostLockDir).toEqual({
+      path: parent, group: 'deploy', mode: '2770', writable: true, guard: { exists: true },
+    });
+    execFileSync('chmod', ['555', parent]);
     try {
       const state = readWith(home, config, env).hostLockDir;
-      expect(state).toMatchObject({ path: dir, group: 'deploy', mode: '2770' });
+      expect(state).toMatchObject({ path: parent, group: 'deploy', mode: '2770' });
       if (process.getuid && process.getuid() !== 0) expect(state.writable).toBe(false);
-    } finally { execFileSync('chmod', ['755', dir]); }
+    } finally { execFileSync('chmod', ['755', parent]); }
   });
 
-  it('hostLockDir: a missing directory, or a stat that cannot answer, is a problem with the path', () => {
+  it('hostLockDir: a missing parent, or a stat that cannot answer, is a problem with the path', () => {
     const home = freshHome();
     const config = withHostLock(home);
-    const dir = lock.hostLockDir(config);
-    expect(readWith(home, config).hostLockDir).toEqual({ path: dir, problem: expect.stringMatching(/does not exist/) });
-    mkdirSync(dir);
+    const parent = config.hostLock.dir;
     const env = writeShim(home, 'stat', 'exit 1');
-    expect(readWith(home, config, env).hostLockDir).toEqual({ path: dir, problem: expect.stringMatching(/could not be read/) });
+    expect(readWith(home, config, env).hostLockDir).toEqual({ path: parent, problem: expect.stringMatching(/could not be read/) });
+    execFileSync('rmdir', [parent]);
+    expect(readWith(home, config).hostLockDir).toEqual({ path: parent, problem: expect.stringMatching(/does not exist/) });
+  });
+
+  describe('physicalLayout', () => {
+    const marker = (root: string, body: string) => writeFileSync(join(root, '.deploy-kit-layout'), body);
+    const physical = (home: string, config: any) => readWith(home, config).physicalLayout;
+
+    it('a releases config against an unmigrated legacy host (a git checkout, no marker) reports legacy; layout stays the config', () => {
+      const home = freshHome();
+      const root = join(home, 'app');
+      repoWithCommit(root);
+      const config = appConfig({ projectDir: root, layout: { type: 'releases' } });
+      expect(physical(home, config)).toBe('legacy');
+      expect(readWith(home, config).layout).toBe('releases');
+      expect(physical(home, appConfig({ projectDir: root }))).toBe('legacy');
+    });
+
+    it('a parsing marker at the right version is releases, whichever config was supplied', () => {
+      const home = freshHome();
+      const root = join(home, 'app');
+      mkdirSync(root);
+      marker(root, '{"layout":"releases","version":1}');
+      expect(physical(home, appConfig({ projectDir: root }))).toBe('releases');
+      expect(physical(home, appConfig({ projectDir: root, layout: { type: 'releases' } }))).toBe('releases');
+    });
+
+    it('a marker at another version or unparseable, or neither marker nor checkout, is unknown', () => {
+      const home = freshHome();
+      const root = join(home, 'app');
+      mkdirSync(root);
+      const config = appConfig({ projectDir: root });
+      expect(physical(home, config)).toBe('unknown');
+      marker(root, '{"layout":"releases","version":99}');
+      expect(physical(home, config)).toBe('unknown');
+      marker(root, '{nope');
+      expect(physical(home, config)).toBe('unknown');
+    });
   });
 
   // The framed reply for classifyTargetState, with only the capability records varying.
@@ -517,6 +619,12 @@ describe('cli', () => {
     const runtime = runtimeFor(home);
     expect(run(['epoch', 'set', '5'], config, runtime)).toMatchObject({ code: 0, lines: ['epoch set 5'] });
     expect(run(['epoch', 'set', '4'], config, runtime).code).toBe(3);
+    put(home, `deploy-kit-${lock.lockId(config)}.inflight.json`, { requestId: REQUEST_ID, runId: RUN_ID, kind: 'deploy' });
+    expect(run(['epoch', 'clear', '--reason', 'x'], config, runtime)).toMatchObject({ code: 3, lines: ['refused epoch-clear inflight'] });
+    execFileSync('rm', [dkPath(home, `deploy-kit-${lock.lockId(config)}.inflight.json`)]);
+    expect(run(['epoch', 'clear', '--reason', 'x'], config, runtime).code).toBe(0);
+    expect(exists(home, '.last-epoch')).toBe(false);
+    run(['epoch', 'set', '5'], config, runtime);
     expect(run(['hold', 'set', '--reason', 'x', '--until', '2030-01-01T00:00:00Z'], config, runtime).code).toBe(0);
     expect(run(['hold', 'clear'], config, runtime).code).toBe(0);
     holdAppLock(config, home);
@@ -528,7 +636,7 @@ describe('cli', () => {
 
   it('usage errors exit 1 and never reach the target', () => {
     const throwing = { execFileSync: () => { throw new Error('should not run'); } };
-    for (const args of [['hold'], ['hold', 'set'], ['hold', 'set', '--reason'], ['hold', 'clear', 'x'], ['epoch', 'set'], ['epoch', 'bump', '1'],
+    for (const args of [['hold'], ['hold', 'set'], ['hold', 'set', '--reason'], ['hold', 'clear', 'x'], ['epoch', 'set'], ['epoch', 'bump', '1'], ['epoch', 'clear'], ['epoch', 'clear', '--reason'], ['epoch', 'clear', 'x'],
       ['request', 'cancel'], ['request', 'drop', 'a'], ['target-state'], ['target-state', '--json', 'extra']]) {
       expect(run(args, appConfig(), throwing).code, args.join(' ')).toBe(1);
     }
