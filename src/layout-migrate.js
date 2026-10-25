@@ -426,7 +426,10 @@ function verifyForward({ config, paths, run, ctx, facts, releaseId }) {
 function runningLegacyFailures({ config, paths, run, facts }) {
   const failures = [];
   const list = parsePm2List(run.read('pm2 jlist').out);
-  const canonicalRoot = run.read(`cd ${shQuote(paths.root)} && pwd -P`).out;
+  // A failed or empty probe is never evidence: two failed reads both return '' and would compare equal.
+  const rootProbe = run.read(`cd ${shQuote(paths.root)} && pwd -P`);
+  const canonicalRoot = rootProbe.ok && rootProbe.out ? rootProbe.out : null;
+  if (!canonicalRoot) return [`cannot resolve the legacy root ${paths.root} (pwd -P failed or printed nothing)`];
   config.appNames.forEach((name) => {
     const proc = (list || []).find((p) => p && p.name === name);
     const cwd = proc && (proc.pm_cwd || (proc.pm2_env && proc.pm2_env.pm_cwd));
@@ -437,8 +440,9 @@ function runningLegacyFailures({ config, paths, run, facts }) {
     // The recorded cwd is what pm2 was told; the live process's own cwd is what it is doing.
     if (!Number.isInteger(proc.pid) || proc.pid <= 0) failures.push(`PM2 process ${name} has no live pid (${proc.pid})`);
     else {
-      const actual = run.read(`readlink -f /proc/${proc.pid}/cwd`).out;
-      if (actual !== canonicalRoot) failures.push(`PM2 process ${name} (pid ${proc.pid}) is running from ${actual || '<unknown>'}, expected ${canonicalRoot}`);
+      const probe = run.read(`readlink -f /proc/${proc.pid}/cwd`);
+      const actual = probe.ok ? probe.out : '';
+      if (!actual || actual !== canonicalRoot) failures.push(`PM2 process ${name} (pid ${proc.pid}) is running from ${actual || '<unknown>'}, expected ${canonicalRoot}`);
     }
   });
   const shaCommand = config.layout.runningShaCommand;

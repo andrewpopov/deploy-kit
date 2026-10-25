@@ -365,6 +365,27 @@ describeOnPosix('layout migrate: reverse', () => {
     expect(result.failed).toMatch(/pid 4242\) is running from .*, expected/);
   });
 
+  it.each([
+    ['the process cwd read', 'readlink -f /proc/', /is running from <unknown>, expected/],
+    ['both the root and the process cwd reads', 'pwd -P', /cannot resolve the legacy root/],
+  ])('fails verification when %s fails: two failed reads never compare equal', (_label, failing, expected) => {
+    const f = fixture();
+    expect(migrateLayout(f.config, { to: 'releases' }, f.deps()).exitCode).toBe(0);
+    const base = f.runtime.execFileSync;
+    let restarted = false; // the probes fail only in verify, after the reverse restart (pwd -P is also a precondition)
+    f.runtime.execFileSync = (file: string, args: string[], opts: any) => {
+      const cmd = String(args[args.length - 1]);
+      if (cmd.includes('pm2 startOrRestart')) restarted = true;
+      if (restarted && (cmd.includes(failing) || (failing === 'pwd -P' && cmd.includes('readlink -f /proc/')))) {
+        throw Object.assign(new Error('probe failed'), { status: 1, stdout: '', stderr: 'no such file' });
+      }
+      return base(file, args, opts);
+    };
+    const { exitCode, result } = migrateLayout(f.config, { to: 'legacy' }, f.deps());
+    expect(exitCode).toBe(2);
+    expect(result.failed).toMatch(expected);
+  });
+
   it('fails verification when one of two apps (a dead worker behind a healthy API) is not online', () => {
     const f = fixture({ appNames: ['app', 'worker'] });
     const twoApps = (cwd: string) => `module.exports = { apps: [{ name: 'app', cwd: '${cwd}' }, { name: 'worker', cwd: '${cwd}' }] };\n`;
