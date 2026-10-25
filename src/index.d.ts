@@ -14,6 +14,9 @@ export interface DeployHooks {
    * base-10 integer = pending migrations. Exactly 0 skips `migrate`; anything
    * else runs it as usual. null = disabled. */
   pendingMigrations?: string | null;
+  /** Release layout only. true = nothing else migrates the database between the probe and the flip, so
+   * `pendingMigrations` runs first, read-only, before the writer stop; an exact 0 skips stop, backup and migrate. */
+  migrationsExclusive?: boolean;
   build?: string | null;
   restart?: string | null;
   /** Restore the pre-migration DB backup during release-layout recovery. Receives
@@ -40,6 +43,16 @@ export interface ReleaseLayout {
   /** Command that returns the SHA the live app reports; asserted == deployed SHA
    * after the flip so an old process answering 200 can't mask a failed activation. */
   runningShaCommand?: string;
+  /** Read-only checks polled until all pass, immediately before the first live step. */
+  disruptiveGate?: DisruptiveGate;
+}
+
+export interface DisruptiveGate {
+  checks: PreDeployCheck[];
+  /** Seconds between polls. Default 60. */
+  pollSeconds?: number;
+  /** Longest wait (also bounded by the request's notAfter). Default 900. */
+  maxWaitSeconds?: number;
 }
 
 export interface PreDeployCheck {

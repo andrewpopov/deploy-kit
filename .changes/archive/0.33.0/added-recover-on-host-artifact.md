@@ -1,0 +1,6 @@
+---
+kind: added
+summary: `recover --on-host`, a controller-supplied `--run-id`, and an exact kit artifact identity (`ARTIFACT.json`, `artifact --json`)
+---
+
+`deploy-kit recover --on-host --parent-run <run-id> --request <id> --epoch <n> --not-after <unix> --expect-reservation <json>` runs only the interrupted-journal recovery as its own request kind (`recoverRelease`, ledger step `recover-interrupted`, class `live`). The host admits it only when the journal is `interrupted` and names the release the parent run deployed (`nothing-to-recover`, `journal-corrupt`, `recover-parent-mismatch` otherwise); an `app-unresolved` marker blocks every request except the recover whose parent is the run that left it, and a verified recovery archives that marker like `resolve` does while any other outcome leaves it in place. `deploy`, `rollback` and `recover --on-host` take `--run-id <id>`: the operator uses it instead of generating one and refuses (`ONHOST_RUN_EXISTS`) when that run dir already exists on the host. `scripts/install-artifact.sh <tarball>` installs the npm tarball globally and writes `ARTIFACT.json {name, version, sha256, installedAt}` into the package root; `deploy-kit artifact --json` prints it (or `source: "unpinned"` with a null sha256), and the operator records it as `meta.kitArtifact` and `terminal.json` carries it.

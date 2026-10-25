@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { log: defaultLog } = require('./log');
 const { verifiedRefProblems } = require('./verified-ref');
+const { DECLARABLE_CLASSES, USER_HOOK_STEPS } = require('./effects');
 
 const CONFIG_FILENAME = '.deploy-kit.config.json';
 
@@ -87,7 +88,12 @@ const DEFAULT_CONFIG = {
   localShell: null,
   // `deploy --on-host` (PKG-187): { env: [NAMES] } -- extra environment variable
   // names captured from the target's ssh environment and forwarded to host-run.
+  // `required: true` (BRAIN-636) opts the app out of automatic lock takeover: a
+  // held lock is only ever removed by an evidence-checked `lock break`.
   onHost: null,
+  // `{ dir, key }` (BRAIN-636 D2): a lock shared by every app on one host, at
+  // `<dir>/<key>.lock` (+ `.guard`). Owned-lock acquisition takes it before the app lock.
+  hostLock: null,
   // Build before the backup/stop/migrate block (apps stay up during build) so the
   // paused window is just migration. Default false = build after migrate (paused).
   buildBeforeMigrate: false,
@@ -124,6 +130,13 @@ const DEFAULT_CONFIG = {
   //     runningShaCommand: 'curl -s localhost:PORT/health | jq -r .buildSha',
   //                                       // returns the SHA the live app reports;
   //                                       // asserted == the deployed SHA post-flip.
+  //     effects: { build: 'candidate' },  // hook/step name -> 'candidate' | 'read-only' | 'live'
+  //                                       // (BRAIN-636 D4d). A user hook not declared is 'live',
+  //                                       // which stops a failed deploy being a clean abort.
+  //     disruptiveGate: { checks: [{ name, command }], pollSeconds: 60, maxWaitSeconds: 900 },
+  //                                       // read-only checks (like preDeployChecks) polled until all pass
+  //                                       // immediately before the FIRST live step (BRAIN-636 D4c). On
+  //                                       // timeout the deploy aborts (aborted-clean if nothing live ran).
   //   }
   layout: null,
   // Fleet monitoring + alerting (SMH-116). null (default) = disabled (no-op), so
@@ -197,6 +210,10 @@ const DEFAULT_CONFIG = {
     // output) is "unknown" and runs `migrate` exactly as if this hook were
     // absent. See README "Skipping a no-op migration". null = disabled.
     pendingMigrations: null,
+    // true = nothing else migrates this database between the probe and the flip (BRAIN-636 D7), so
+    // `pendingMigrations` runs FIRST, read-only, with the writers up: an exact 0 skips the writer
+    // stop, the backup and migrate, and recovery is code-only. See README "Skipping a no-op migration".
+    migrationsExclusive: false,
     build: null, // e.g. 'npm run build'. null = skip.
     // Override the app (re)start command. null → the ecosystemFile-aware
     // start-or-restart idiom (see pm2StartOrRestart). Set this only when a repo
@@ -244,6 +261,7 @@ const KEY_TYPES = {
   lock: 'boolean',
   localShell: 'string?',
   onHost: 'object?',
+  hostLock: 'object?',
   buildBeforeMigrate: 'boolean',
   verifyPins: 'boolean',
   requireVerifiedRef: 'string?',
@@ -351,6 +369,7 @@ const HOOKS_TYPES = {
   backup: 'string?',
   migrate: 'string?',
   pendingMigrations: 'string?',
+  migrationsExclusive: 'boolean',
   build: 'string?',
   restart: 'string?',
   restore: 'string?',
@@ -551,7 +570,7 @@ function validateMonitor(m, source) {
 
 // Keys allowed inside a `layout` block, with their validators. Absence of most is
 // fine (deploy normalizes defaults); `type` is the only required key.
-const LAYOUT_KEYS = ['type', 'keepReleases', 'sharedPaths', 'releaseChecks', 'runningShaCommand'];
+const LAYOUT_KEYS = ['type', 'keepReleases', 'sharedPaths', 'releaseChecks', 'runningShaCommand', 'legacyEcosystemFile', 'effects', 'disruptiveGate'];
 
 // Names the on-host runner sets itself (or that would let a config redirect the
 // unit's identity or runtime); they can never be forwarded via `onHost.env`.
@@ -561,7 +580,10 @@ const ON_HOST_FORBIDDEN_ENV = [
 const ON_HOST_ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
 
 function validateOnHost(onHost, source) {
-  const problems = rejectUnknownKeys(onHost, ['env'], source, 'onHost');
+  const problems = rejectUnknownKeys(onHost, ['env', 'required'], source, 'onHost');
+  if ('required' in onHost && typeof onHost.required !== 'boolean') {
+    problems.push(`${source}: "onHost.required" must be a boolean`);
+  }
   if (!('env' in onHost)) return problems;
   if (!Array.isArray(onHost.env)) {
     problems.push(`${source}: "onHost.env" must be an array of environment variable names`);
@@ -572,6 +594,38 @@ function validateOnHost(onHost, source) {
       problems.push(`${source}: "onHost.env" entry ${JSON.stringify(name)} must match ${ON_HOST_ENV_NAME_RE}`);
     } else if (ON_HOST_FORBIDDEN_ENV.includes(name)) {
       problems.push(`${source}: "onHost.env" must not include "${name}" (set by deploy-kit itself)`);
+    }
+  }
+  return problems;
+}
+
+// `dir` is interpolated into target shell, so it is an absolute path of safe
+// characters with no ".." segment; `key` is one safe filename token.
+const HOST_LOCK_DIR_RE = /^\/[A-Za-z0-9_./-]*$/;
+const HOST_LOCK_KEY_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
+
+function validateHostLock(hostLock, source) {
+  const problems = rejectUnknownKeys(hostLock, ['dir', 'key'], source, 'hostLock');
+  if (typeof hostLock.dir !== 'string' || !HOST_LOCK_DIR_RE.test(hostLock.dir) || hostLock.dir.split('/').includes('..')) {
+    problems.push(`${source}: "hostLock.dir" must be an absolute path (letters, digits, ".", "_", "-", "/"; no "..")`);
+  }
+  if (typeof hostLock.key !== 'string' || !HOST_LOCK_KEY_RE.test(hostLock.key)) {
+    problems.push(`${source}: "hostLock.key" must match ${HOST_LOCK_KEY_RE}`);
+  }
+  return problems;
+}
+
+function validateDisruptiveGate(gate, source) {
+  if (typeof gate !== 'object' || Array.isArray(gate)) return [`${source}: "layout.disruptiveGate" must be an object`];
+  const problems = rejectUnknownKeys(gate, ['checks', 'pollSeconds', 'maxWaitSeconds'], source, 'layout.disruptiveGate');
+  if (!Array.isArray(gate.checks) || gate.checks.length === 0) {
+    problems.push(`${source}: "layout.disruptiveGate.checks" must be a non-empty array`);
+  } else {
+    problems.push(...validateDeployChecks(gate.checks, 'layout.disruptiveGate.checks', source));
+  }
+  for (const key of ['pollSeconds', 'maxWaitSeconds']) {
+    if (gate[key] != null && !(typeof gate[key] === 'number' && Number.isFinite(gate[key]) && gate[key] > 0)) {
+      problems.push(`${source}: "layout.disruptiveGate.${key}" must be a positive number`);
     }
   }
   return problems;
@@ -595,6 +649,26 @@ function validateLayout(layout, source) {
   if (layout.runningShaCommand != null && typeof layout.runningShaCommand !== 'string') {
     problems.push(`${source}: "layout.runningShaCommand" must be a string`);
   }
+  if (layout.legacyEcosystemFile != null) {
+    const f = layout.legacyEcosystemFile;
+    if (typeof f !== 'string' || !/^[A-Za-z0-9_.-]+(\/[A-Za-z0-9_.-]+)*$/.test(f) || f.split('/').includes('..')) {
+      problems.push(`${source}: "layout.legacyEcosystemFile" must be a relative path of plain segments (no "..")`);
+    }
+  }
+  if (layout.effects != null) {
+    if (typeof layout.effects !== 'object' || Array.isArray(layout.effects)) {
+      problems.push(`${source}: "layout.effects" must be an object of step name -> class`);
+    } else {
+      for (const [step, cls] of Object.entries(layout.effects)) {
+        if (!USER_HOOK_STEPS.includes(step)) {
+          problems.push(`${source}: "layout.effects.${step}" is not a declarable step (one of ${USER_HOOK_STEPS.join(', ')}; every other step has a fixed class)`);
+        } else if (!DECLARABLE_CLASSES.includes(cls)) {
+          problems.push(`${source}: "layout.effects.${step}" must be one of ${DECLARABLE_CLASSES.join(', ')}`);
+        }
+      }
+    }
+  }
+  if (layout.disruptiveGate != null) problems.push(...validateDisruptiveGate(layout.disruptiveGate, source));
   if (layout.releaseChecks != null) {
     if (!Array.isArray(layout.releaseChecks)) {
       problems.push(`${source}: "layout.releaseChecks" must be an array`);
@@ -748,6 +822,9 @@ function validateConfig(raw, { source = 'config' } = {}) {
   }
   if (raw.onHost != null && typeof raw.onHost === 'object' && !Array.isArray(raw.onHost)) {
     problems.push(...validateOnHost(raw.onHost, source));
+  }
+  if (raw.hostLock != null && typeof raw.hostLock === 'object' && !Array.isArray(raw.hostLock)) {
+    problems.push(...validateHostLock(raw.hostLock, source));
   }
   if (raw.deliveryEvent != null && typeof raw.deliveryEvent === 'object' && !Array.isArray(raw.deliveryEvent)) {
     problems.push(...validateDeliveryEvent(raw.deliveryEvent, source));

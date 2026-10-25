@@ -20,6 +20,8 @@ const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const kit = require('../index.js') as typeof import('../index');
 const { loadConfig } = kit;
 
+// (Since BRAIN-636 the old pipeline is wired to the v0.32.0 lock module instead -- see `oldLock` below; the
+// paragraph below still describes exec.js and the v0.9.4-era lock rewrite.)
 // Load a source file AS IT WAS AT TAG `tag`, wired to the CURRENT exec/lock/log
 // modules, and to `overrides` for its other in-package requires (used to wire
 // release.js's old deploy.js dependency, and deploy.js's old release.js
@@ -59,9 +61,12 @@ const lock = require('../lock.js');
 const log = require('../log.js');
 
 const TAG = 'v0.9.4';
-const oldRelease = loadAtTag('release.js', TAG, { './exec': exec, './lock': lock, './log': log });
+// The last release before the BRAIN-636 lock work: the old pipeline takes its locks through THIS module, so a
+// change to the lock scripts that a non-opted consumer would see now surfaces as a command mismatch here.
+const oldLock = loadAtTag('lock.js', 'v0.32.0', { './exec': exec });
+const oldRelease = loadAtTag('release.js', TAG, { './exec': exec, './lock': oldLock, './log': log });
 const oldDeploy = loadAtTag('deploy.js', TAG, {
-  './exec': exec, './lock': lock, './log': log, './release': oldRelease,
+  './exec': exec, './lock': oldLock, './log': log, './release': oldRelease,
 });
 // v0.9.4's release.js resolves the peer deploy.js via `require('./deploy')` only
 // indirectly (it doesn't) — release.js has no back-reference to deploy.js, so no

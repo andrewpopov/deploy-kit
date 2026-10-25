@@ -17,12 +17,14 @@ const { DEFAULT_GUARD_CONFIG, loadGuardConfig } = require('./guard-config');
 const { verifyTunnelConfig } = require('./tunnel-config-guard');
 const { verifyNoSecrets } = require('./secret-file-guard');
 const { assertShaOptions } = require('./sha-options');
+const { markPlanningRuntime } = require('./lock');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
   '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
   '--dir', '--json', '--local', '--branch', '--no-auto-cut', '--guard-config', '--sha', '--on-host',
+  '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--to', '--run-id', '--parent-run',
 ];
 
 // Flags that take a following positional value. Kept in sync with the arity
@@ -32,7 +34,7 @@ const KNOWN_FLAGS = [
 // a used flag; parseOptions consumes it as --service's value).
 const VALUE_FLAGS = new Set([
   '--lines', '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env', '--dir', '--branch',
-  '--guard-config', '--sha',
+  '--guard-config', '--sha', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--to', '--run-id', '--parent-run',
 ]);
 
 // The set of flags each command actually reads. KNOWN_FLAGS above is only
@@ -50,8 +52,9 @@ const COMMAND_FLAGS = {
   'verify-tunnel-config': ['--dir', '--guard-config', '--json'],
   'verify-no-secrets': ['--dir', '--guard-config', '--json'],
   'clear-pending-release': ['--dir', '--json'],
-  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut', '--sha', '--on-host'],
-  rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock'],
+  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut', '--sha', '--on-host', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--run-id'],
+  rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock', '--on-host', '--to', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--run-id'],
+  recover: ['--on-host', '--parent-run', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--run-id'],
   monitor: ['--steal-lock', '--no-lock', '--local'],
   status: [],
   health: [],
@@ -98,6 +101,12 @@ function validateCommandFlags(command, args) {
   return `${command} does not support: ${bad.join(', ')}\n${command} supports: ${list}${hint}`;
 }
 
+// On-host request flags (BRAIN-636 D4a): raw strings here, validated by on-host/operator.js.
+const REQUEST_FLAGS = {
+  '--kind': 'kind', '--request': 'request', '--epoch': 'epoch', '--not-after': 'notAfter', '--expect-reservation': 'expectReservation',
+  '--run-id': 'runId', '--parent-run': 'parentRun',
+};
+
 const PORT_RE = /^[0-9]+$/;
 
 // Reject anything we do not recognise. Silently ignoring an unknown flag is
@@ -105,6 +114,20 @@ const PORT_RE = /^[0-9]+$/;
 // a typo'd `--dry-rn`, or `--dry-run` passed to a version that predates it,
 // would otherwise run a FULL PRODUCTION DEPLOY while the operator believes
 // nothing will happen. That happened on 2026-07-10 (BWK-136).
+// `lock break` flags: --nonce and --reason take a value; --host and --legacy-owner-gone
+// are switches. Returns null on anything else (unknown flag, missing value or nonce/reason).
+function parseLockBreakArgs(args) {
+  const out = { host: false, legacyOwnerGone: false };
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i];
+    if (a === '--host') out.host = true;
+    else if (a === '--legacy-owner-gone') out.legacyOwnerGone = true;
+    else if ((a === '--nonce' || a === '--reason') && i + 1 < args.length) { out[a.slice(2)] = args[i + 1]; i += 1; }
+    else return null;
+  }
+  return out.nonce && out.reason ? out : null;
+}
+
 function parseOptions(args) {
   const options = { lines: 50 };
   for (let i = 0; i < args.length; i += 1) {
@@ -136,6 +159,8 @@ function parseOptions(args) {
       options.sha = args[i + 1];
       i += 1;
     }
+    else if (a === '--to' && args[i + 1]) { options.to = args[i + 1]; i += 1; }
+    else if (REQUEST_FLAGS[a] && args[i + 1]) { options[REQUEST_FLAGS[a]] = args[i + 1]; i += 1; }
     else if (a === '--guard-config' && args[i + 1]) { options.guardConfig = args[i + 1]; i += 1; }
     else if (a === '--json') { options.json = true; }
     else if (a === '--local') { options.local = true; }
@@ -168,6 +193,15 @@ Commands:
                                             deploy-kit.guards.json (default)
   verify-no-secrets [--dir <path>]         fail when a configured secret-shaped
     [--guard-config <path>] [--json]       filename is tracked or unignored
+  lock inspect [--json]                    print the app lock's owner record and guard
+                                            state (read-only; never mutates)
+  lock break --nonce <N> --reason <text>   operator-only: remove a held lock after proving
+    [--host] [--legacy-owner-gone]         its owner is gone (see README). Exit 0 broken,
+                                            3 refused
+  layout migrate --to releases|legacy     convert the host between the legacy checkout and the
+    [--dry-run]                            release layout, under both locks, with a step journal.
+                                            Moves, never copies. Exit 0 verified, 3 refused,
+                                            2 failed (journal kept; a rerun refuses)
   clear-pending-release [--dir <path>]     discard the crash-recovery pointer
     [--json]                               auto-cut writes to
                                             .deploy-kit/pending-release.json, so the
@@ -228,11 +262,33 @@ Commands:
                                             succeeded, 1 failed/refused, 70 outcome unknown, 75
                                             transport lost or submission unacknowledged (do NOT
                                             redeploy; attach). See README "On-host deploys".
+  on-host-status <run-id> [--request <id>] --json
+                                           read-only: classify an --on-host run on the host (absent|staged|
+                                           claimed|refused|accepted-running|terminal|unknown); exit 75 = transport lost
+  hold set --reason <text> [--until <iso>] | hold clear
+                                           write or remove the target's deploy hold (locked, as a session
+                                           lock owner; refuses lock-held, never waits)
+  epoch set <n>                            raise the target's epoch fence (refuses to lower it)
+  request cancel <requestId>               tombstone an unstarted deploy request; exit 3 not-cancellable <reason>
+  resolve --request <requestId> --reason <text>
+                                           clear the app's unresolved record after assessing production (locked, as
+                                           a session lock owner); exit 3 not-unresolved / request-mismatch
+  target-state --json [--request <id>]     read-only: live sha, journal class, hold, epoch, reservation, lock owners
   attach <run-id>                          follow an --on-host run from the local receipts file
                                             (~/.deploy-kit/on-host-runs.jsonl); same exit codes
   rollback [--skip-build|--skip-deps] [--dry-run] [--steal-lock] [--no-lock]
                                             (NOT --skip-migrate or --no-stash — rollback
                                             never reads them)
+  rollback --on-host --to <40-hex> --request <id> --epoch <n> --not-after <unix> --expect-reservation <json>
+                                            the controller-driven rollback: refuses unless previous is the --to
+                                            release and the current release never migrated
+  recover --on-host --parent-run <run-id> --request <id> --epoch <n> --not-after <unix> --expect-reservation <json>
+                                            settle the interrupted deploy <run-id> left: runs ONLY the journal
+                                            recovery; refuses unless the journal is interrupted and names that
+                                            run's release. deploy, rollback and recover also take --run-id <id>
+                                            (the controller's run id; refused if that run dir exists on the host)
+  artifact --json                          print the installed kit's identity (version + tarball sha256 from
+                                            ARTIFACT.json, or source "unpinned")
   monitor [--steal-lock] [--no-lock]       run fleet checks + alert on transitions (cron)
     [--local]                               force mode:'local' for this run — every check
                                             and the alert sink execute on this machine, no
@@ -315,13 +371,13 @@ function dryRunContext(config, options = {}) {
   };
   return {
     sleep: () => {},
-    runtime: {
+    runtime: markPlanningRuntime({
       dryRun: true,
       execFileSync: executePlan,
       // runOnTarget normally sends readOnly dry-run probes through this seam.
       // Point it at the same planner so even preflight cannot contact the host.
       realExecFileSync: executePlan,
-    },
+    }),
   };
 }
 
@@ -385,6 +441,22 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     return 1;
   }
 
+  // artifact: the installed kit's identity (BRAIN-636 D8). No config, no banner: stdout is only the JSON.
+  if (command === 'artifact') {
+    const rest = argv.slice(1);
+    if (rest.length !== 1 || rest[0] !== '--json') {
+      log.error('Usage: deploy-kit artifact --json');
+      return 1;
+    }
+    try {
+      console.log(JSON.stringify(require('./artifact').readArtifact(), null, 2));
+      return 0;
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
+  }
+
   // host-run takes a positional <runDir>, like port-guard, and is invoked only by
   // the on-host systemd unit: no config load, no banner, no flags.
   if (command === 'host-run') {
@@ -411,6 +483,104 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
       return 1;
     }
     return require('./on-host/attach').attachRun(rest[0], attachConfig);
+  }
+
+  // on-host-status takes a positional <run-id> like attach; read-only, always prints JSON.
+  if (command === 'on-host-status') {
+    const rest = argv.slice(1);
+    const positional = [];
+    let requestId;
+    let usage = false;
+    for (let i = 0; i < rest.length; i += 1) {
+      if (rest[i] === '--json') continue;
+      if (rest[i] === '--request') {
+        i += 1;
+        requestId = rest[i];
+        if (requestId === undefined || requestId.startsWith('-')) usage = true;
+      } else if (rest[i].startsWith('-')) usage = true;
+      else positional.push(rest[i]);
+    }
+    if (usage || positional.length !== 1) {
+      log.error('Usage: deploy-kit on-host-status <run-id> [--request <id>] --json');
+      return 1;
+    }
+    try {
+      const status = require('./on-host/status').onHostStatus(loadConfig({ cwd }), positional[0], { requestId });
+      console.log(JSON.stringify(status, null, 2));
+      return status.transport === 'lost' ? 75 : 0;
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
+  }
+
+  // lock takes a positional subcommand, so it is dispatched before parseOptions
+  // like attach. `inspect` is read-only; `break` is the operator-only removal that
+  // first proves the owner is gone (exit 0 broken, 3 refused, 1 usage or failure).
+  if (command === 'lock') {
+    const rest = argv.slice(1);
+    const lockUsage = 'Usage: deploy-kit lock inspect [--json] | deploy-kit lock break --nonce <N> --reason <text> [--host] [--legacy-owner-gone]';
+    if (rest[0] === 'break') {
+      const parsed = parseLockBreakArgs(rest.slice(1));
+      if (!parsed) {
+        log.error(lockUsage);
+        return 1;
+      }
+      try {
+        const result = require('./lock-break').breakLock(loadConfig({ cwd }), {}, parsed);
+        console.log(result.output);
+        return result.broken ? 0 : require('./lock-break').REFUSED_EXIT;
+      } catch (error) {
+        log.error(error instanceof Error ? error.message : String(error));
+        return 1;
+      }
+    }
+    if (rest[0] !== 'inspect' || rest.slice(1).some((a) => a !== '--json')) {
+      log.error(lockUsage);
+      return 1;
+    }
+    try {
+      const report = require('./lock').inspectLock(loadConfig({ cwd }), {});
+      console.log(JSON.stringify(report, null, 2));
+      return 0;
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
+  }
+
+  // layout migrate (BRAIN-636 D9) takes a positional subcommand like lock, so it is dispatched before
+  // parseOptions. Exit 0 verified (or a clean dry run), 3 refused, 2 failed with the journal left in place.
+  if (command === 'layout') {
+    const rest = argv.slice(1);
+    const toIndex = rest.indexOf('--to');
+    const to = toIndex >= 0 ? rest[toIndex + 1] : undefined;
+    const extra = rest.filter((a, i) => i > 0 && i !== toIndex && i !== toIndex + 1 && a !== '--dry-run');
+    if (rest[0] !== 'migrate' || !['releases', 'legacy'].includes(to) || extra.length) {
+      log.error('Usage: deploy-kit layout migrate --to releases|legacy [--dry-run]');
+      return 1;
+    }
+    try {
+      const { migrateLayout } = require('./layout-migrate');
+      const { exitCode, result } = migrateLayout(loadConfig({ cwd }), { to, dryRun: rest.includes('--dry-run') }, { env, log });
+      console.log(JSON.stringify(result, null, 2));
+      return exitCode;
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 2;
+    }
+  }
+
+  // Target-state commands (BRAIN-636 D3): holds, the epoch fence, request cancel, and the read-only state.
+  if (['hold', 'epoch', 'request', 'resolve', 'target-state'].includes(command)) {
+    let targetConfig;
+    try {
+      targetConfig = loadConfig({ cwd });
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
+    return require('./target-state').runCommand(command, argv.slice(1), targetConfig, { log });
   }
 
   const options = parseOptions(argv.slice(1));
@@ -623,8 +793,41 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   }
   if (options.lock === false) config = { ...config, lock: false };
 
+  // An onHost.required app deploys and rolls back only as an accepted request (`--on-host`), under owned locks.
+  // `--dry-run` is the config-only planner: it opens no ssh and runs no target command (dryRunContext), so it is not an execution.
+  if (['deploy', 'rollback'].includes(command) && !(options.dryRun && !options.onHost) && require('./lock').lockRequiresOwnership(config)) {
+    const refusal = !options.onHost
+      ? `${command}: this app sets onHost.required, so it only runs as \`deploy-kit ${command} --on-host ...\` (an accepted request under the host and app locks)`
+      : (options.stealLock || options.lock === false) && `${command}: --steal-lock and --no-lock are refused for an onHost.required app`;
+    if (refusal) {
+      log.error(refusal);
+      return 1;
+    }
+  }
+
   if (command === 'deploy' && options.onHost) {
     return require('./on-host/operator').onHostDeploy(config, options, { cwd });
+  }
+  if (command === 'deploy' && !options.onHost && options.runId !== undefined) {
+    log.error('deploy: --run-id only applies with --on-host');
+    return 1;
+  }
+  if (command === 'rollback' && !options.onHost) {
+    const requestFlags = ['to', 'kind', 'request', 'epoch', 'notAfter', 'expectReservation', 'runId'].filter((key) => options[key] !== undefined);
+    if (requestFlags.length > 0) {
+      log.error('rollback: --to and the request flags only apply with --on-host; without it rollback returns to `previous`, whatever it is');
+      return 1;
+    }
+  }
+  if (command === 'rollback' && options.onHost) {
+    return require('./on-host/operator').onHostRollback(config, options, { cwd });
+  }
+  if (command === 'recover') {
+    if (!options.onHost) {
+      log.error('recover only exists as `recover --on-host`: it settles an interrupted on-host deploy');
+      return 1;
+    }
+    return require('./on-host/operator').onHostRecover(config, options, { cwd });
   }
 
   switch (command) {

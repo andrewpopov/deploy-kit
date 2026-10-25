@@ -3,7 +3,9 @@
 const path = require('path');
 const { execFileSync: nodeExecFileSync } = require('child_process');
 const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
-const { acquireLock } = require('./lock');
+const {
+  acquireLock, validateOwnedLocks, lockRequiresOwnership, assertOwnedEntry,
+} = require('./lock');
 const { log: defaultLog, logFailureOutput } = require('./log');
 const { backupIdFromOutput, isSafeBackupId, backupReferenceFromId } = require('./backup-reference');
 const { resolveBranch } = require('./branch');
@@ -25,6 +27,10 @@ const { createReleasePhaseStorage } = require('./transition-operation-storage');
 const CONSERVATIVE_EFFECTS = {
   stop: true, migrate: true, pointerSwap: true, restart: true, databaseRestore: true,
 };
+const {
+  NO_RECOVERY, shaOfTarget, deployed: deployedResult, failure, failureFromError, attach,
+} = require('./deploy-result');
+const { stepClass, isClean } = require('./effects');
 const recoveryRequired = (message, cause) => new TransitionOperationError('RECOVERY_REQUIRED', message, cause);
 
 // Bump when the on-host layout changes shape. The host migration writes this
@@ -55,6 +61,8 @@ const MIN_FREE_KIB = 512 * 1024;
 const RELEASE_ID_BODY = '[0-9a-f]{7,40}-\\d{8}T\\d{6}Z';
 const RELEASE_ID_RE = new RegExp(`^${RELEASE_ID_BODY}$`);
 const RELEASE_TARGET_RE = new RegExp(`^releases\\/${RELEASE_ID_BODY}$`);
+// A failed rollback that flipped `current` back to the release it started from and saw it healthy.
+const RESTORED_ORIGINAL = { action: 'flip-back', verified: true };
 const IDENTICAL_CHECK_FAILURE_NOTE = 'check failed identically on both releases: likely the check or its environment, not the release';
 
 function defaultSleep(seconds) {
@@ -418,6 +426,45 @@ function readInterruptedDeploy(config, paths, ctx) {
   return null;
 }
 
+// BRAIN-636 D4c: the disruptive gate (layout.disruptiveGate checks, polled every pollSeconds up to maxWaitSeconds and
+// never past ctx.notAfter), evaluated immediately before the FIRST live step of a deploy or a rollback. `report(step)`
+// puts each poll and its outcome in the effects ledger. A refusal throws an error flagged `gateRefused`.
+function runDisruptiveGateChecks(config, paths, c, report) {
+  const gate = config.layout && config.layout.disruptiveGate;
+  if (!gate) return;
+  const nowMs = () => (c.now ? c.now() : Date.now());
+  const pollSeconds = gate.pollSeconds ?? 60;
+  const start = nowMs();
+  const deadline = Math.min(start + (gate.maxWaitSeconds ?? 900) * 1000, c.notAfter != null ? c.notAfter * 1000 : Infinity);
+  for (;;) {
+    report('disruptive-gate');
+    const failing = gate.checks.find((check) => !runInDir(paths.root, check.command, config, c, { tolerate: true }).ok);
+    if (!failing) { report('disruptive-gate'); return; }
+    const remainingMs = deadline - nowMs();
+    if (remainingMs <= 0) {
+      report('disruptive-gate');
+      throw Object.assign(
+        new Error(`Disruptive gate failed: ${failing.name} still failing after ${Math.round((nowMs() - start) / 1000)}s`),
+        { gateRefused: true },
+      );
+    }
+    c.log.info(`Disruptive gate waiting on ${failing.name}`);
+    c.sleep(Math.min(pollSeconds, remainingMs / 1000));
+  }
+}
+
+// recoverRelease() runs deployRelease's own recovery closure and nothing else; the marker is module-private so
+// no caller can ask a deploy to stop after recovery.
+const RECOVER_ONLY = Symbol('recover-only');
+
+// With `ctx.ownedLocks` (host-run's handle) the locks are already held: validate
+// the handle and return a no-op release. Otherwise take the app lock as always.
+function acquireOrAdoptLock(config, c, { steal }) {
+  if (c.ownedLocks == null) return acquireLock(config, c, { steal });
+  validateOwnedLocks(config, c, c.ownedLocks);
+  return () => {};
+}
+
 // The full artifact-first release deploy. See the failure-phase table in the ticket:
 // every phase records enough state that recover() can restore a known-good running
 // release, and the ONLY disruptive window is stop → backup → migrate → flip.
@@ -428,6 +475,8 @@ function deployRelease(config, options = {}, ctx = {}) {
   // directly (not just via deploy()'s layout delegation), so the CLI's
   // parse-time checks are not the only way in (PKG-164 review finding 6).
   assertShaOptions(options);
+  const recoverOnly = ctx[RECOVER_ONLY] === true;
+  assertOwnedEntry(config, options, ctx, recoverOnly ? 'recover' : 'deploy');
   const log = ctx.log || defaultLog;
   const sleep = ctx.sleep || defaultSleep;
   const c = { ...ctx, log, sleep, runtime: ctx.runtime };
@@ -473,7 +522,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     }
   }
 
-  log.header(`🚀 Deploying [release layout] (${config.mode}${config.host ? ` → ${config.host}` : ''})`);
+  log.header(`${recoverOnly ? '🩹 Recovering' : '🚀 Deploying'} [release layout] (${config.mode}${config.host ? ` → ${config.host}` : ''})`);
 
   const steps = [];
   // Mutable state the recovery machine reads. phase names match the failure table.
@@ -485,6 +534,53 @@ function deployRelease(config, options = {}, ctx = {}) {
   });
   const st = freshState();
   let recoveringInterrupted = false;
+  // What recover() is doing / did, read by the failure path to build the DeployResult.
+  let recoveryInfo = { ...NO_RECOVERY };
+  const resultFacts = (stage) => ({
+    stage,
+    liveBefore: shaOfTarget(st.prevTarget),
+    migrated: st.migrated,
+    migrationsPending: st.migrationsPending,
+    backupId: st.backupId,
+    liveAfter: (recovery) => {
+      if (!st.flipped || (recovery.verified && ['flip-back', 'restore+flip-back', 'resume-previous'].includes(recovery.action))) return shaOfTarget(st.prevTarget);
+      return ['remain-active', 'manual'].includes(recovery.action) ? shaOfTarget(`releases/${st.releaseId}`) : null;
+    },
+  });
+  const rollbackAction = () => (st.migrated ? 'restore+flip-back' : 'flip-back');
+
+  // BRAIN-636 D4d effects ledger: each step is reported (ctx.onStep) BEFORE it runs, and its class decides
+  // effectsClean if the pipeline then fails. A step is recorded even when onStep throws: assume it ran.
+  const executedClasses = [];
+  // BRAIN-636 D4c disruptive gate: re-checks safety immediately before the FIRST live step, whichever step
+  // that is. It runs at most once; once a live step has started it can no longer abort cleanly.
+  let gateDone = false;
+  let gateRefused = false;
+  const runDisruptiveGate = () => {
+    gateDone = true;
+    try {
+      runDisruptiveGateChecks(config, paths, c, (step) => {
+        if (typeof c.onStep === 'function') c.onStep({ step, class: stepClass(config, step) });
+      });
+    } catch (error) {
+      if (error.gateRefused) gateRefused = true;
+      throw error;
+    }
+  };
+  const ensureDisruptiveGate = () => { if (!gateDone) runDisruptiveGate(); };
+  const stepStart = (step) => {
+    const stepClassName = stepClass(config, step);
+    if (stepClassName === 'live') ensureDisruptiveGate();
+    executedClasses.push(stepClassName);
+    if (typeof c.onStep === 'function') c.onStep({ step, class: stepClassName });
+  };
+  // A failure with only staging/candidate/read-only steps behind it, in an unprotected deploy that recovery
+  // only quarantined (or had nothing to quarantine), is a clean abort. Protected mode never claims one.
+  const withEffects = (result) => {
+    const clean = !protectedMode && isClean(executedClasses);
+    const abortedClean = clean && result.status === 'failed' && ['none', 'quarantine'].includes(result.recovery.action);
+    return { ...result, status: abortedClean ? 'aborted-clean' : result.status, effectsClean: clean };
+  };
 
   // Informational audit field, written only once a probe has answered: a deploy
   // without `hooks.pendingMigrations` keeps a byte-identical journal (the consumer
@@ -630,6 +726,7 @@ function deployRelease(config, options = {}, ctx = {}) {
         { rollbackTargetRestored: true, appsOnline },
       );
     }
+    return resumed.ok;
   };
 
   // Re-run the failed post-deploy check against the rolled-back release. The same
@@ -686,6 +783,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       case 'build':
       case 'validate':
         // current never touched, apps never stopped — just quarantine the candidate.
+        recoveryInfo = { action: st.releaseDir ? 'quarantine' : 'none', verified: false };
         if (st.releaseDir) {
           log.warning(`Quarantining candidate release ${st.releaseDir}`);
           runInDir(paths.root, `git --git-dir=${paths.repoGit} worktree remove --force ${st.releaseDir} 2>/dev/null || rm -rf ${st.releaseDir}`, config, c, { tolerate: true });
@@ -695,13 +793,16 @@ function deployRelease(config, options = {}, ctx = {}) {
         return;
       case 'stopped':
         // writers stopped, nothing migrated/flipped — resume previous, verify.
+        recoveryInfo = { action: 'resume-previous', verified: false };
         if (!resumePrevious().ok) fail('failed to bring the previous release back online after aborting pre-migration');
+        recoveryInfo.verified = true;
         markRecovered();
         return;
       case 'migrated':
       case 'flipped':
       case 'verify': {
-        rollbackToPrevious(fail);
+        recoveryInfo = { action: rollbackAction(), verified: false };
+        recoveryInfo.verified = rollbackToPrevious(fail);
         markRecovered();
         return;
       }
@@ -714,6 +815,7 @@ function deployRelease(config, options = {}, ctx = {}) {
         if (st.failurePolicy === 'remain-active') {
           st.phase = 'post-deploy-degraded';
           st.recoveryOutcome = 'remained-active';
+          recoveryInfo = { action: 'remain-active', verified: true };
           journal();
           emitDeliveryEvent('degraded', {
             ...eventBase,
@@ -724,6 +826,7 @@ function deployRelease(config, options = {}, ctx = {}) {
         if (st.failurePolicy === 'manual') {
           st.phase = 'post-deploy-manual-decision';
           st.recoveryOutcome = 'manual-decision-required';
+          recoveryInfo = { action: 'manual', verified: false };
           journal();
           emitDeliveryEvent('failed', {
             ...eventBase,
@@ -735,8 +838,9 @@ function deployRelease(config, options = {}, ctx = {}) {
         st.phase = 'post-deploy-rollback';
         st.recoveryOutcome = 'pending';
         journal();
+        recoveryInfo = { action: rollbackAction(), verified: false };
         try {
-          rollbackToPrevious(fail);
+          recoveryInfo.verified = rollbackToPrevious(fail);
           st.phase = 'post-deploy-rolled-back';
           st.recoveryOutcome = 'rolled-back';
           // Persist the verified rollback before the diagnostic re-run: a re-run that hangs or
@@ -798,7 +902,16 @@ function deployRelease(config, options = {}, ctx = {}) {
     // symlink flip had, so resuming and re-verifying the untouched previous
     // release is safe whether the stop itself completed or not.
     const saved = readInterruptedDeploy(config, paths, c);
-    if (!saved) return;
+    if (!saved) return null;
+    // A deploy whose caller said `recoverInterrupted: 'refuse'` (host-run) never settles an old run's journal as a
+    // side effect: that is the separate `recover` operation. Refused before the ledger records a live step.
+    if (c.recoverInterrupted === 'refuse' && !recoverOnly) {
+      throw new Error(
+        `A previous deploy was interrupted mid-"${saved.phase}" (release ${saved.releaseId || '?'}); this deploy will not recover it `
+        + 'as a side effect. Settle it with `deploy-kit recover --on-host` first.',
+      );
+    }
+    stepStart('recover-interrupted');
 
     const phase = saved.phase;
     const releaseId = typeof saved.releaseId === 'string' ? saved.releaseId : '';
@@ -829,7 +942,10 @@ function deployRelease(config, options = {}, ctx = {}) {
     recover(new Error(`previous deploy interrupted during ${phase}`));
     recoveringInterrupted = false;
     steps.push(`recover-interrupted:${phase}`);
+    const facts = resultFacts('recover-interrupted');
+    const recovered = { ...facts, liveAfter: facts.liveAfter(recoveryInfo) };
     Object.assign(st, freshState());
+    return recovered; // null above = nothing was journaled to recover
   };
 
   // DO NOT DELETE THIS AS DEAD CODE -- see the fuller note in deploy.js. This
@@ -856,6 +972,7 @@ function deployRelease(config, options = {}, ctx = {}) {
   const sigHandlers = { SIGINT: () => onSignal('SIGINT'), SIGTERM: () => onSignal('SIGTERM') };
 
   const runPreDeployChecks = () => {
+    if (config.preDeployChecks.length) stepStart('preDeployChecks');
     for (const check of config.preDeployChecks) {
       st.phase = protectedMode ? 'hook-running' : 'preflight';
       const res = runInDir(paths.root, check.command, config, c, { tolerate: true });
@@ -991,13 +1108,14 @@ function deployRelease(config, options = {}, ctx = {}) {
       });
       if (alertText) postFleetAlert(`${alertText} (${outcome}).${st.recoveryNote ? ` ${st.recoveryNote}.` : ''}`);
     };
-    const settledFailure = (child, message) => {
-      throw withFacts(recoveryRequired(`forward deployment failed (${reason}); ${message}`, failure), child.operationId);
+    const settledFailure = (child, message, deployRecovery) => {
+      throw Object.assign(withFacts(recoveryRequired(`forward deployment failed (${reason}); ${message}`, failure), child.operationId), { deployRecovery });
     };
+    const restoreAction = failedPhase === 'stopped' ? 'resume-previous' : rollbackAction();
     const concludeVerified = (child) => {
       journal({ phase: 'recovered', sha: previousSha });
       log.success(`Restored the previous release ${st.prevTarget}`);
-      return settledFailure(child, `previous release ${st.prevTarget} recovered`);
+      return settledFailure(child, `previous release ${st.prevTarget} recovered`, { action: restoreAction, verified: true });
     };
     const concludeUnverified = (child) => {
       if (!policyPhase) {
@@ -1007,7 +1125,8 @@ function deployRelease(config, options = {}, ctx = {}) {
       }
       return settledFailure(child, policyPhase
         ? `post-deploy policy "${st.failurePolicy}" left the candidate active; manual review required`
-        : 'recovery did not verify the previous release; manual recovery required');
+        : 'recovery did not verify the previous release; manual recovery required',
+      { action: policyPhase ? st.failurePolicy : restoreAction, verified: false });
     };
 
     const firstBody = () => {
@@ -1088,12 +1207,19 @@ function deployRelease(config, options = {}, ctx = {}) {
     return restart.verified ? concludeVerified(restart) : concludeUnverified(restart);
   }
 
-  const release = acquireLock(config, c, { steal: stealLock });
+  const release = acquireOrAdoptLock(config, c, { steal: stealLock });
   process.on('SIGINT', sigHandlers.SIGINT);
   process.on('SIGTERM', sigHandlers.SIGTERM);
   try {
+    stepStart('preflight');
     preflight(config, paths, c);
     if (protectedMode && !dryRun) initializeTransitionAuthority();
+    if (recoverOnly) {
+      const recovered = recoverInterruptedDeploy();
+      if (!recovered) throw new Error(`Nothing to recover: ${paths.stateFile} holds no interrupted deploy this tool can recover.`);
+      log.success('Recovered the interrupted deploy');
+      return withEffects(failure(recovered, recoveryInfo, null));
+    }
     if (!protectedMode || dryRun) recoverInterruptedDeploy();
     if (!protectedMode) runPreDeployChecks();
 
@@ -1143,6 +1269,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // heads/*` force-updates every local head to the remote (releases are detached, so
     // no worktree has a branch checked out). It also updates a mirror clone's heads
     // harmlessly. --prune keeps deleted branches from lingering.
+    stepStart('fetch');
     runInDir(paths.root, `git --git-dir=${paths.repoGit} fetch --prune ${shQuote(config.remote)} '+refs/heads/*:refs/heads/*'`, config, c);
     // Same branch-resolution rule as the legacy path (README.md: null branch ->
     // resolve origin/HEAD, fall back to master) — the release layout's repo lives
@@ -1224,11 +1351,16 @@ function deployRelease(config, options = {}, ctx = {}) {
     const releaseId = `${st.sha.slice(0, 12)}-${ts}`;
     st.releaseId = releaseId;
     st.releaseDir = `${paths.releasesDir}/${releaseId}`;
+    // Tell the caller exactly which release this run is about to create, before anything touches it (host-run
+    // persists it as runs/<runId>/release.json, which `recover` later matches against the journal).
+    if (typeof c.onRelease === 'function') c.onRelease({ releaseId, sha: st.sha });
     log.step(`Materializing release ${releaseId} at ${st.sha.slice(0, 12)}`);
+    stepStart('worktree-add');
     runInDir(paths.root, `git --git-dir=${paths.repoGit} worktree add --detach ${st.releaseDir} ${st.sha}`, config, c);
     steps.push('materialize');
 
     // Symlink shared state in (verifying the release does not track the path).
+    if ((config.layout.sharedPaths || []).length) stepStart('shared-links');
     for (const rel of (config.layout.sharedPaths || [])) {
       const src = `${paths.sharedDir}/${rel}`;
       const dest = `${st.releaseDir}/${rel}`;
@@ -1264,6 +1396,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       log.warning('Skipping dependency install (--skip-deps) — the candidate release will have no node_modules unless sharedPaths supplies one');
     } else {
       log.step('Installing dependencies in the candidate release');
+      stepStart('install');
       runInDir(st.releaseDir, `npm_config_cache=${paths.npmCache} ${config.hooks.install}`, config, c);
       steps.push('install');
       // Always run right after install, never folded into `hooks.build` — a
@@ -1273,6 +1406,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       // config.js's `hooks.generate` comment for the full incident.
       if (config.hooks.generate) {
         log.step('Running post-install generation in the candidate release');
+        stepStart('generate');
         runInDir(st.releaseDir, config.hooks.generate, config, c);
         steps.push('generate');
       }
@@ -1284,6 +1418,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     if (verifyPins) {
       st.phase = 'verify-pins';
       log.step('Verifying dependency pins in the candidate release');
+      stepStart('verify-pins');
       runInDir(st.releaseDir, PIN_CHECK_COMMAND, config, c, { input: buildPinCheckProgram() });
       steps.push('verify-pins');
     }
@@ -1295,6 +1430,7 @@ function deployRelease(config, options = {}, ctx = {}) {
         log.warning('Skipping build (--skip-build)');
       } else {
         log.step('Building the candidate release');
+        stepStart('build');
         runInDir(st.releaseDir, config.hooks.build, config, c);
         steps.push('build');
       }
@@ -1304,6 +1440,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     st.phase = 'validate';
     const builtSha = capture(st.releaseDir, 'git rev-parse HEAD', config, c);
     if (builtSha !== st.sha) throw new Error(`Candidate SHA ${builtSha} != resolved ${st.sha}`);
+    if ((config.layout.releaseChecks || []).length) stepStart('releaseChecks');
     for (const check of (config.layout.releaseChecks || [])) {
       log.step(`Release check: ${check.name}`);
       runInDir(st.releaseDir, check.command, config, c);
@@ -1315,12 +1452,44 @@ function deployRelease(config, options = {}, ctx = {}) {
     // a WAL-safe disposable copy, run the candidate migrations against it, and
     // abort without stopping the live service when data-dependent SQL fails.
     if (!skipMigrate) {
+      if (config.preMigrationChecks.length) stepStart('preMigrationChecks');
       for (const check of config.preMigrationChecks) {
         log.step(`Pre-migration check: ${check.name}`);
         runInDir(st.releaseDir, check.command, config, c);
         steps.push(`pre-migration-check:${check.name}`);
       }
     }
+
+    // Probe first (BRAIN-636 D7), only under exclusive migration ownership: ask with the writers still up,
+    // read-only. An exact 0 skips the writer stop, the backup and migrate, so recovery is code-only. Null
+    // (unknown) or a count takes today's path below, without asking a second time.
+    const probeFirst = !skipMigrate && config.hooks.migrationsExclusive === true
+      && Boolean(config.hooks.migrate) && Boolean(config.hooks.pendingMigrations);
+    let provenNoMigration = false;
+    if (probeFirst) {
+      stepStart('pending-migrations-probe');
+      log.step('Checking for pending database migrations (writers still running)');
+      const probe = runInDir(st.releaseDir, config.hooks.pendingMigrations, config, c, { capture: true });
+      if (!probe.ok) logFailureOutput('Pending-migration probe', probe, log);
+      const pending = parsePendingCount(probe);
+      if (pending === 0) {
+        // Not journaled here: the phase is still `validate`, which the host reads as an interrupted deploy, and this
+        // probe changed nothing. The count rides on the `flipped` journal and the final record.
+        st.migrationsPending = 0;
+        provenNoMigration = true;
+        steps.push('migrate-skipped');
+        log.success('No pending database migrations; skipping the writer stop, backup and migrate');
+      } else if (pending === null) {
+        log.warning(
+          `Pending-migration probe ${probe.ok ? 'printed no usable count' : 'failed'}; treating the result as unknown `
+          + 'and taking the full migration path',
+        );
+      } else {
+        st.migrationsPending = pending;
+        log.info(`${pending} pending database migration${pending === 1 ? '' : 's'}`);
+      }
+    }
+    const runMigrationPath = !skipMigrate && !provenNoMigration;
 
     // ================= disruptive window opens =================
     // From here a failure can leave production stopped or the schema changed, so we
@@ -1329,17 +1498,19 @@ function deployRelease(config, options = {}, ctx = {}) {
     const opensDisruptive = !skipMigrate && (config.dbBoundApps.length || config.hooks.migrate);
     if (opensDisruptive) assertSafeTarget(st.prevTarget, 'current (known-good)');
 
-    if (!skipMigrate && config.dbBoundApps.length) {
+    if (runMigrationPath && config.dbBoundApps.length) {
       // Codex ordering: stop writers FIRST, THEN back up (consistent snapshot), THEN
       // migrate. The stop is GATED and verified — writers left online would corrupt
       // the backup and defeat the consistent-snapshot guarantee.
+      stepStart('stop-writers');
       st.phase = 'stopped';
       journal();
       log.step(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`);
       if (!stopWritersConfirmed()) throw new Error(`Could not confirm DB-bound apps (${config.dbBoundApps.join(', ')}) stopped before backup/migrate`);
       st.dbAppsPaused = true;
     }
-    if (!skipMigrate && config.hooks.backup) {
+    if (runMigrationPath && config.hooks.backup) {
+      stepStart('backup');
       beginProtectedHook();
       log.step('Backing up the database (writers stopped)');
       const res = runInDir(st.releaseDir, config.hooks.backup, config, c, { capture: true });
@@ -1366,8 +1537,9 @@ function deployRelease(config, options = {}, ctx = {}) {
     // to the migrate block below unchanged. Writers are stopped and the backup is
     // taken, so the answer cannot move under us (given exclusive migration
     // ownership -- see README "Skipping a no-op migration").
-    let migrateHookNeeded = !skipMigrate && Boolean(config.hooks.migrate);
-    if (migrateHookNeeded && config.hooks.pendingMigrations) {
+    let migrateHookNeeded = runMigrationPath && Boolean(config.hooks.migrate);
+    if (migrateHookNeeded && config.hooks.pendingMigrations && !probeFirst) {
+      stepStart('pending-migrations');
       beginProtectedHook();
       log.step('Checking for pending database migrations (writers stopped)');
       const probe = runInDir(st.releaseDir, config.hooks.pendingMigrations, config, c, { capture: true });
@@ -1396,6 +1568,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       // Mark migrated BEFORE running: a migration that fails partway may have already
       // touched the schema, so recovery from here on must restore the DB, not just
       // resume the previous (possibly-incompatible) code.
+      stepStart('migrate');
       st.phase = 'migrated';
       st.migrated = true;
       journal();
@@ -1405,14 +1578,21 @@ function deployRelease(config, options = {}, ctx = {}) {
     }
 
     // ---- Phase: flip (atomic activation) ----
+    // The flip is always live, and journaling `flipped` is already a disruptive write that recovery would
+    // roll back: a gate that has not run yet (nothing earlier was live) must refuse before it.
+    ensureDisruptiveGate();
     st.phase = 'flipped';
     journal();
     // Point `previous` at the old current (the known-good fallback) before flipping
     // `current` forward. Only when the old target is a safe releases/<id> value — a
     // pure code deploy with no prior current just skips the previous update.
     if (st.prevTarget && RELEASE_TARGET_RE.test(st.prevTarget)) {
+      stepStart('previous-pointer');
       activateSymlink(config, paths, st.prevTarget, c, { link: paths.previousLink });
     }
+    stepStart('current-pointer');
+    // Only apps on the on-host protocol roll back through accept.js; every other app's command stream stays byte-identical.
+    if (lockRequiresOwnership(config)) writeReleaseRecord(config, st, c);
     activateSymlink(config, paths, `releases/${releaseId}`, c);
     st.flipped = true;
     steps.push('flip');
@@ -1422,6 +1602,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // process. A failure here throws into the 'flipped'-phase recovery (flips
     // `current` back, restores DB if migrated, resumes the previous release) —
     // the same recovery a failure anywhere else in this phase gets.
+    if (config.preRestartChecks.length) stepStart('preRestartChecks');
     for (const check of config.preRestartChecks) {
       log.step(`Pre-restart check: ${check.name}`);
       runInDir(paths.root, check.command, config, c);
@@ -1429,6 +1610,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     }
 
     log.step('Restarting apps from the stable ecosystem');
+    stepStart('pm2-restart');
     runInDir(paths.root, pm2Activate(config, paths), config, c);
     runInDir(paths.root, 'pm2 save 2>/dev/null || true', config, c, { tolerate: true });
 
@@ -1445,6 +1627,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // outcome is journaled before a durable delivery event is attempted.
     st.phase = 'post-deploy';
     journal();
+    if (config.postDeployChecks.length) stepStart('postDeployChecks');
     for (const check of config.postDeployChecks) {
       log.step(`Post-deploy check: ${check.name}`);
       const result = runInDir(paths.root, check.command, config, c, { tolerate: true });
@@ -1465,6 +1648,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // the authority completion ACK; only then does recordSuccess run.
     const fenced = protectedMode && !dryRun;
     if (!fenced) recordSuccess();
+    stepStart('prune');
     prune(config, paths, releaseId, c);
     steps.push('prune');
 
@@ -1484,6 +1668,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     return {
       branch, mode: config.mode, host: config.host, sha: st.sha, release: releaseId, steps, healthy: true,
       ...(deliveryEvent ? { deliveryEvent } : {}),
+      ...deployedResult({ ...resultFacts('done'), liveAfter: shaOfTarget(`releases/${releaseId}`) }),
     };
     };
     // Terminal success metadata: retains operation identity when protected.
@@ -1525,30 +1710,50 @@ function deployRelease(config, options = {}, ctx = {}) {
     log.success(`Deployment completed successfully (release ${releaseId})`);
     return deployed;
   } catch (err) {
+    const stage = gateRefused ? 'disruptive-gate' : st.phase;
     if (protectedMode) {
-      // Never generic recover(): early hooks may have mutated production.
-      if (err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED' && authorityHandle && !isPhaseWriteUncertain(err)) {
-        const handle = authorityHandle;
-        const failedOperationId = operationIdentity?.operationId;
-        const failedPhase = st.phase;
-        authorityHandle = null;
-        try {
-          manager.abandon(handle, 'UNKNOWN');
-        } catch (abandonErr) {
-          throw recoveryRequired('forward operation failed and abandon was not acknowledged; recovery assessment required', abandonErr);
+      try {
+        // Never generic recover(): early hooks may have mutated production.
+        if (err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED' && authorityHandle && !isPhaseWriteUncertain(err)) {
+          const handle = authorityHandle;
+          const failedOperationId = operationIdentity?.operationId;
+          const failedPhase = st.phase;
+          authorityHandle = null;
+          try {
+            manager.abandon(handle, 'UNKNOWN');
+          } catch (abandonErr) {
+            throw recoveryRequired('forward operation failed and abandon was not acknowledged; recovery assessment required', abandonErr);
+          }
+          recoverProtectedForward(err, failedOperationId, failedPhase);
         }
-        recoverProtectedForward(err, failedOperationId, failedPhase);
+        throw err;
+      } catch (protectedError) {
+        throw attach(protectedError, withEffects(failureFromError(resultFacts(stage), NO_RECOVERY, protectedError)));
       }
-      throw err;
     }
-    if (recoveringInterrupted) throw err;
-    recover(err);
-    throw err;
+    if (recoveringInterrupted) throw attach(err, withEffects(failureFromError(resultFacts(stage), recoveryInfo, err)));
+    try {
+      recover(err);
+    } catch (recoveryError) {
+      throw attach(recoveryError, withEffects(failureFromError(resultFacts(stage), recoveryInfo, recoveryError)));
+    }
+    throw attach(err, withEffects(failureFromError(resultFacts(stage), recoveryInfo, err)));
   } finally {
     process.removeListener('SIGINT', sigHandlers.SIGINT);
     process.removeListener('SIGTERM', sigHandlers.SIGTERM);
     release();
   }
+}
+
+// BRAIN-636 D8: the interrupted-journal recovery as its own operation (plan 4.1, `recover`). It runs the
+// SAME recovery deployRelease used to run before its pre-checks, and nothing else: no fetch, no candidate, no
+// hook. Resolves to a DeployResult (a verified recovery is `failed-recovered` with `recovery.verified`; the
+// journal is left `recovered`); throws, with `deployResult` attached, when nothing was recovered. Takes the same
+// `ctx.ownedLocks` and `ctx.onStep` as deployRelease. A transition-authority config is refused: its recovery
+// runs under a fenced child operation and ends the invocation, which is not this operation.
+function recoverRelease(config, options = {}, ctx = {}) {
+  assertTransitionAuthorityEntryPoint(config, { supported: false });
+  return deployRelease(config, options, { ...ctx, [RECOVER_ONLY]: true, recoverInterrupted: 'run' });
 }
 
 // Protected mode: inspect the saved authority journal BEFORE any recovery or configured hook.
@@ -1633,6 +1838,19 @@ function resolveReleaseSha(config, paths, target, label, c) {
   const sha = (res.output || '').trim();
   if (!/^[0-9a-f]{40}$/.test(sha)) throw recoveryRequired(`${label} ${target} did not resolve to a full 40-hex commit SHA`);
   return sha;
+}
+
+// BRAIN-636 D6: whether this release ever ran a migration, recorded durably INSIDE the release directory just
+// before it becomes `current`. A manual on-host rollback reads it (src/on-host/accept.js): a release with no
+// record, or an unreadable one, is treated as migrated, so the rollback refuses (fail closed).
+const RELEASE_RECORD = '.deploy-kit-release.json';
+
+function writeReleaseRecord(config, st, c) {
+  const record = {
+    sha: st.sha, migrated: st.migrated === true, migrationsPending: st.migrationsPending ?? null, backupId: st.backupId ?? null,
+  };
+  const file = `${st.releaseDir}/${RELEASE_RECORD}`;
+  runInDir(st.releaseDir, `printf '%s\\n' ${shQuote(JSON.stringify(record))} > ${file}.tmp && mv -f ${file}.tmp ${file}`, config, c);
 }
 
 // Atomic symlink swap: create a uniquely-named temp symlink in the same directory,
@@ -1743,7 +1961,7 @@ function recoverFailedRollback(config, paths, originalCurrent, c, reason, restor
     throw new Error(`MANUAL RECOVERY REQUIRED — ${reason} AND the original release did not come back (${back.reason}).`);
   }
   if (restoredSha) return { observedSha: restoredSha, verified: true };
-  throw new Error(`Rollback aborted: ${reason}; restored the original release ${originalCurrent}.`);
+  throw Object.assign(new Error(`Rollback aborted: ${reason}; restored the original release ${originalCurrent}.`), { deployRecovery: RESTORED_ORIGINAL });
 }
 
 // Release-layout rollback: flip `current` back to the recorded previous release and
@@ -1751,6 +1969,7 @@ function recoverFailedRollback(config, paths, originalCurrent, c, reason, restor
 // touched — a schema rollback is a data-loss decision the operator makes explicitly.
 function rollbackRelease(config, options = {}, ctx = {}) {
   assertTransitionAuthorityEntryPoint(config, { supported: true, options });
+  assertOwnedEntry(config, options, ctx, 'rollback');
   const log = ctx.log || defaultLog;
   const sleep = ctx.sleep || defaultSleep;
   const c = { ...ctx, log, sleep, runtime: ctx.runtime };
@@ -1775,9 +1994,20 @@ function rollbackRelease(config, options = {}, ctx = {}) {
     );
   }
 
+  // BRAIN-636 D6: each step is reported (ctx.onStep) BEFORE it runs, like deployRelease's, so the effects ledger shows it.
+  const executedClasses = [];
+  const reportStep = (step) => {
+    const stepClassName = stepClass(config, step);
+    executedClasses.push(stepClassName);
+    if (typeof c.onStep === 'function') c.onStep({ step, class: stepClassName });
+  };
+  const rollbackFacts = {
+    stage: 'rollback', liveBefore: null, migrated: false, migrationsPending: null, backupId: null, liveAfter: null,
+  };
   log.header(`⏪ Rolling back [release layout] (${config.mode}${config.host ? ` → ${config.host}` : ''})`);
-  const release = acquireLock(config, c, { steal: options.stealLock === true });
+  const release = acquireOrAdoptLock(config, c, { steal: options.stealLock === true });
   try {
+    reportStep('preflight');
     preflight(config, paths, c);
     const fenced = config.transitionAuthority != null && c.runtime?.dryRun !== true;
     const manager = fenced ? inspectTransitionAuthority(config, paths, c, ctx).manager : null;
@@ -1787,6 +2017,11 @@ function rollbackRelease(config, options = {}, ctx = {}) {
     // Remember what current pointed at so a failed rollback can flip back to it
     // instead of leaving a broken `previous` release serving traffic.
     const originalCurrent = pointers.current;
+    rollbackFacts.liveBefore = shaOfTarget(originalCurrent);
+    rollbackFacts.liveAfter = (recovery) => (recovery.verified ? rollbackFacts.liveBefore : null);
+    // The same first-live-step gate as a deploy (D4c): the flip below is the first live step, so a busy gate refuses
+    // before `current` moves. Under a transition authority the gate runs before the operation begins.
+    runDisruptiveGateChecks(config, paths, c, reportStep);
     if (fenced && originalCurrent) assertSafeTarget(originalCurrent, 'current');
     const isRuntimeFailure = (err) => err instanceof TransitionOperationError && err.code === 'RUNTIME_FAILED';
     const phaseJournal = (identity, fields) => persistState(config, paths, { ...identity, ...fields }, c);
@@ -1795,10 +2030,12 @@ function rollbackRelease(config, options = {}, ctx = {}) {
     // fenced (failures then throw into the authority runtime, never unfenced recovery).
     const executeRollback = (targetSha) => {
       log.step(`Flipping current back to ${pointers.previous}`);
+      reportStep('current-pointer');
       activateSymlink(config, paths, pointers.previous, c);
       // Pre-restart checks: gated, run IMMEDIATELY BEFORE the pm2 restart, same as
       // the forward deploy. `current` has ALREADY been flipped, so a failing check must
       // not throw straight out (PKG-135 Finding 5) when unfenced.
+      if (config.preRestartChecks.length) reportStep('preRestartChecks');
       for (const check of config.preRestartChecks) {
         log.step(`Pre-restart check: ${check.name}`);
         try {
@@ -1809,6 +2046,7 @@ function rollbackRelease(config, options = {}, ctx = {}) {
           recoverFailedRollback(config, paths, originalCurrent, c, reason);
         }
       }
+      reportStep('pm2-restart');
       runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
       runInDir(paths.root, 'pm2 save 2>/dev/null || true', config, c, { tolerate: true });
 
@@ -1826,7 +2064,10 @@ function rollbackRelease(config, options = {}, ctx = {}) {
         log.warning('Code rolled back to the previous release. If the failed deploy ran a migration, the previous '
           + 'code may not run against the migrated schema — restore the pre-migration DB backup explicitly if needed.');
       }
-      return { release: pointers.previous, mode: config.mode, host: config.host, healthy: true };
+      return {
+        release: pointers.previous, mode: config.mode, host: config.host, healthy: true,
+        ...deployedResult({ ...rollbackFacts, stage: 'done', liveAfter: shaOfTarget(pointers.previous) }),
+      };
     };
 
     if (fenced) {
@@ -1892,8 +2133,20 @@ function rollbackRelease(config, options = {}, ctx = {}) {
       manager.complete(begun.handle, observation);
       phaseJournal(identity, { phase: 'recovered', current: originalCurrent, previous: pointers.previous, sha: originalSha });
       log.success(`Restored the original release ${originalCurrent}`);
-      throw new Error(`Rollback aborted: ${reason}; restored the original release ${originalCurrent}.`);
+      throw Object.assign(new Error(`Rollback aborted: ${reason}; restored the original release ${originalCurrent}.`), { deployRecovery: RESTORED_ORIGINAL });
     }
+  } catch (err) {
+    const result = failureFromError(rollbackFacts, NO_RECOVERY, err);
+    if (!err.gateRefused) throw attach(err, result);
+    // Refused before the flip: nothing live ran, if the ledger agrees (never claimed under a transition authority).
+    const clean = config.transitionAuthority == null && isClean(executedClasses);
+    throw attach(err, {
+      ...result,
+      status: clean ? 'aborted-clean' : result.status,
+      stage: 'disruptive-gate',
+      liveAfter: clean ? rollbackFacts.liveBefore : result.liveAfter,
+      effectsClean: clean,
+    });
   } finally {
     release();
   }
@@ -1903,10 +2156,15 @@ module.exports = {
   LAYOUT_VERSION,
   isReleaseLayout,
   releasePaths,
+  RELEASE_RECORD,
   deployRelease,
   rollbackRelease,
+  recoverRelease,
   verifyActivation,
   activateSymlink,
   prune,
   readPointers,
 };
+
+// Shared with src/layout-migrate.js (BRAIN-636 D9) so the migration restarts and health-waits exactly as a deploy does.
+Object.assign(module.exports, { waitForHealth, pm2Activate });

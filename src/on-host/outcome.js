@@ -102,6 +102,7 @@ module.exports = {
   EXIT_SUCCEEDED,
   EXIT_FAILED,
   EXIT_UNKNOWN,
+  isPlainObject,
   parseRecord,
   validateResultRecord,
   validateOutcomeRecord,
