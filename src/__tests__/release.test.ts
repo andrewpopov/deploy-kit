@@ -551,10 +551,9 @@ describe('release deploy — post-deploy failure policy', () => {
         mkdirSync(scripts, { recursive: true });
         writeFileSync(path.join(scripts, 'restore-fixture.sh'), `printf '${marker}:%s' "$DEPLOY_KIT_BACKUP_ID"\n`);
       }
-      const config = relConfig({
-        hooks: { restore: 'bash scripts/restore-fixture.sh' },
-        postDeployChecks: [failingCheck('rollback')],
-      });
+      const config = relConfig();
+      config.hooks.restore = 'bash scripts/restore-fixture.sh';
+      config.postDeployChecks = [failingCheck('rollback')];
       expect(() => release.deployRelease(config, {}, ctx(runtime))).toThrow();
       const emitted = calls.find(command => command.includes('bash scripts/restore-fixture.sh'));
       expect(emitted).toBeDefined();
