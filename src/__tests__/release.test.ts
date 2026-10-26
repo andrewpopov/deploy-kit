@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { createRequire } from 'module';
 import { execSync } from 'child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 const require = createRequire(__filename);
 const kit = require('../index.js') as typeof import('../index');
@@ -535,6 +538,31 @@ describe('release deploy — last-deploy record (PKG-189)', () => {
 describe('release deploy — post-deploy failure policy', () => {
   const failingCheck = (onFailure?: string) => ({
     name: 'public-smoke', command: 'run-smoke', ...(onFailure ? { onFailure } : {}),
+  });
+
+  it('ROLLBACK_RESTORE_RELEASE_CWD executes the rollback target hook instead of stale root or older release scripts', () => {
+    const { runtime, calls, cfg } = makeReleaseRuntime({ fail: ['run-smoke'] });
+    const root = mkdtempSync(path.join(tmpdir(), 'deploy-kit-restore-cwd-'));
+    try {
+      for (const [directory, marker] of [
+        ['', 'STALE_ROOT'], [cfg.previousLink, 'OLDER_RELEASE'], [cfg.currentLink, 'ROLLBACK_TARGET'],
+      ]) {
+        const scripts = path.join(root, directory, 'scripts');
+        mkdirSync(scripts, { recursive: true });
+        writeFileSync(path.join(scripts, 'restore-fixture.sh'), `printf '${marker}:%s' "$DEPLOY_KIT_BACKUP_ID"\n`);
+      }
+      const config = relConfig({
+        hooks: { restore: 'bash scripts/restore-fixture.sh' },
+        postDeployChecks: [failingCheck('rollback')],
+      });
+      expect(() => release.deployRelease(config, {}, ctx(runtime))).toThrow();
+      const emitted = calls.find(command => command.includes('bash scripts/restore-fixture.sh'));
+      expect(emitted).toBeDefined();
+      const output = execSync(emitted!.replaceAll('/srv/app', root), { shell: '/bin/sh', encoding: 'utf8' });
+      expect(output).toBe(`ROLLBACK_TARGET:${cfg.backupId}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('rejects a missing policy before acquiring the deploy lock', () => {
