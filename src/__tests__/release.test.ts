@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { createRequire } from 'module';
 import { execSync } from 'child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 const require = createRequire(__filename);
 const kit = require('../index.js') as typeof import('../index');
@@ -537,6 +540,30 @@ describe('release deploy — post-deploy failure policy', () => {
     name: 'public-smoke', command: 'run-smoke', ...(onFailure ? { onFailure } : {}),
   });
 
+  it('ROLLBACK_RESTORE_RELEASE_CWD executes the rollback target hook instead of stale root or older release scripts', () => {
+    const { runtime, calls, cfg } = makeReleaseRuntime({ fail: ['run-smoke'] });
+    const root = mkdtempSync(path.join(tmpdir(), 'deploy-kit-restore-cwd-'));
+    try {
+      for (const [directory, marker] of [
+        ['', 'STALE_ROOT'], [cfg.previousLink, 'OLDER_RELEASE'], [cfg.currentLink, 'ROLLBACK_TARGET'],
+      ]) {
+        const scripts = path.join(root, directory, 'scripts');
+        mkdirSync(scripts, { recursive: true });
+        writeFileSync(path.join(scripts, 'restore-fixture.sh'), `printf '${marker}:%s' "$DEPLOY_KIT_BACKUP_ID"\n`);
+      }
+      const config = relConfig();
+      config.hooks.restore = 'bash scripts/restore-fixture.sh';
+      config.postDeployChecks = [failingCheck('rollback')];
+      expect(() => release.deployRelease(config, {}, ctx(runtime))).toThrow();
+      const emitted = calls.find(command => command.includes('bash scripts/restore-fixture.sh'));
+      expect(emitted).toBeDefined();
+      const output = execSync(emitted!.replaceAll('/srv/app', root), { shell: '/bin/sh', encoding: 'utf8' });
+      expect(output).toBe(`ROLLBACK_TARGET:${cfg.backupId}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('rejects a missing policy before acquiring the deploy lock', () => {
     const { runtime, calls } = makeReleaseRuntime();
     expect(() => release.deployRelease(relConfig({ postDeployChecks: [failingCheck()] }), {}, ctx(runtime)))
@@ -890,7 +917,7 @@ describe('release deploy — failure recovery by phase', () => {
   // This proves it survives a compound restore hook end-to-end through a real
   // shell, not just via a string match on the emitted command.
   it('DEPLOY_KIT_BACKUP_ID reaches a child process at the end of a real compound restore hook chain', () => {
-    const { runtime, calls } = makeReleaseRuntime({ fail: ['run-migrate'] });
+    const { runtime, calls, cfg: host } = makeReleaseRuntime({ fail: ['run-migrate'] });
     const cfg = relConfig({
       hooks: {
         install: 'npm ci', build: 'npm run build', migrate: 'run-migrate', backup: 'run-backup',
@@ -904,7 +931,7 @@ describe('release deploy — failure recovery by phase', () => {
     expect(() => release.deployRelease(cfg, {}, ctx(runtime))).toThrow();
     const emitted = calls.find((cmd) => cmd.includes('DEPLOY_KIT_BACKUP_ID') && cmd.includes('process.env'));
     expect(emitted).toBeDefined();
-    const shellCommand = (emitted as string).replace('cd /srv/app', `cd ${process.cwd()}`);
+    const shellCommand = (emitted as string).replace(`cd /srv/app/${host.currentLink} &&`, `cd ${process.cwd()} &&`);
     const output = execSync(shellCommand, { shell: '/bin/sh', encoding: 'utf8' });
     expect(output).toBe('/var/lib/smarthome/backups/smarthome-20260710T090000Z.db.gpg');
   });
@@ -1702,12 +1729,12 @@ describe('PKG-212: a failed automatic rollback blocks the next deploy (V2)', () 
   );
 });
 
-describe('PKG-212: the restore hook is run exactly as before (no capture, no wrapper)', () => {
+describe('PKG-212: restore hook I/O remains uncaptured and unwrapped', () => {
   it('runs the original command text with inherited stdio and no buffer limit', () => {
-    const { runtime, execOptions } = makeReleaseRuntime({ fail: ['run-migrate'] });
+    const { runtime, execOptions, cfg } = makeReleaseRuntime({ fail: ['run-migrate'] });
     expect(() => release.deployRelease(relConfig(), {}, ctx(runtime))).toThrow();
     const restore = execOptions.find(({ command }) => command.includes('run-restore'))!;
-    expect(restore.command).toBe("cd /srv/app && export DEPLOY_KIT_BACKUP_ID='/var/lib/smarthome/backups/smarthome-20260710T090000Z.db.gpg'; run-restore");
+    expect(restore.command).toBe(`cd /srv/app/${cfg.currentLink} && export DEPLOY_KIT_BACKUP_ID='${cfg.backupId}'; run-restore`);
     expect(restore.options.stdio).toEqual(['inherit', 'inherit', 'inherit']);
     expect(restore.options.maxBuffer).toBeUndefined();
   });

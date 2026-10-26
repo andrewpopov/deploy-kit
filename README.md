@@ -125,7 +125,7 @@ text or redirection filenames.
 | `hooks.migrationsExclusive` | `boolean` | `false` | release | unreleased | Declares exclusive migration ownership and, together with `hooks.pendingMigrations` and `hooks.migrate`, turns on probe-first. Nothing else may migrate this database between the probe and the flip. See [Probe first](#probe-first-migrationsexclusive). |
 | `hooks.build` | `string \| null` | `null` | both | 0.1 | Build command. |
 | `hooks.restart` | `string \| null` | `null` | both | 0.3 | Override the app (re)start command. `null` → the `ecosystemFile`-aware start-or-restart idiom. |
-| `hooks.restore` | `string \| null` | `null` | both | 0.7 | Restore the pre-migration DB backup during release-layout recovery (gets `DEPLOY_KIT_BACKUP_ID`). `null` = no auto-restore. |
+| `hooks.restore` | `string \| null` | `null` | both | 0.7 | Restore the pre-migration DB backup during release-layout recovery, running inside the validated rollback-target release (gets `DEPLOY_KIT_BACKUP_ID`). Relative hook paths resolve there. `null` = no auto-restore. |
 | `layout` | `{type:'releases',…} \| null` | `null` | both | 0.7 | Opt-in artifact-first release layout (see below). `null` = legacy in-place deploy. |
 | `layout.keepReleases` | `number` | `4` | both | 0.7 | Releases retained when pruning (≥1). |
 | `layout.sharedPaths` | `string[]` | `[]` | both | 0.7 | Relative paths symlinked from `shared/` into every release (dirs, `.env`, uploads — never `node_modules` or a bare SQLite file). Validated relative + non-overlapping. |

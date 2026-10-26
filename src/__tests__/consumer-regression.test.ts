@@ -41,7 +41,7 @@ const { loadConfig } = kit;
 // "ssh hardening" suite in `deploy-kit.test.ts`. What THIS file actually
 // verifies is narrower and complementary: that deploy.js's/release.js's own
 // pipeline logic (step order, gating, which commands get built and when) is
-// byte-identical to v0.9.4 except for the three documented `applyIntentionalDeltas`
+// byte-identical to v0.9.4 except for the documented `applyIntentionalDeltas`
 // deltas below. Only log.js is genuinely unchanged since v0.9.4 (verified:
 // `git diff v0.9.4 HEAD -- src/log.js` is empty).
 function loadAtTag(relFile: string, tag: string, overrides: Record<string, unknown> = {}) {
@@ -362,6 +362,18 @@ function applyIntentionalDeltas(oldSeq: string[], config: unknown): string[] {
     seq = seq.flatMap((cmd) => (
       cmd.includes(runningShaCommand) ? Array.from({ length: attempts }, () => cmd) : [cmd]
     ));
+  }
+
+  // PKG-268: relative restore hooks resolve from the rollback target, not stale
+  // deployment-root source. Match only this consumer's exact restore command;
+  // the target below is the distinct current-pointer answer in makeRunner.
+  const restoreConfig = config as { projectDir?: string; hooks?: { restore?: string } };
+  if (isReleaseLayout && restoreConfig.projectDir && restoreConfig.hooks?.restore) {
+    const prefix = `cd ${restoreConfig.projectDir} && export DEPLOY_KIT_BACKUP_ID=`;
+    const suffix = `; ${restoreConfig.hooks.restore}`;
+    seq = seq.map(cmd => cmd.startsWith(prefix) && cmd.endsWith(suffix)
+      ? cmd.replace(`cd ${restoreConfig.projectDir} &&`, `cd ${restoreConfig.projectDir}/releases/deadbee-20260709T090000Z &&`)
+      : cmd);
   }
 
   return seq;
