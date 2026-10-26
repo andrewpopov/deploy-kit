@@ -646,6 +646,7 @@ function deployRelease(config, options = {}, ctx = {}) {
 
   const restoreDb = () => {
     if (!config.hooks.restore) return false;
+    assertSafeTarget(st.prevTarget, 'rollback restore target');
     // backupId is validated to a safe charset before migrate; single-quote anyway.
     // `export …; ` (not a bare assignment prefix) so the variable survives into
     // every command of a compound hook (`cd … && …`), not just the first one --
@@ -653,7 +654,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // "FOO='bar' cd /tmp && node -e \"console.log(process.env.FOO)\""` prints
     // undefined; `export FOO='bar'; cd /tmp && node …` prints bar).
     const env = st.backupId ? `export DEPLOY_KIT_BACKUP_ID='${st.backupId}'; ` : '';
-    const res = runInDir(paths.root, `${env}${config.hooks.restore}`, config, c, { tolerate: true });
+    const res = runInDir(`${paths.root}/${st.prevTarget}`, `${env}${config.hooks.restore}`, config, c, { tolerate: true });
     return res.ok;
   };
 
