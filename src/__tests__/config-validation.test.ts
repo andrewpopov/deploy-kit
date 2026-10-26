@@ -255,6 +255,23 @@ describe('config validation: nested key allowlisting (PKG-135 Finding 6)', () =>
     expect(problems).toEqual([]);
   });
 
+  describe('monitor.reAlertAfterMinutes', () => {
+    const check = (v: unknown) => validateConfig({ monitor: { alert: { command: 'x' }, reAlertAfterMinutes: v } }).join('\n');
+    it('accepts a number or a { warn, crit } object', () => {
+      expect(check(15)).toBe('');
+      expect(check({ warn: 360, crit: 60 })).toBe('');
+      expect(check({ crit: 0 })).toBe('');
+    });
+    it.each([
+      ['a negative level', { warn: -1 }],
+      ['a string level', { warn: '360' }],
+      ['an unknown level', { info: 5 }],
+      ['an array', [60]],
+    ])('rejects %s', (_name, v) => {
+      expect(check(v)).toMatch(/"monitor\.reAlertAfterMinutes" must be a non-negative number or an object/);
+    });
+  });
+
   // PKG-212: hooks.pendingMigrations is a registered hook (so it is neither an
   // unknown-key typo nor silently ignored), null disables it, and a blank command
   // is rejected rather than quietly meaning "always unknown".

@@ -141,7 +141,7 @@ text or redirection filenames.
 | `monitor.checks` | `{id,command,level?}[]` | `[]` | both | 0.8 | App-supplied checks; non-zero exit ⇒ alert at `level` (static severity). |
 | `monitor.disk` / `.backup` / `.restartStorm` / `.tunnel` | see below | off | both | 0.8 | Built-in host checks (omit a key to skip it). |
 | `monitor.failAfterRuns` / `.recoverAfterRuns` | `number` | `2` | both | 0.8 | Cross-run debounce before alert / recovery. |
-| `monitor.reAlertAfterMinutes` | `number` | `0` | both | 0.8 | Re-fire a still-failing alert after N minutes (0 = quiet). |
+| `monitor.reAlertAfterMinutes` | `number \| { warn?: number, crit?: number }` | `0` | both | 0.8 | Re-fire a still-failing alert after N minutes (0 = quiet). A number applies to warn and crit alike; an object sets each level separately (e.g. `{ "warn": 360, "crit": 60 }`), and a missing level is quiet. |
 | `monitor.stateFile` | `string` | `<dir>/.deploy-kit-monitor-state.json` | both | 0.8 | Abs path to monitor state — a STABLE dir, never under `releases/`. |
 | `monitor.checkTimeoutSeconds` | `number` | `20` | both | 0.8 | Per-check wall-clock bound. |
 | `deliveryEvent` | `{command} \| null` | `null` | both | 0.9 | Opt-in post-health delivery event (see `announce-discord` below). `null` = skip. `command` is the only valid key — a typo (e.g. `comand`) is now rejected at config load (unreleased) instead of silently no-op'ing the feature. |

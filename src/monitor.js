@@ -138,7 +138,9 @@ function monitor(config, options = {}, ctx = {}) {
   const m = config.monitor;
   const failAfterRuns = m.failAfterRuns || 2;
   const recoverAfterRuns = m.recoverAfterRuns || 2;
-  const reAlertAfterMinutes = m.reAlertAfterMinutes || 0;
+  // A number applies to warn and crit alike; { warn, crit } sets each level's reminder interval (a missing level = 0, quiet).
+  const reAlertConfig = m.reAlertAfterMinutes || 0;
+  const reAlertFor = (status) => (typeof reAlertConfig === 'object' ? reAlertConfig[status] || 0 : reAlertConfig);
   const nowMs = now();
 
   log.header(`🩺 Monitor (${config.mode}${config.host ? ` → ${config.host}` : ''})`);
@@ -151,7 +153,7 @@ function monitor(config, options = {}, ctx = {}) {
     const newAlerts = [];
     const nextChecks = { ...state.checks };
     for (const r of results) {
-      const { next, alert } = stepCheck(state.checks[r.id], r, { failAfterRuns, recoverAfterRuns, reAlertAfterMinutes, nowMs });
+      const { next, alert } = stepCheck(state.checks[r.id], r, { failAfterRuns, recoverAfterRuns, reAlertAfterMinutes: reAlertFor(r.status), nowMs });
       nextChecks[r.id] = next;
       if (alert) newAlerts.push(alert);
     }
