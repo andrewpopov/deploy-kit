@@ -127,8 +127,8 @@ export interface MonitorConfig {
   /** Cross-run debounce: consecutive runs a check must fail/recover before alerting. */
   failAfterRuns?: number;
   recoverAfterRuns?: number;
-  /** Re-fire a still-failing alert after this many minutes (0 = quiet). */
-  reAlertAfterMinutes?: number;
+  /** Re-fire a still-failing alert after this many minutes (0 = quiet). An object sets warn and crit separately; a missing level is quiet. */
+  reAlertAfterMinutes?: number | { warn?: number; crit?: number };
   /** Absolute path to the monitor state file — a STABLE dir, never under releases/. */
   stateFile?: string;
   checkTimeoutSeconds?: number;

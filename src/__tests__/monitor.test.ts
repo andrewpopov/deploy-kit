@@ -39,6 +39,7 @@ function makeMonitorRuntime(over: any = {}) {
     if (cmd.includes('cat >') && cmd.includes('monitor-state.json')) { stateStore = opts.input; return ''; }
     if (cmd.includes('cat ') && cmd.includes('monitor-state.json')) return stateStore;
     if (cmd.includes('ALERT-SINK')) { if (cfg.alertFails) throw new Error('sink failed'); delivered.push(opts && opts.input); return ''; }
+    if (cmd.includes('FAILING-CHECK')) throw new Error('check failed');
     if (cmd.includes('pm2 jlist')) { if (cfg.pm2Fails) throw new Error('pm2 down'); return JSON.stringify(cfg.pm2); }
     if (cmd.includes('df -kP')) { if (cfg.dfFails) throw new Error('df: cannot read'); return cfg.dfAvail; }
     if (cmd.includes('df -iP')) return cfg.dfInodes;
@@ -115,6 +116,40 @@ describe('monitor state machine (stepCheck)', () => {
 });
 
 // ---------------- monitor() end-to-end ----------------
+// reAlertAfterMinutes as { warn, crit }: monitor() resolves the interval from each
+// result's current status before handing it to stepCheck.
+describe('monitor() run: reAlertAfterMinutes per level', () => {
+  const MIN = 60000;
+  const failingCheck = (level: 'warn' | 'crit') => [{ id: 'svc', command: 'FAILING-CHECK', level }];
+  // Two runs clear the debounce and alert at NOW; then one run at NOW + minutes.
+  const reminderAfter = (level: 'warn' | 'crit', reAlertAfterMinutes: any, minutes: number) => {
+    const rt = makeMonitorRuntime();
+    const config = monConfig({ checks: failingCheck(level), reAlertAfterMinutes });
+    monitor(config, {}, ctx(rt));
+    monitor(config, {}, ctx(rt));
+    expect(rt.delivered.length).toBe(1);
+    monitor(config, {}, ctx(rt, NOW + minutes * MIN));
+    return rt.delivered.slice(1).map((d) => JSON.parse(d).alerts.map((a: any) => `${a.id}:${a.kind}`)).flat();
+  };
+  const split = { warn: 360, crit: 60 };
+
+  it('warn does not remind at +61 min but does at +361 min under { warn: 360, crit: 60 }', () => {
+    expect(reminderAfter('warn', split, 61)).toEqual([]);
+    expect(reminderAfter('warn', split, 361)).toEqual(['custom:svc:reminder']);
+  });
+  it('crit reminds at +61 min under { warn: 360, crit: 60 }', () => {
+    expect(reminderAfter('crit', split, 61)).toEqual(['custom:svc:reminder']);
+  });
+  it('a level missing from the object never reminds', () => {
+    expect(reminderAfter('warn', { crit: 60 }, 10_000)).toEqual([]);
+  });
+  it('the number form reminds warn and crit on the one interval', () => {
+    expect(reminderAfter('warn', 60, 61)).toEqual(['custom:svc:reminder']);
+    expect(reminderAfter('crit', 60, 61)).toEqual(['custom:svc:reminder']);
+    expect(reminderAfter('warn', 60, 59)).toEqual([]);
+  });
+});
+
 // PTRY-489: `deploy-kit monitor --local` forces mode:'local' via cli.js's
 // loadConfig override. Prove the effect at the layer that actually matters —
 // every command monitor() issues (checks + the alert sink) goes out through

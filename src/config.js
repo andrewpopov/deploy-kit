@@ -296,6 +296,12 @@ function isValidRefName(v) {
 }
 const MONITOR_KEYS = ['disk', 'backup', 'restartStorm', 'tunnel', 'publicProbes', 'checks', 'alert', 'failAfterRuns', 'recoverAfterRuns', 'reAlertAfterMinutes', 'stateFile', 'checkTimeoutSeconds'];
 
+function isNonNegNumber(v) { return typeof v === 'number' && v >= 0; }
+function isValidReAlertAfterMinutes(v) {
+  if (isNonNegNumber(v)) return true;
+  return v !== null && typeof v === 'object' && !Array.isArray(v)
+    && Object.keys(v).every((k) => (k === 'warn' || k === 'crit') && isNonNegNumber(v[k]));
+}
 function isPosInt(v) { return typeof v === 'number' && Number.isInteger(v) && v > 0; }
 
 // ---- Nested-object validation (PKG-135 Finding 6) ------------------------
@@ -562,7 +568,7 @@ function validateMonitor(m, source) {
   for (const k of ['failAfterRuns', 'recoverAfterRuns', 'checkTimeoutSeconds']) {
     if (m[k] != null && !isPosInt(m[k])) p.push(`${source}: "monitor.${k}" must be a positive integer`);
   }
-  if (m.reAlertAfterMinutes != null && !(typeof m.reAlertAfterMinutes === 'number' && m.reAlertAfterMinutes >= 0)) p.push(`${source}: "monitor.reAlertAfterMinutes" must be a non-negative number`);
+  if (m.reAlertAfterMinutes != null && !isValidReAlertAfterMinutes(m.reAlertAfterMinutes)) p.push(`${source}: "monitor.reAlertAfterMinutes" must be a non-negative number or an object { warn?, crit? } of non-negative numbers`);
   if (m.stateFile != null && !safeAbsPath(m.stateFile)) p.push(`${source}: "monitor.stateFile" must be an absolute path free of shell metacharacters`);
   if (m.tunnel != null && typeof m.tunnel !== 'boolean') p.push(`${source}: "monitor.tunnel" must be a boolean`);
   return p;
