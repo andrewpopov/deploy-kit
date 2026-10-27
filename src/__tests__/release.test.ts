@@ -68,6 +68,7 @@ function makeReleaseRuntime(over: any = {}) {
     }
     if (/pm2 stop /.test(cmd)) { if (!cfg.stopIneffective) stopped.add('app'); return ''; }
     if (/pm2 (startOrRestart|start|restart)/.test(cmd)) { stopped.clear(); return ''; }
+    if (cfg.restartHook && cmd.includes(cfg.restartHook)) { stopped.clear(); return ''; }
     if (cmd.includes('cat') && cmd.includes('deploy-kit-state.json')) return cfg.stateContent;
     if (cmd.includes('.deploy-kit-layout')) return cfg.marker;
     if (cmd.includes('mv --version')) return cfg.mvVersion;
@@ -1969,5 +1970,64 @@ describe('PKG-258 round 2: rollback identity, restoration vs startup, identical-
       expect(badRun.warnings.some((m) => /fleet alert webhook/.test(m))).toBe(true);
       expect(badRun.warnings.join('\n')).not.toContain('SECRET-TOKEN');
     });
+  });
+});
+
+describe('PKG-272 release custom activation', () => {
+  const hook = 'guarded-activate-runtime';
+  const customConfig = () => {
+    const config = relConfig();
+    config.hooks.restart = hook;
+    return config;
+  };
+
+  it('RESTART_DEFAULT preserves the stable ecosystem command', () => {
+    expect(release.pm2Activate(relConfig(), { root: '/srv/app' }))
+      .toBe('pm2 startOrRestart /srv/app/shared/ecosystem.config.cjs --update-env');
+  });
+
+  it.each(['migrate', 'skip', 'none'])('RESTART_FORWARD uses the override after flip: %s', mode => {
+    const rt = makeReleaseRuntime({ restartHook: hook, pending: '0' });
+    const config = customConfig();
+    if (mode === 'none') config.hooks.pendingMigrations = 'check-pending';
+    release.deployRelease(config, { skipMigrate: mode === 'skip' }, ctx(rt.runtime));
+    const start = rt.calls.findIndex(command => command.includes(hook));
+    const flip = rt.calls.findIndex(command => /mv -Tf .*\/current/.test(command));
+    expect(start).toBeGreaterThan(flip);
+    expect(flip).toBeGreaterThan(-1);
+    expect(rt.calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
+  });
+
+  it('RESTART_FORWARD_REJECT cannot treat a healthy process as an accepted activation', () => {
+    const rt = makeReleaseRuntime({ restartHook: hook, fail: [hook] });
+    expect(() => release.deployRelease(customConfig(), { skipMigrate: true }, ctx(rt.runtime))).toThrow();
+    expect(rt.calls.some(command => command.includes(hook))).toBe(true);
+    expect(rt.calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
+  });
+
+  it('RESTART_PREMIGRATION_REJECT preserves hook rejection during previous-release resumption', () => {
+    const rt = makeReleaseRuntime({ restartHook: hook, fail: ['run-backup', hook],
+      canonical: '/srv/app/releases/00000000aaaa-20260709T090000Z' });
+    expect(() => release.deployRelease(customConfig(), {}, ctx(rt.runtime)))
+      .toThrow(/MANUAL RECOVERY|required|failed to bring/i);
+    expect(rt.calls.some(command => command.includes(hook))).toBe(true);
+    expect(rt.calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
+  });
+
+  it('RESTART_MANUAL uses the override for the selected previous target', () => {
+    const rt = makeReleaseRuntime({ restartHook: hook,
+      canonical: '/srv/app/releases/00000000bbbb-20260708T090000Z' });
+    release.rollbackRelease(customConfig(), {}, ctx(rt.runtime));
+    expect(rt.calls.filter(command => command.includes(hook))).toHaveLength(1);
+    expect(rt.calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
+  });
+
+  it('RESTART_MANUAL_REJECT rejects both rollback and recovery hooks despite an online process', () => {
+    const rt = makeReleaseRuntime({ restartHook: hook, fail: [hook],
+      canonical: '/srv/app/releases/00000000aaaa-20260709T090000Z' });
+    expect(() => release.rollbackRelease(customConfig(), {}, ctx(rt.runtime)))
+      .toThrow(/MANUAL RECOVERY REQUIRED.*custom restart hook/i);
+    expect(rt.calls.filter(command => command.includes(hook))).toHaveLength(2);
+    expect(rt.calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
   });
 });

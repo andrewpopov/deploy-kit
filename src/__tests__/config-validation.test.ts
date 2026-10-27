@@ -373,3 +373,14 @@ describe('config validation: transitionAuthority (PKG-266)', () => {
     expect(kit.mergeConfig(DEFAULT_CONFIG, { hooks: { build: 'x' } }).transitionAuthority).toBeNull();
   });
 });
+
+describe('PKG-272 restart command validation', () => {
+  it.each(['', ' ', '\t\n'])('RESTART_BLANK refuses an empty activation override: %j', command => {
+    expect(validateConfig({ hooks: { restart: command } }).join())
+      .toContain('"hooks.restart" must be a non-empty command');
+  });
+  it('RESTART_CONFIG accepts explicit default or a real command', () => {
+    expect(validateConfig({ hooks: { restart: null } })).toEqual([]);
+    expect(validateConfig({ hooks: { restart: 'node /srv/app/shared/activate.cjs' } })).toEqual([]);
+  });
+});

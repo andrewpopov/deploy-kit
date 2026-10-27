@@ -791,9 +791,11 @@ function validateConfig(raw, { source = 'config' } = {}) {
     problems.push(...validateBlock(raw.hooks, HOOKS_TYPES, source, 'hooks'));
     // A blank command would exit 0 with no output: unparseable, so it could only
     // ever mean "unknown". Reject the typo instead of silently disabling the skip.
-    const pending = raw.hooks.pendingMigrations;
-    if (typeof pending === 'string' && !pending.trim()) {
-      problems.push(`${source}: "hooks.pendingMigrations" must be a non-empty command (use null to disable)`);
+    for (const key of ['pendingMigrations', 'restart']) {
+      const command = raw.hooks[key];
+      if (typeof command === 'string' && !command.trim()) {
+        problems.push(`${source}: "hooks.${key}" must be a non-empty command (use null to disable)`);
+      }
     }
   }
   if (raw.health != null && typeof raw.health === 'object' && !Array.isArray(raw.health)) {
