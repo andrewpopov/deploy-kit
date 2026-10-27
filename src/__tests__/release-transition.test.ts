@@ -159,6 +159,15 @@ function makeTarget(events: string[], over: { builtSha?: string; stateRead?: Sta
     if (modelled !== undefined) return modelled;
     if (over.headFails && cmd.startsWith('cd /srv/app/releases/') && cmd.endsWith('git rev-parse HEAD')) throw execFailure(over.builtSha ?? SHA);
     if (cmd.includes('.deploy-kit-last-deploy.json.tmp')) { t.lastDeploy = cmd; events.push('target:last-deploy'); return ''; }
+    if (cmd.includes('/.deploy-kit-state.json.tmp')) {
+      const match = /printf '%s' '(.*?)' > /.exec(cmd);
+      if (!match) throw new Error('unrecognised unfenced journal write');
+      const body = match[1];
+      JSON.parse(body);
+      t.stateText = body; t.stateWrites.push(body);
+      return '';
+    }
+    if (cmd.includes(STATE_FILE) && cmd.includes('cat ')) return t.stateText || '';
     if (cmd.includes(STATE_FILE)) throw new Error(`unrecognised phase journal command: ${cmd}`);
     if (/pm2 stop /.test(cmd)) { t.stopped = true; return ''; }
     if (/pm2 (startOrRestart|start|restart)/.test(cmd)) { t.stopped = false; return ''; }
@@ -793,9 +802,9 @@ describe('PKG-272 fenced custom activation', () => {
     } });
     expect(() => host.deploy(target)).toThrow();
     expect(host.authority.actions).not.toContain('complete');
-    expect(host.authority.actions.filter(action => action === 'begin')).toHaveLength(2);
+    expect(host.authority.actions).toEqual(['begin', 'abandon', 'begin', 'abandon', 'begin', 'abandon']);
     expect(host.journal().operations.every(operation => operation.state !== 'COMPLETED')).toBe(true);
-    expect(calls.filter(command => command.includes(hook))).toHaveLength(1);
+    expect(calls.filter(command => command.includes(hook))).toHaveLength(2);
     expect(calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
     expect(rb.s).toMatchObject({ current: ORIG_DIR, running: ORIG_DIR, online: true, restarts: 0 });
   });
