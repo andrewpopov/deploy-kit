@@ -117,6 +117,7 @@ function capture(dir, command, config, ctx, { readOnly = false } = {}) {
 // it respawns each child (verified post-flip via /proc/<pid>/cwd). Not `reload`
 // (graceful overlap is undesirable around a SQLite migration).
 function pm2Activate(config, paths) {
+  if (config.hooks.restart) return config.hooks.restart;
   const eco = `${paths.root}/${config.ecosystemFile}`;
   return `pm2 startOrRestart ${eco} --update-env`;
 }
@@ -629,19 +630,20 @@ function deployRelease(config, options = {}, ctx = {}) {
   const resumePrevious = (targetSha = null) => {
     // Bring the previous release's apps back and verify it is actually healthy —
     // a zero-exit `pm2 start` is not proof (Codex).
-    runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
+    const activation = runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
+    if (config.hooks.restart && !activation.ok) return { ok: false, reason: 'custom restart hook rejected activation' };
     return verifyActivation(config, paths, targetSha, `${paths.root}/${st.prevTarget}`, c);
   };
 
-  // The rollback target is restored (DB and pointer) but did not verify. It must still
-  // end up RUNNING: a rollback that cannot prove health is a reason to alert, never a
-  // reason to leave the service stopped. Starts the apps again only when one is not online.
+  // Default activation keeps an unverified rollback target running for diagnosis.
+  // A custom hook must accept activation even when a process is already online:
+  // health cannot bypass its policy, and its rejection may leave the app stopped.
   const ensureRollbackTargetRunning = () => {
     const runsFromTarget = () => appsRunFromRelease(config, paths, `${paths.root}/${st.prevTarget}`, c).ok;
-    if (runsFromTarget()) return true;
-    log.warning('Rollback target is not fully online (or an app still runs from another release); starting its apps again');
-    runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
-    return runsFromTarget();
+    if (!config.hooks.restart && runsFromTarget()) return { activationAccepted: true, appsOnline: true };
+    log.warning('Revalidating activation of the rollback target');
+    const activation = runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
+    return { activationAccepted: !config.hooks.restart || activation.ok, appsOnline: runsFromTarget() };
   };
 
   const restoreDb = () => {
@@ -720,7 +722,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       // Protected: read-only facts only; a restart would be an unfenced nested mutation.
       const appsOnline = targetSha
         ? appsRunFromRelease(config, paths, `${paths.root}/${st.prevTarget}`, c).ok
-        : ensureRollbackTargetRunning();
+        : ensureRollbackTargetRunning().appsOnline;
       fail(
         `the previous release did not come back healthy after DB/symlink recovery (${resumed.reason}); `
         + `its apps were left ${appsOnline ? 'running' : 'NOT online'}`,
@@ -1194,13 +1196,14 @@ function deployRelease(config, options = {}, ctx = {}) {
       priorPointer: st.prevTarget, parentOperationId: first.operationId,
     }, () => {
       journal({ phase: 'forward-recovery-restart', sha: previousSha });
-      ensureRollbackTargetRunning();
+      const activation = ensureRollbackTargetRunning();
       if (postDeploy) {
-        const running = appsRunFromRelease(config, paths, targetDir, c).ok;
-        const healthy = running && verifyActivation(config, paths, previousSha, targetDir, c).ok;
+        const running = activation.appsOnline;
+        const healthy = activation.activationAccepted && running && verifyActivation(config, paths, previousSha, targetDir, c).ok;
         reportRollbackOutcome(healthy ? 'rolled-back' : (running ? 'rollback-failed-running' : 'rollback-failed-not-started'), true);
       }
-      return { observedSha: previousSha, verified: verifyActivation(config, paths, previousSha, targetDir, c).ok };
+      return { observedSha: previousSha,
+        verified: activation.activationAccepted && verifyActivation(config, paths, previousSha, targetDir, c).ok };
     });
     if (restart.runtimeFailure) {
       throw withFacts(recoveryRequired('recovery restart failed and was abandoned UNKNOWN; recovery assessment required', restart.runtimeFailure), restart.operationId);
@@ -1956,7 +1959,10 @@ function recoverFailedRollback(config, paths, originalCurrent, c, reason, restor
       + 'running before touching PM2 yourself.',
     );
   }
-  runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
+  const activation = runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
+  if (config.hooks.restart && !activation.ok) {
+    throw new Error(`MANUAL RECOVERY REQUIRED — ${reason} AND the original release's custom restart hook rejected activation.`);
+  }
   const back = verifyActivation(config, paths, restoredSha, `${paths.root}/${originalCurrent}`, c);
   if (!back.ok) {
     throw new Error(`MANUAL RECOVERY REQUIRED — ${reason} AND the original release did not come back (${back.reason}).`);
@@ -2048,7 +2054,12 @@ function rollbackRelease(config, options = {}, ctx = {}) {
         }
       }
       reportStep('pm2-restart');
-      runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
+      const activation = runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
+      if (config.hooks.restart && !activation.ok) {
+        const reason = 'Custom restart hook rejected rollback activation';
+        if (targetSha) throw new Error(reason);
+        recoverFailedRollback(config, paths, originalCurrent, c, reason);
+      }
       runInDir(paths.root, 'pm2 save 2>/dev/null || true', config, c, { tolerate: true });
 
       const v = verifyActivation(config, paths, targetSha, `${paths.root}/${pointers.previous}`, c);
