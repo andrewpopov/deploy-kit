@@ -640,11 +640,10 @@ function deployRelease(config, options = {}, ctx = {}) {
   // health cannot bypass its policy, and its rejection may leave the app stopped.
   const ensureRollbackTargetRunning = () => {
     const runsFromTarget = () => appsRunFromRelease(config, paths, `${paths.root}/${st.prevTarget}`, c).ok;
-    if (!config.hooks.restart && runsFromTarget()) return true;
+    if (!config.hooks.restart && runsFromTarget()) return { activationAccepted: true, appsOnline: true };
     log.warning('Revalidating activation of the rollback target');
     const activation = runInDir(paths.root, pm2Activate(config, paths), config, c, { tolerate: true });
-    if (config.hooks.restart && !activation.ok) return false;
-    return runsFromTarget();
+    return { activationAccepted: !config.hooks.restart || activation.ok, appsOnline: runsFromTarget() };
   };
 
   const restoreDb = () => {
@@ -723,7 +722,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       // Protected: read-only facts only; a restart would be an unfenced nested mutation.
       const appsOnline = targetSha
         ? appsRunFromRelease(config, paths, `${paths.root}/${st.prevTarget}`, c).ok
-        : ensureRollbackTargetRunning();
+        : ensureRollbackTargetRunning().appsOnline;
       fail(
         `the previous release did not come back healthy after DB/symlink recovery (${resumed.reason}); `
         + `its apps were left ${appsOnline ? 'running' : 'NOT online'}`,
@@ -1197,13 +1196,14 @@ function deployRelease(config, options = {}, ctx = {}) {
       priorPointer: st.prevTarget, parentOperationId: first.operationId,
     }, () => {
       journal({ phase: 'forward-recovery-restart', sha: previousSha });
-      ensureRollbackTargetRunning();
+      const activation = ensureRollbackTargetRunning();
       if (postDeploy) {
-        const running = appsRunFromRelease(config, paths, targetDir, c).ok;
-        const healthy = running && verifyActivation(config, paths, previousSha, targetDir, c).ok;
+        const running = activation.appsOnline;
+        const healthy = activation.activationAccepted && running && verifyActivation(config, paths, previousSha, targetDir, c).ok;
         reportRollbackOutcome(healthy ? 'rolled-back' : (running ? 'rollback-failed-running' : 'rollback-failed-not-started'), true);
       }
-      return { observedSha: previousSha, verified: verifyActivation(config, paths, previousSha, targetDir, c).ok };
+      return { observedSha: previousSha,
+        verified: activation.activationAccepted && verifyActivation(config, paths, previousSha, targetDir, c).ok };
     });
     if (restart.runtimeFailure) {
       throw withFacts(recoveryRequired('recovery restart failed and was abandoned UNKNOWN; recovery assessment required', restart.runtimeFailure), restart.operationId);

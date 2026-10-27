@@ -366,7 +366,8 @@ function dryRunContext(config, options = {}) {
     const rendered = [file, ...args].join(' ');
     log.step(`[dry-run] ${rendered}`);
     if (rendered.includes('pm2 stop ')) appsStopped = true;
-    if (/pm2 (startOrRestart|start|restart) /.test(rendered)) appsStopped = false;
+    if (/pm2 (startOrRestart|start|restart) /.test(rendered)
+      || (config.hooks.restart && rendered.includes(config.hooks.restart))) appsStopped = false;
     const mergeMatch = rendered.match(/git merge --ff-only '([0-9a-f]{7,64})'/);
     if (mergeMatch) headSha = mergeMatch[1];
     return plannedOutput(rendered);

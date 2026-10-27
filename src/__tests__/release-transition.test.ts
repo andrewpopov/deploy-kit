@@ -27,6 +27,7 @@ const SHA_OF: Record<string, string> = { [ORIG_DIR]: ORIG_FULL, [PREV_DIR]: PREV
 const execFailure = (stdout: string) => Object.assign(new Error('Command failed'), { stdout, status: 1 });
 
 interface RollbackOpts {
+  restartCommand?: string;
   flipFails?: (relTarget: string, dest: string) => boolean; checkFails?: boolean; headFails?: (relDir: string) => boolean;
   probeSha?: (call: number) => string | undefined; // override the running-SHA answer for one probe call
 }
@@ -60,7 +61,7 @@ function makeRollbackHost(opts: RollbackOpts = {}) {
     }
     if (cmd.includes('pre-restart-smoke')) { if (opts.checkFails) throw execFailure(''); return ''; }
     if (/pm2 stop /.test(cmd)) { s.online = false; return ''; }
-    if (/pm2 startOrRestart/.test(cmd)) { s.restarts += 1; s.running = s.current; s.online = true; return ''; }
+    if (/pm2 startOrRestart/.test(cmd) || (opts.restartCommand && cmd.includes(opts.restartCommand))) { s.restarts += 1; s.running = s.current; s.online = true; return ''; }
     if (cmd.includes('pm2 jlist')) return JSON.stringify([{ name: 'app', pid: 111, pm2_env: { status: s.online ? 'online' : 'stopped', restart_time: 5 } }]);
     if (cmd.startsWith('readlink /srv/app/current')) return s.current;
     if (cmd.startsWith('readlink /srv/app/previous')) return s.previous;
@@ -126,7 +127,7 @@ function makeTarget(events: string[], over: { builtSha?: string; stateRead?: Sta
   });
   const tags: Array<[RegExp, string]> = [
     [/pre-hook/, 'pre-hook'], [/npm ci/, 'install'], [/npm run build/, 'build'], [/pm2 stop/, 'stop'],
-    [/run-backup/, 'backup'], [/run-migrate/, 'migrate'], [/mv -Tf/, 'flip'], [/pm2 (startOrRestart|start|restart)/, 'restart'],
+    [/run-backup/, 'backup'], [/run-migrate/, 'migrate'], [/mv -Tf/, 'flip'], [/pm2 (startOrRestart|start|restart)|guarded-activate-runtime/, 'restart'],
     [/pre-restart-smoke/, 'check'], [/run-restore/, 'restore'],
   ];
   const execFileSync = (_file: string, args: string[], options?: { input?: string }) => {
@@ -759,5 +760,118 @@ describe('protected manual rollback', () => {
     expect(host.authority.actions).toEqual([]);
     expect(host.durable.store.writes).toBe(0);
     expect(host.runtimeEvents()).toEqual([]);
+  });
+});
+
+describe('PKG-272 fenced custom activation', () => {
+  const hook = 'guarded-activate-runtime';
+
+  it('RESTART_FENCED_RECOVERY runs the override only inside the fresh authorized recovery child', () => {
+    const host = makeHost({ config: { hooks: { restart: hook } } });
+    const rb = makeRollbackHost({ restartCommand: hook });
+    const calls: string[] = [];
+    const target = makeTarget(host.events, { rb, onCommand: command => {
+      calls.push(command);
+      if (command.includes('pm2 stop')) throw execFailure('');
+    } });
+    expect(() => host.deploy(target)).toThrow(/recovered/);
+    expect(host.authority.actions).toEqual(['begin', 'abandon', 'begin', 'complete']);
+    expect(host.journal().operations.map(operation => operation.state)).toEqual(['ABANDONED', 'COMPLETED']);
+    expect(calls.filter(command => command.includes(hook))).toHaveLength(1);
+    expect(calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
+    expect(host.events.indexOf('target:restart')).toBeGreaterThan(host.events.lastIndexOf('storage:MUTATING'));
+    expect(rb.s).toMatchObject({ current: ORIG_DIR, running: ORIG_DIR, restarts: 1 });
+  });
+
+  it('RESTART_FENCED_REJECT never completes a child after hook rejection despite healthy original processes', () => {
+    const host = makeHost({ config: { hooks: { restart: hook } } });
+    const rb = makeRollbackHost({ restartCommand: hook });
+    const calls: string[] = [];
+    const target = makeTarget(host.events, { rb, onCommand: command => {
+      calls.push(command);
+      if (command.includes('pm2 stop') || command.includes(hook)) throw execFailure('');
+    } });
+    expect(() => host.deploy(target)).toThrow();
+    expect(host.authority.actions).not.toContain('complete');
+    expect(host.authority.actions.filter(action => action === 'begin')).toHaveLength(2);
+    expect(host.journal().operations.every(operation => operation.state !== 'COMPLETED')).toBe(true);
+    expect(calls.filter(command => command.includes(hook))).toHaveLength(1);
+    expect(calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
+    expect(rb.s).toMatchObject({ current: ORIG_DIR, running: ORIG_DIR, online: true, restarts: 0 });
+  });
+
+  it('RESTART_FENCED_MANUAL uses the hook for the exact previous SHA', () => {
+    const host = makeHost({ config: { hooks: { restart: hook } } });
+    const rb = makeRollbackHost({ restartCommand: hook });
+    const calls: string[] = [];
+    const target = makeTarget(host.events, { rb, onCommand: command => { calls.push(command); } });
+    expect(host.rollback(target).healthy).toBe(true);
+    expect(rb.s).toMatchObject({ current: PREV_DIR, running: PREV_DIR, restarts: 1 });
+    expect(host.authority.actions).toEqual(['begin', 'complete']);
+    expect(calls.filter(command => command.includes(hook))).toHaveLength(1);
+    expect(calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
+  });
+
+  it.each([false, true])('RESTART_FENCED_CHILD_REJECTS_HEALTHY guards the restart child acceptance=%s', accepted => {
+    const rb = makeRollbackHost({ restartCommand: hook,
+      probeSha: call => call <= 4 ? OTHER_SHA : undefined });
+    const host = makeHost({ config: { hooks: { restart: hook } } });
+    let hookCalls = 0;
+    const commands: string[] = [];
+    const target = makeTarget(host.events, { rb, onCommand: command => {
+      commands.push(command);
+      if (command.includes(hook)) {
+        hookCalls++;
+        if (hookCalls === 3 && !accepted) throw execFailure('');
+      }
+    } });
+    expect(() => host.deploy(target)).toThrow(accepted ? /recovered/ : /manual recovery/i);
+    expect(hookCalls).toBe(3);
+    const requests = host.authority.requests.map(request => JSON.parse(request));
+    expect(requests[4]).toMatchObject({ kind: 'recovery-restart',
+      parentOperationId: requests[2].operationId, targetSha: ORIG_FULL, targetRelease: ORIG_DIR });
+    expect(host.journal().operations.map(operation => operation.state))
+      .toEqual(['ABANDONED', 'ABANDONED', accepted ? 'COMPLETED' : 'ABANDONED']);
+    expect(host.authority.actions.at(-1)).toBe(accepted ? 'complete' : 'abandon');
+    expect(phaseOf(target).phase).toBe(accepted ? 'recovered' : 'forward-recovery-failed');
+    expect(rb.s).toMatchObject({ current: ORIG_DIR, running: ORIG_DIR, online: true,
+      restarts: accepted ? 3 : 2 });
+    expect(commands.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
+  });
+});
+
+describe('PKG-272 unfenced running facts', () => {
+  it.each([false, true])('RESTART_FALLBACK_REJECTION_PRESERVES_RUNNING_FACT fallback accepts=%s', accepted => {
+    const hook = 'guarded-activate-runtime';
+    const config = relConfig({ hooks: { restart: hook }, deliveryEvent: true,
+      postDeployChecks: [{ name: 'post-smoke', command: 'post-check-fail', onFailure: 'rollback' }] });
+    config.transitionAuthority = null;
+    const events: string[] = [];
+    const rb = makeRollbackHost({ restartCommand: hook });
+    let hookCalls = 0;
+    const commands: string[] = [];
+    const target = makeTarget(events, { rb, onCommand: command => {
+      commands.push(command);
+      if (command.includes('post-check-fail')) throw execFailure('');
+      if (command.includes(hook)) {
+        hookCalls++;
+        if (hookCalls === 2 || (hookCalls === 3 && !accepted)) {
+          rb.s.running = rb.s.current;
+          rb.s.online = true; // partial activation can resume the right app yet return nonzero
+          throw execFailure('');
+        }
+      }
+    } });
+    expect(() => release.deployRelease(config, { skipMigrate: true }, {
+      runtime: { execFileSync: target.execFileSync }, sleep: () => {},
+      now: () => Date.parse('2026-07-10T09:00:00Z'),
+    })).toThrow(/MANUAL RECOVERY REQUIRED/);
+    expect(hookCalls).toBe(3);
+    expect(rb.s).toMatchObject({ current: ORIG_DIR, running: ORIG_DIR, online: true });
+    expect(phaseOf(target)).toMatchObject({ phase: 'post-deploy-rollback-failed' });
+    const delivery = JSON.parse(target.t.deliveries.at(-1)!);
+    expect(delivery).toMatchObject({ appsState: 'running', activeRelease: ORIG_DIR,
+      recovery: { verified: false, outcome: 'rollback-failed-running' } });
+    expect(commands.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
   });
 });

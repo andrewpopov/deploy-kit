@@ -62,6 +62,7 @@ function makeReleaseRuntime(over: any = {}) {
       throw err;
     }
     if (cfg.fail.some((f: string) => cmd.includes(f))) {
+      if (cfg.rejectedHookLeavesOnline && cfg.restartHook && cmd.includes(cfg.restartHook)) stopped.clear();
       const err: any = new Error(`fake failure: ${cmd}`);
       err.stdout = '';
       throw err;
@@ -1999,14 +2000,21 @@ describe('PKG-272 release custom activation', () => {
   });
 
   it('RESTART_FORWARD_REJECT cannot treat a healthy process as an accepted activation', () => {
-    const rt = makeReleaseRuntime({ restartHook: hook, fail: [hook] });
-    expect(() => release.deployRelease(customConfig(), { skipMigrate: true }, ctx(rt.runtime))).toThrow();
+    const rt = makeReleaseRuntime({ restartHook: hook, rejectedHookLeavesOnline: true, fail: [hook],
+      canonical: '/srv/app/releases/00000000aaaa-20260709T090000Z' });
+    let failure: Error | undefined;
+    try { release.deployRelease(customConfig(), { skipMigrate: true }, ctx(rt.runtime)); }
+    catch (error) { failure = error as Error; }
+    expect(failure?.message).toMatch(/MANUAL RECOVERY REQUIRED/);
+    const journals = rt.calls.filter(command => command.includes('.deploy-kit-state.json.tmp'))
+      .map(command => JSON.parse(/printf '%s' '(.*?)' > /.exec(command)![1]));
+    expect(journals.at(-1).phase).not.toBe('recovered');
     expect(rt.calls.some(command => command.includes(hook))).toBe(true);
     expect(rt.calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
   });
 
   it('RESTART_PREMIGRATION_REJECT preserves hook rejection during previous-release resumption', () => {
-    const rt = makeReleaseRuntime({ restartHook: hook, fail: ['run-backup', hook],
+    const rt = makeReleaseRuntime({ restartHook: hook, rejectedHookLeavesOnline: true, fail: ['run-backup', hook],
       canonical: '/srv/app/releases/00000000aaaa-20260709T090000Z' });
     expect(() => release.deployRelease(customConfig(), {}, ctx(rt.runtime)))
       .toThrow(/MANUAL RECOVERY|required|failed to bring/i);
@@ -2028,6 +2036,87 @@ describe('PKG-272 release custom activation', () => {
     expect(() => release.rollbackRelease(customConfig(), {}, ctx(rt.runtime)))
       .toThrow(/MANUAL RECOVERY REQUIRED.*custom restart hook/i);
     expect(rt.calls.filter(command => command.includes(hook))).toHaveLength(2);
+    expect(rt.calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
+  });
+});
+
+describe('PKG-272 custom activation recovery paths', () => {
+  const hook = 'guarded-activate-runtime';
+  const configWithHook = () => {
+    const config = relConfig();
+    config.hooks.restart = hook;
+    return config;
+  };
+
+  it('RESTART_DRY_RUN plans custom activation without a target execution seam', () => {
+    const config = configWithHook();
+    const plan = cli.dryRunContext(config);
+    expect(plan.runtime.realExecFileSync).toBe(plan.runtime.execFileSync);
+    const planned = plan.runtime.execFileSync;
+    const calls: string[] = [];
+    const observe = (file: string, args: string[]) => {
+      calls.push([file, ...args].join(' '));
+      return planned(file, args);
+    };
+    plan.runtime.execFileSync = observe;
+    plan.runtime.realExecFileSync = observe;
+    const result = release.deployRelease(config, {}, plan);
+    expect(result.healthy).toBe(true);
+    expect(calls.filter(command => command.includes(hook))).toHaveLength(1);
+    expect(calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
+  });
+
+  it('RESTART_POINTER_FAILURE never invokes a custom hook after an unconfirmed recovery flip', () => {
+    const rt = makeReleaseRuntime();
+    rt.cfg.fail.push('check-port', 'ln -s ' + rt.cfg.currentLink + ' ');
+    const config = configWithHook();
+    config.preRestartChecks = [{ name: 'port', command: 'check-port' }];
+    expect(() => release.rollbackRelease(config, {}, ctx(rt.runtime))).toThrow(/MANUAL RECOVERY REQUIRED/);
+    expect(rt.calls.some(command => command.includes('ln -s ' + rt.cfg.previousLink))).toBe(true);
+    expect(rt.calls.some(command => command.includes('ln -s ' + rt.cfg.currentLink))).toBe(true);
+    expect(rt.calls.some(command => command.includes(hook))).toBe(false);
+    expect(rt.calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
+  });
+
+  it('RESTART_ONLINE_FALLBACK rechecks a rejected custom hook even with matching online processes', () => {
+    const rt = makeReleaseRuntime({ restartHook: hook, fail: ['run-smoke'] });
+    const config = configWithHook();
+    config.postDeployChecks = [{ name: 'smoke', command: 'run-smoke', onFailure: 'rollback' }];
+    let attempts = 0;
+    const inner = rt.runtime.execFileSync;
+    const runtime = {
+      execFileSync(file: string, args: string[], options: { input?: string } = {}) {
+        const command = args.at(-1) || '';
+        if (command.includes('ln -s ' + rt.cfg.currentLink + ' ')) {
+          rt.cfg.canonical = '/srv/app/' + rt.cfg.currentLink;
+        }
+        if (command.includes(hook)) {
+          attempts++;
+          if (attempts > 1) {
+            rt.calls.push(command);
+            throw Object.assign(new Error('activation rejected'), { stdout: '', status: 1 });
+          }
+        }
+        return inner(file, args, options);
+      },
+    };
+    expect(() => release.deployRelease(config, { skipMigrate: true }, ctx(runtime)))
+      .toThrow(/MANUAL RECOVERY REQUIRED/);
+    expect(attempts).toBe(3); // forward, resume, then guarded fallback despite online matching cwd
+    expect(rt.calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
+  });
+});
+
+describe('PKG-272 probe-first zero migrations', () => {
+  it('RESTART_PROBE_FIRST_NO_MIGRATION activates without stop, backup or migration after a zero proof', () => {
+    const hook = 'guarded-activate-runtime';
+    const rt = makeReleaseRuntime({ restartHook: hook, pending: '0' });
+    const config = relConfig();
+    Object.assign(config.hooks, { restart: hook, pendingMigrations: 'check-pending', migrationsExclusive: true });
+    expect(release.deployRelease(config, {}, ctx(rt.runtime)).healthy).toBe(true);
+    expect(rt.calls.some(command => command.includes('check-pending'))).toBe(true);
+    expect(rt.calls.some(command => /pm2 stop |run-backup|run-migrate/.test(command))).toBe(false);
+    expect(rt.calls.filter(command => command.includes(hook))).toHaveLength(1);
     expect(rt.calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
   });
 });
