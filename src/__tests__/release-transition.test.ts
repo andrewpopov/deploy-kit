@@ -875,3 +875,38 @@ describe('PKG-272 unfenced running facts', () => {
     expect(commands.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
   });
 });
+
+describe('PKG-272 fenced post-deploy rejection reporting', () => {
+  it('RESTART_FENCED_POST_REJECT never reports rolled-back when a healthy target fails its activation guard', () => {
+    const hook = 'guarded-activate-runtime';
+    const host = makeHost({ config: { hooks: { restart: hook }, deliveryEvent: true,
+      postDeployChecks: [{ name: 'post-smoke', command: 'post-check-fail', onFailure: 'rollback' }] } });
+    const rb = makeRollbackHost({ restartCommand: hook });
+    let hookCalls = 0;
+    const commands: string[] = [];
+    const target = makeTarget(host.events, { rb, onCommand: command => {
+      commands.push(command);
+      if (command.includes('post-check-fail')) throw execFailure('');
+      if (command.includes(hook)) {
+        hookCalls++;
+        if (hookCalls > 1) {
+          rb.s.running = rb.s.current;
+          rb.s.online = true;
+          throw execFailure('');
+        }
+      }
+    } });
+    expect(() => host.deploy(target)).toThrow(/manual recovery/i);
+    expect(hookCalls).toBe(3);
+    expect(host.authority.actions).toEqual(['begin', 'abandon', 'begin', 'abandon', 'begin', 'abandon']);
+    expect(host.journal().operations.every(operation => operation.state === 'ABANDONED')).toBe(true);
+    expect(phaseOf(target)).toMatchObject({ phase: 'post-deploy-rollback-failed' });
+    const deliveries = target.t.deliveries.map(body => JSON.parse(body));
+    expect(deliveries.length).toBeGreaterThan(0);
+    expect(deliveries.every(delivery => delivery.recovery.outcome !== 'rolled-back')).toBe(true);
+    expect(deliveries.at(-1)).toMatchObject({ appsState: 'running', activeRelease: ORIG_DIR,
+      recovery: { outcome: 'rollback-failed-running', verified: false } });
+    expect(rb.s).toMatchObject({ current: ORIG_DIR, running: ORIG_DIR, online: true });
+    expect(commands.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
+  });
+});
