@@ -171,6 +171,8 @@ describe('createDeployRecorder', () => {
       const home = tmp();
       fs.mkdirSync(historyDir(home), { recursive: true, mode: 0o700 });
       expect(spawnSync('mkfifo', [historyFile(home)]).status).toBe(0);
+      // 0600 like a real history file, so only the regular-file check can reject it.
+      fs.chmodSync(historyFile(home), 0o600);
       const warn = run(home);
       expect(warn).toHaveBeenCalledTimes(1);
       expect(warn.mock.calls[0][0]).toMatch(/^deploy-kit: deploy history not recorded \(history file (unavailable|unsafe)\)$/);
