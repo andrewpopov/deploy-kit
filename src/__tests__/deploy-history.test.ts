@@ -3,6 +3,7 @@ import { createRequire } from 'module';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
+import { spawnSync } from 'child_process';
 
 const require = createRequire(__filename);
 const { createDeployRecorder } = require('../deploy-history.js') as { createDeployRecorder: (o: any) => { onStep: (e: any) => void; finish: (r: any) => void } };
@@ -56,7 +57,8 @@ describe('createDeployRecorder', () => {
 
   it('turns unsafe step text into other and a bad sha into null', () => {
     const home = tmp();
-    const rec = createDeployRecorder({ operation: 'rollback', config: CONFIG, home });
+    const c = fakeClocks();
+    const rec = createDeployRecorder({ operation: 'rollback', config: CONFIG, home, now: c.now, clock: c.clock });
     rec.onStep({ step: 'rm -rf /; echo $SECRET', class: { x: 1 } });
     rec.onStep(undefined);
     rec.finish({ result: 'failed', sha: 'nope' });
@@ -88,6 +90,18 @@ describe('createDeployRecorder', () => {
     createDeployRecorder({ operation: 'deploy', config: CONFIG, home }).finish({ result: 'ok', sha: null });
     expect(fs.statSync(historyFile(home)).mode & 0o777).toBe(0o600);
     expect(fs.statSync(historyDir(home)).mode & 0o777).toBe(0o700);
+  });
+
+  it('starts a record on its own line after an unterminated earlier write', () => {
+    const home = tmp();
+    fs.mkdirSync(historyDir(home), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(historyFile(home), '{"partial":', { mode: 0o600 });
+    fs.chmodSync(historyFile(home), 0o600);
+    createDeployRecorder({ operation: 'deploy', config: CONFIG, home }).finish({ result: 'ok', sha: SHA });
+    const text = fs.readFileSync(historyFile(home), 'utf8');
+    expect(text.startsWith('{"partial":\n')).toBe(true);
+    const last = JSON.parse(text.split('\n').filter(Boolean).pop()!);
+    expect(last).toMatchObject({ operation: 'deploy', sha: SHA });
   });
 
   it('never writes a planted env secret or step-text secret', () => {
@@ -143,6 +157,25 @@ describe('createDeployRecorder', () => {
       expect(warn).toHaveBeenCalledTimes(1);
       expect(fs.existsSync(historyFile(home))).toBe(false);
     });
+
+    it('existing 0755 directory', () => {
+      const home = tmp();
+      fs.mkdirSync(historyDir(home), { recursive: true });
+      fs.chmodSync(historyDir(home), 0o755);
+      const warn = run(home);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(historyFile(home))).toBe(false);
+    });
+
+    it.skipIf(process.platform === 'win32')('FIFO in place of the history file', () => {
+      const home = tmp();
+      fs.mkdirSync(historyDir(home), { recursive: true, mode: 0o700 });
+      expect(spawnSync('mkfifo', [historyFile(home)]).status).toBe(0);
+      const warn = run(home);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toMatch(/^deploy-kit: deploy history not recorded \(history file (unavailable|unsafe)\)$/);
+      expect(fs.statSync(historyFile(home)).isFIFO()).toBe(true);
+    }, 5000);
 
     it('non-regular file (a directory in its place)', () => {
       const home = tmp();

@@ -30,10 +30,13 @@ function appendLine(home, line) {
   } catch { throw new Error('history directory unavailable'); }
   let dirStat;
   try { dirStat = fs.lstatSync(dir); } catch { throw new Error('history directory unavailable'); }
-  if (!dirStat.isDirectory() || dirStat.isSymbolicLink() || (uid !== null && dirStat.uid !== uid) || (dirStat.mode & 0o022) !== 0) {
+  if (!dirStat.isDirectory() || dirStat.isSymbolicLink() || (uid !== null && dirStat.uid !== uid) || (dirStat.mode & 0o077) !== 0) {
     throw new Error('history directory unsafe');
   }
-  const flags = fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW;
+  // O_NONBLOCK keeps open() on a FIFO from blocking before fstat can reject it; it does not affect regular files.
+  // O_RDWR is needed only to read the last byte below.
+  const { O_RDWR, O_APPEND, O_CREAT, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
+  const flags = O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK;
   let fd;
   try { fd = fs.openSync(path.join(dir, 'history.jsonl'), flags, 0o600); } catch { throw new Error('history file unavailable'); }
   try {
@@ -41,7 +44,15 @@ function appendLine(home, line) {
     if (!fileStat.isFile() || (uid !== null && fileStat.uid !== uid) || (fileStat.mode & 0o777) !== 0o600) {
       throw new Error('history file unsafe');
     }
-    const bytes = Buffer.from(line, 'utf8');
+    // A single O_APPEND write of a small line is not interleaved with other writers on local filesystems.
+    // The leading newline only repairs framing after an earlier partial write; existing bytes are never touched.
+    let prefix = '';
+    if (fileStat.size > 0) {
+      const last = Buffer.alloc(1);
+      fs.readSync(fd, last, 0, 1, fileStat.size - 1);
+      if (last[0] !== 0x0a) prefix = '\n';
+    }
+    const bytes = Buffer.from(prefix + line, 'utf8');
     if (fs.writeSync(fd, bytes) !== bytes.length) throw new Error('history write incomplete');
   } finally {
     try { fs.closeSync(fd); } catch { /* nothing to recover */ }
