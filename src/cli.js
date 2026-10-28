@@ -4,7 +4,8 @@
 const path = require('path');
 const { loadConfig } = require('./config');
 const { log } = require('./log');
-const { deploy, rollback } = require('./deploy');
+const deployOps = require('./deploy');
+const { createDeployRecorder } = require('./deploy-history');
 const { init } = require('./init');
 const remote = require('./remote');
 const { checkPortGuard } = require('./port-guard');
@@ -407,7 +408,24 @@ function readStdin(stream, maxBytes = Infinity) {
   });
 }
 
-function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = process.stdin, env = process.env, fetchImpl } = {}) {
+// PKG-274: times a real (non --dry-run) deploy/rollback into the private history file. A dry run records nothing
+// and gets no onStep. `--on-host` runs return earlier through the operator and are not recorded in this version.
+function runRecorded({ operation, config, options, home, sha, call }) {
+  if (options.dryRun) {
+    call(undefined);
+    return;
+  }
+  const recorder = createDeployRecorder({ operation, config, home });
+  let result = 'failed';
+  try {
+    call(recorder.onStep);
+    result = 'ok';
+  } finally {
+    recorder.finish({ result, sha });
+  }
+}
+
+function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = process.stdin, env = process.env, fetchImpl, home } = {}) {
   const command = argv[0];
   if (!command || command === 'help' || command === '--help' || command === '-h') {
     console.log(HELP);
@@ -843,7 +861,10 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
         // (see auto-cut.js), which is wrong for anything invoking the CLI
         // programmatically (or under test) from a different working directory
         // than `cwd`.
-        deploy(config, { ...options, projectRoot: cwd }, options.dryRun ? dryRunContext(config, options) : {});
+        runRecorded({
+          operation: 'deploy', config, options, home, sha: options.sha,
+          call: (onStep) => deployOps.deploy(config, { ...options, projectRoot: cwd }, options.dryRun ? dryRunContext(config, options) : { onStep }),
+        });
         return 0;
       } catch (error) {
         log.error(error instanceof Error ? error.message : String(error));
@@ -851,7 +872,10 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
       }
     case 'rollback':
       try {
-        rollback(config, options, options.dryRun ? dryRunContext(config) : {});
+        runRecorded({
+          operation: 'rollback', config, options, home, sha: null,
+          call: (onStep) => deployOps.rollback(config, options, options.dryRun ? dryRunContext(config) : { onStep }),
+        });
         return 0;
       } catch (error) {
         log.error(error instanceof Error ? error.message : String(error));
