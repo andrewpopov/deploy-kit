@@ -99,9 +99,26 @@ describe('createDeployRecorder', () => {
     fs.chmodSync(historyFile(home), 0o600);
     createDeployRecorder({ operation: 'deploy', config: CONFIG, home }).finish({ result: 'ok', sha: SHA });
     const text = fs.readFileSync(historyFile(home), 'utf8');
-    expect(text.startsWith('{"partial":\n')).toBe(true);
-    const last = JSON.parse(text.split('\n').filter(Boolean).pop()!);
-    expect(last).toMatchObject({ operation: 'deploy', sha: SHA });
+    expect(text.startsWith('{"partial":')).toBe(true);
+    const rows = text.split('\n');
+    expect(rows[0]).toBe('{"partial":');
+    expect(text.endsWith('\n')).toBe(true);
+    expect(JSON.parse(rows[rows.length - 2])).toMatchObject({ operation: 'deploy', sha: SHA });
+  });
+
+  it('keeps every complete record parseable when a partial line lands between two writes', () => {
+    const home = tmp();
+    const first = createDeployRecorder({ operation: 'deploy', config: CONFIG, home });
+    const second = createDeployRecorder({ operation: 'rollback', config: CONFIG, home });
+    first.finish({ result: 'ok', sha: SHA });
+    fs.appendFileSync(historyFile(home), '{"partial":');
+    second.finish({ result: 'failed', sha: null });
+    const bad: string[] = [];
+    const good = fs.readFileSync(historyFile(home), 'utf8').split('\n').filter(Boolean).flatMap((l) => {
+      try { return [JSON.parse(l)]; } catch { bad.push(l); return []; }
+    });
+    expect(bad).toEqual(['{"partial":']);
+    expect(good.map((r) => [r.operation, r.result])).toEqual([['deploy', 'ok'], ['rollback', 'failed']]);
   });
 
   it('never writes a planted env secret or step-text secret', () => {
@@ -173,11 +190,17 @@ describe('createDeployRecorder', () => {
       expect(spawnSync('mkfifo', [historyFile(home)]).status).toBe(0);
       // 0600 like a real history file, so only the regular-file check can reject it.
       fs.chmodSync(historyFile(home), 0o600);
-      const warn = run(home);
-      expect(warn).toHaveBeenCalledTimes(1);
-      expect(warn.mock.calls[0][0]).toMatch(/^deploy-kit: deploy history not recorded \(history file (unavailable|unsafe)\)$/);
+      // A child process with a hard kill, so a regression that blocks on the FIFO cannot hang the vitest worker.
+      const modulePath = path.resolve(__dirname, '..', 'deploy-history.js');
+      const script = `require(${JSON.stringify(modulePath)}).createDeployRecorder({ operation: 'deploy', config: ${JSON.stringify(CONFIG)}, home: ${JSON.stringify(home)} }).finish({ result: 'ok', sha: null });`;
+      const child = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL' });
+      expect(child.signal).toBeNull();
+      expect(child.status).toBe(0);
+      const output = `${child.stdout}${child.stderr}`.split('\n').filter((l) => l.includes('deploy history not recorded'));
+      expect(output).toHaveLength(1);
+      expect(output[0]).toMatch(/^deploy-kit: deploy history not recorded \(history file (unavailable|unsafe)\)$/);
       expect(fs.statSync(historyFile(home)).isFIFO()).toBe(true);
-    }, 5000);
+    }, 10000);
 
     it('non-regular file (a directory in its place)', () => {
       const home = tmp();

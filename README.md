@@ -161,7 +161,9 @@ group/other-writable directories (it prints one `deploy-kit: deploy history not 
 deploy carries on). Fields: `version` (1), `operation` (`deploy`/`rollback`), `service` (project directory name plus
 a short hash of `host:projectDir`), `sha` (the `--sha` value, else `null`), `result` (`ok`/`failed`), `startedAt`,
 `endedAt`, `durationMs`, and `marks` (up to 200 `{ step, class, atMs }` entries, offsets from the start). Step names
-are only kept when they are short plain identifiers. Recording is best-effort: a killed process leaves no row, and
+are only kept when they are short plain identifiers. Each record is written as `\n<json>\n` in a single append, so
+readers must ignore blank lines and any line that is not valid JSON: a crashed writer can leave a partial line, which
+never swallows the next record. Recording is best-effort: a killed process leaves no row, and
 `--on-host` runs are not recorded yet.
 
 ### Last-deploy record (`.deploy-kit-last-deploy.json`)

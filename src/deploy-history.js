@@ -33,10 +33,10 @@ function appendLine(home, line) {
   if (!dirStat.isDirectory() || dirStat.isSymbolicLink() || (uid !== null && dirStat.uid !== uid) || (dirStat.mode & 0o077) !== 0) {
     throw new Error('history directory unsafe');
   }
-  // O_NONBLOCK keeps open() on a FIFO from blocking before fstat can reject it; it does not affect regular files.
-  // O_RDWR is needed only to read the last byte below.
-  const { O_RDWR, O_APPEND, O_CREAT, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
-  const flags = O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK;
+  // O_NONBLOCK keeps open() on a FIFO from failing-or-blocking indefinitely (a reader-less FIFO fails with ENXIO);
+  // it does not affect regular files.
+  const { O_WRONLY, O_APPEND, O_CREAT, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
+  const flags = O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK;
   let fd;
   try { fd = fs.openSync(path.join(dir, 'history.jsonl'), flags, 0o600); } catch { throw new Error('history file unavailable'); }
   try {
@@ -44,15 +44,10 @@ function appendLine(home, line) {
     if (!fileStat.isFile() || (uid !== null && fileStat.uid !== uid) || (fileStat.mode & 0o777) !== 0o600) {
       throw new Error('history file unsafe');
     }
-    // A single O_APPEND write of a small line is not interleaved with other writers on local filesystems.
-    // The leading newline only repairs framing after an earlier partial write; existing bytes are never touched.
-    let prefix = '';
-    if (fileStat.size > 0) {
-      const last = Buffer.alloc(1);
-      fs.readSync(fd, last, 0, 1, fileStat.size - 1);
-      if (last[0] !== 0x0a) prefix = '\n';
-    }
-    const bytes = Buffer.from(prefix + line, 'utf8');
+    // One O_APPEND write of a small record is not interleaved with other writers on local filesystems.
+    // The unconditional leading newline means a crashed writer's partial line never swallows this record
+    // (no racy tail check); existing bytes are never touched. Readers skip blank and non-JSON lines.
+    const bytes = Buffer.from(`\n${line}`, 'utf8');
     if (fs.writeSync(fd, bytes) !== bytes.length) throw new Error('history write incomplete');
   } finally {
     try { fs.closeSync(fd); } catch { /* nothing to recover */ }
