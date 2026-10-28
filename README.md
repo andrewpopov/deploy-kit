@@ -153,6 +153,17 @@ Set `"mode": "local"` for a box that runs the deploy on itself (no SSH) — it r
 each step as `sh -c 'cd <projectDir> && …'` and skips the tracked-file stash. See
 the local-mode example below.
 
+### Deploy history (`~/.cache/deploy-kit/history.jsonl`)
+
+Every real `deploy` and `rollback` (not `--dry-run`) appends one JSON line recording how long it took. The file
+is private: the directory is `0700`, the file `0600`, and the writer refuses symlinks, other owners and
+group/other-writable directories (it prints one `deploy-kit: deploy history not recorded (<reason>)` line and the
+deploy carries on). Fields: `version` (1), `operation` (`deploy`/`rollback`), `service` (project directory name plus
+a short hash of `host:projectDir`), `sha` (the `--sha` value, else `null`), `result` (`ok`/`failed`), `startedAt`,
+`endedAt`, `durationMs`, and `marks` (up to 200 `{ step, class, atMs }` entries, offsets from the start). Step names
+are only kept when they are short plain identifiers. Recording is best-effort: a killed process leaves no row, and
+`--on-host` runs are not recorded yet.
+
 ### Last-deploy record (`.deploy-kit-last-deploy.json`)
 
 After a deploy **fully** succeeds — restart, health check, and every
