@@ -4,6 +4,7 @@ module.exports = defineConfig({
   productName: '@andrewpopov/deploy-kit',
   stage: 'stable',
   rootDir: __dirname,
+  installFromGit: true,
   // changelogTarget writes CHANGELOG.md; indexPath is unused by it but required by the type.
   paths: { notesDir: '.changes', indexPath: '.changes/INDEX.md' },
   // groupByKind is false (below), so these headings don't render; kinds set bullet ORDER and are the valid `--kind` values.
