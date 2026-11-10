@@ -430,7 +430,10 @@ its inode, and the original checkout is kept as `<projectDir>/.legacy-checkout`.
 Forward refuses unless there is no marker, the checkout is clean at a known sha (apart from `sharedPaths`),
 there is no deploy recovery journal or unresolved record, the legacy ecosystem file exists with every app's `cwd` at
 the project root (the check evaluates the file with `node`, and the marker records it for the reverse), and every shared path exists, is untracked and is on
-the root's filesystem. Steps, each journaled in `layout-migrate.journal.json` before it runs: `worktree`
+the root's filesystem. A layout name (`repo.git`, `releases`, `shared`, `current`, `previous`) or `.legacy-checkout`
+already in `projectDir` refuses (`layout-dirs-absent`), unless the checkout tracks that name in `HEAD`: it is then
+checkout content, moved first (`reserve` step, which also creates `.legacy-checkout`) so the layout can create its own.
+Steps, each journaled in `layout-migrate.journal.json` before it runs: `worktree`
 (bare `repo.git` plus `releases/<id>` at the live sha), `shared` (move each shared path into `shared/`, leaving
 a symlink behind), `build` (the configured install/generate/build hooks in the new release), `pointers`
 (`current`), `legacy` (rename the old content into `.legacy-checkout`, leave a copy of the ecosystem file),
@@ -444,7 +447,9 @@ Reverse restores the checkout, moves the shared data back (never an older snapsh
 validated before anything is stopped; a reverse that cannot restart in the legacy checkout refuses
 (`legacy-ecosystem-cwd-root`). It refuses with `layout-reverse-after-deploy` once `current` is not the release
 forward created (a deploy ran since: the database may have migrated). `repo.git`, `releases/` and `shared/` are
-left in place.
+left in place, except a name the checkout tracks: its layout directory is cleared (empty directories only; the
+reverse refuses with `layout-dir-clearable:<name>` if it holds other files) and the tracked entry returns in an
+`unreserve` step.
 
 A crash leaves the journal; every later run refuses with `layout-migrate-interrupted` and prints the commands
 that undo the journaled steps. Nothing resumes on its own. `--dry-run` runs the read-only precondition commands
