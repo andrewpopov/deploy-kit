@@ -136,6 +136,14 @@ function snapshot(root: string, skip: string[] = []): string[] {
   return out;
 }
 
+function trackSharedDir(f: Fixture) {
+  mkdirSync(join(f.root, 'shared'));
+  writeFileSync(join(f.root, 'shared', 'notes.txt'), 'tracked\n');
+  git(f.home, f.root, 'add', 'shared');
+  git(f.home, f.root, 'commit', '--quiet', '-m', 'track shared');
+  return git(f.home, f.root, 'rev-parse', 'HEAD');
+}
+
 const preconditionFailed = (result: any, name: string) => (result.preconditions || []).filter((p: any) => !p.ok).map((p: any) => p.name).includes(name);
 const crashSeam = () => { throw Object.assign(new Error('crash'), { isCrash: true }); };
 
@@ -199,6 +207,7 @@ describeOnPosix('layout migrate: forward', () => {
       writeFileSync(join(f.home, '.deploy-kit', `deploy-kit-${lock.lockId(f.config)}.unresolved.json`), '{}');
     }],
     ['a layout directory is already present', 'layout-dirs-absent', (f) => mkdirSync(join(f.root, 'releases'))],
+    ['an untracked directory has a layout name', 'layout-dirs-absent', (f) => mkdirSync(join(f.root, 'shared'))],
     ['a shared path is missing', 'shared-path:data', (f) => rmSync(join(f.root, 'data'), { recursive: true })],
     ['the ecosystem file does not use current', 'ecosystem-cwd-current', (f) => {
       writeFileSync(join(f.root, 'ecosystem.config.cjs'), "module.exports = { apps: [{ cwd: '/elsewhere' }] };\n");
@@ -222,6 +231,20 @@ describeOnPosix('layout migrate: forward', () => {
     expect(preconditionFailed(result, failing)).toBe(true);
     expect(snapshot(f.root)).toEqual(before);
     expect(f.commands.some((c) => /pm2 /.test(c))).toBe(false);
+  });
+
+  it('moves a checkout-tracked shared/ aside before the layout creates its own', () => {
+    const f = fixture();
+    const sha = trackSharedDir(f);
+    const trackedIno = statSync(join(f.root, 'shared', 'notes.txt')).ino;
+    const { exitCode, result } = migrateLayout(f.config, { to: 'releases' }, f.deps());
+    expect(result).toMatchObject({ direction: 'forward', sha, verified: true });
+    expect(exitCode).toBe(0);
+    expect(result.steps.map((s: any) => s.name)).toEqual(['reserve', ...FORWARD_STEPS]);
+    expect(readdirSync(join(f.root, 'shared')).sort()).toEqual(['.env', 'data']);
+    expect(statSync(join(f.root, '.legacy-checkout', 'shared', 'notes.txt')).ino).toBe(trackedIno);
+    expect(readFileSync(join(f.root, 'current', 'shared', 'notes.txt'), 'utf8')).toBe('tracked\n');
+    expect(git(f.home, join(f.root, '.legacy-checkout'), 'status', '--porcelain', '--untracked-files=no')).toBe('');
   });
 
   it('refuses a tracked sharedPath', () => {
@@ -305,6 +328,32 @@ describeOnPosix('layout migrate: reverse', () => {
     // The app ends up running from the legacy root, not from the removed current.
     expect(f.pm2.cwd).toBe(f.root);
     expect(f.pm2.files).toEqual([`${f.root}/ecosystem.config.cjs`, `${f.root}/ecosystem.legacy.config.cjs`]);
+  });
+
+  it('restores a checkout-tracked shared/ at the root once the layout shared/ is gone', () => {
+    const f = fixture();
+    trackSharedDir(f);
+    const before = treeWithoutLayout(f.root);
+    expect(migrateLayout(f.config, { to: 'releases' }, f.deps()).exitCode).toBe(0);
+    const { exitCode, result } = migrateLayout(f.config, { to: 'legacy' }, f.deps());
+    expect(result.steps.map((s: any) => s.name)).toEqual(['stop', 'legacy', 'shared', 'unlayout', 'unreserve', 'restart']);
+    expect(exitCode).toBe(0);
+    expect(treeWithoutLayout(f.root)).toEqual(before);
+    expect(readdirSync(join(f.root, 'shared'))).toEqual(['notes.txt']);
+    expect(git(f.home, f.root, 'status', '--porcelain', '--untracked-files=no')).toBe('');
+    expect(existsSync(join(f.root, '.legacy-checkout'))).toBe(false);
+  });
+
+  it('refuses a reverse when the layout shared/ holds files that would block the checkout shared/', () => {
+    const f = fixture();
+    trackSharedDir(f);
+    migrateLayout(f.config, { to: 'releases' }, f.deps());
+    writeFileSync(join(f.root, 'shared', 'stray.log'), 'x');
+    const before = snapshot(f.root);
+    const { exitCode, result } = migrateLayout(f.config, { to: 'legacy' }, f.deps());
+    expect(exitCode).toBe(3);
+    expect(preconditionFailed(result, 'layout-dir-clearable:shared')).toBe(true);
+    expect(snapshot(f.root)).toEqual(before);
   });
 
   it('refuses a reverse whose restart config points at current BEFORE stopping anything', () => {
@@ -501,8 +550,9 @@ describeOnPosix('layout migrate: reverse', () => {
     expect(f.commands.some((c) => /pm2 /.test(c))).toBe(false);
   });
 
-  it.each(['stop', 'legacy', 'shared', 'unlayout', 'restart'])('a crash at layout-%s leaves the journal and a rerun refuses', (step) => {
+  it.each(['stop', 'legacy', 'shared', 'unlayout', 'unreserve', 'restart'])('a crash at layout-%s leaves the journal and a rerun refuses', (step) => {
     const f = fixture();
+    trackSharedDir(f);
     migrateLayout(f.config, { to: 'releases' }, f.deps());
     expect(() => migrateLayout(f.config, { to: 'legacy' }, f.deps({ env: { DEPLOY_KIT_TEST_CRASH_AT: `layout-${step}` }, crash: crashSeam }))).toThrow('crash');
     expect(existsSync(join(f.root, 'layout-migrate.journal.json'))).toBe(true);

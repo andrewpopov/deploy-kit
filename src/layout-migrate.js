@@ -51,9 +51,12 @@ function layoutNames(paths) {
   };
 }
 
-// Names that belong to the release layout (or to this command) and so are never legacy checkout content.
+const LAYOUT_NAMES = ['repo.git', 'releases', 'shared', 'current', 'previous'];
+
+// Names that belong to the release layout (or to this command) and so are never legacy checkout content, unless
+// the checkout itself tracks one (see `reserved` in the plans).
 const reservedEntries = (paths) => new Set([
-  'repo.git', 'releases', 'shared', 'current', 'previous', LEGACY_DIR, JOURNAL_NAME,
+  ...LAYOUT_NAMES, LEGACY_DIR, JOURNAL_NAME,
   paths.markerFile.split('/').pop(), paths.stateFile.split('/').pop(),
 ]);
 
@@ -155,9 +158,12 @@ function forwardChecks(config, paths, run) {
   list.add('no-recovery-journal', run.read(`test -e ${q(paths.stateFile)} && echo present || echo absent`).out === 'absent', paths.stateFile);
   const { unresolved } = stateFiles(config);
   list.add('not-unresolved', run.read(`test -e ${unresolved} && echo present || echo absent`).out === 'absent', unresolved);
-  const present = run.read(['repo.git', 'releases', 'shared', 'current', 'previous', LEGACY_DIR]
-    .map((n) => `{ [ -e ${q(n)} ] || [ -L ${q(n)} ]; } && echo ${n}`).join('; ') + '; true').out;
-  list.add('layout-dirs-absent', present === '', present);
+  const present = run.read([...LAYOUT_NAMES, LEGACY_DIR]
+    .map((n) => `{ [ -e ${q(n)} ] || [ -L ${q(n)} ]; } && echo ${n}`).join('; ') + '; true').out.split('\n').filter(Boolean);
+  const tracked = (n) => run.read(`git ls-tree --name-only HEAD -- ${q(n)}`).out === n;
+  facts.reserved = present.filter((n) => n !== LEGACY_DIR && tracked(n));
+  const blocking = present.filter((n) => !facts.reserved.includes(n));
+  list.add('layout-dirs-absent', blocking.length === 0, blocking.join(', '));
 
   const sha = run.read('git rev-parse HEAD').out;
   const prefix = run.read('git rev-parse --show-prefix 2>/dev/null; echo end').out;
@@ -234,6 +240,7 @@ function reverseChecks(config, paths, run) {
   list.add('legacy-checkout-at-sha', legacySha === migration.sha, `${LEGACY_DIR} HEAD ${legacySha || '<none>'}`);
   const entries = run.read(`ls -A ${q(legacy)}`).out.split('\n').filter(Boolean);
   facts.entries = entries;
+  facts.reserved = entries.filter((e) => LAYOUT_NAMES.includes(e));
   const legacyEco = migration.legacyEcosystemFile;
   const legacyProblem = SAFE_ECOSYSTEM_RE.test(String(legacyEco))
     ? legacyEcosystemProblem(run, config, paths, `${legacy}/${legacyEco}`, `${paths.root}/${legacyEco}`)
@@ -243,10 +250,17 @@ function reverseChecks(config, paths, run) {
   facts.legacyEcosystemFile = legacyEco;
 
   const eco = migration.ecosystemFile;
-  const collisions = entries.filter((e) => e !== eco.split('/')[0] && run.read(`{ [ -e ${q(e)} ] || [ -L ${q(e)} ]; } && echo yes`).out === 'yes');
+  const collisions = entries.filter((e) => e !== eco.split('/')[0] && !facts.reserved.includes(e) && run.read(`{ [ -e ${q(e)} ] || [ -L ${q(e)} ]; } && echo yes`).out === 'yes');
   list.add('no-entry-collisions', collisions.length === 0, collisions.join(', '));
   const ecoSame = run.read(`cmp -s ${q(eco)} ${q(`${LEGACY_DIR}/${eco}`)} && echo same || echo differs`).out === 'same';
   list.add('stable-ecosystem-unmodified', ecoSame, `${eco} differs from the legacy copy: reconcile by hand`);
+
+  facts.reserved.forEach((name) => {
+    const exempt = migration.sharedPaths.map((rel) => `-path ${q(`shared/${rel}`)}`).join(' -o ');
+    const prune = exempt ? `\\( ${exempt} \\) -prune -o ` : '';
+    const stray = run.read(`[ -L ${q(name)} ] || find ${q(name)} ${prune}! -type d -print | head -n ${MAX_LISTED}`).out;
+    list.add(`layout-dir-clearable:${name}`, stray === '', `the layout's ${name} holds files a reverse keeps, so the checkout's ${name} cannot return: ${stray.split('\n').join(', ')}`);
+  });
 
   facts.inodes = {};
   migration.sharedPaths.forEach((rel) => {
@@ -279,9 +293,16 @@ function forwardPlan(config, paths, facts, releaseId) {
       sha: facts.sha, releaseId, sharedPaths: rels, ecosystemFile: eco, legacyEcosystemFile: facts.legacyEcosystemFile, at: new Date().toISOString(),
     },
   };
+  const { reserved } = facts;
+  const reserve = reserved.length ? [{
+    name: 'reserve',
+    commands: [`mkdir ${q(legacy)}`, ...reserved.map((e) => `mv ${q(`${paths.root}/${e}`)} ${q(`${legacy}/${e}`)}`)],
+    undo: [...reserved.map((e) => `mv ${legacy}/${e} ${paths.root}/${e}`), `rmdir ${legacy}`],
+  }] : [];
   return {
     marker,
     steps: [
+      ...reserve,
       {
         name: 'worktree',
         commands: [
@@ -316,7 +337,7 @@ function forwardPlan(config, paths, facts, releaseId) {
       {
         name: 'legacy',
         commands: [
-          `mkdir ${q(legacy)}`,
+          ...(reserved.length ? [] : [`mkdir ${q(legacy)}`]),
           ...facts.entries.map((e) => `mv ${q(`${paths.root}/${e}`)} ${q(`${legacy}/${e}`)}`),
           `mkdir -p "$(dirname ${q(`${paths.root}/${eco}`)})"`,
           `cp -p ${q(`${legacy}/${eco}`)} ${q(`${paths.root}/${eco}`)}`,
@@ -324,7 +345,7 @@ function forwardPlan(config, paths, facts, releaseId) {
         undo: [
           `rm ${paths.root}/${eco}`,
           ...facts.entries.map((e) => `mv ${legacy}/${e} ${paths.root}/${e}`),
-          `rmdir ${legacy}`,
+          ...(reserved.length ? [] : [`rmdir ${legacy}`]),
         ],
       },
       {
@@ -342,6 +363,12 @@ function reversePlan(config, paths, facts) {
   const { legacy } = layoutNames(paths);
   const { migration } = facts;
   const eco = migration.ecosystemFile;
+  const { reserved } = facts;
+  const returning = facts.entries.filter((e) => !reserved.includes(e));
+  const clearLayoutDir = (name) => {
+    const dir = q(`${paths.root}/${name}`);
+    return `if [ -L ${dir} ]; then rm ${dir}; else find ${dir} -depth -type d -empty -delete; fi; { [ ! -e ${dir} ] && [ ! -L ${dir} ]; } || exit 1`;
+  };
   const stop = `pm2 stop ${config.appNames.map(q).join(' ')}`;
   return {
     steps: [
@@ -351,10 +378,10 @@ function reversePlan(config, paths, facts) {
         commands: [
           `rm ${q(`${paths.root}/${eco}`)}`,
           `d=${q(eco)}; d=$(dirname "$d"); while [ "$d" != . ]; do rmdir ${q(paths.root)}/"$d" 2>/dev/null || break; d=$(dirname "$d"); done; true`,
-          ...facts.entries.map((e) => `mv ${q(`${legacy}/${e}`)} ${q(`${paths.root}/${e}`)}`),
-          `rmdir ${q(legacy)}`,
+          ...returning.map((e) => `mv ${q(`${legacy}/${e}`)} ${q(`${paths.root}/${e}`)}`),
+          ...(reserved.length ? [] : [`rmdir ${q(legacy)}`]),
         ],
-        undo: ['move the restored entries back into .legacy-checkout (names: ' + facts.entries.join(', ') + ')'],
+        undo: ['move the restored entries back into .legacy-checkout (names: ' + returning.join(', ') + ')'],
       },
       {
         name: 'shared',
@@ -374,6 +401,14 @@ function reversePlan(config, paths, facts) {
         ],
         undo: [`restore ${paths.markerFile} (the journal records the migration record) and ln -s releases/${migration.releaseId} ${paths.currentLink}`],
       },
+      ...(reserved.length ? [{
+        name: 'unreserve',
+        commands: [
+          ...reserved.flatMap((e) => [clearLayoutDir(e), `mv ${q(`${legacy}/${e}`)} ${q(`${paths.root}/${e}`)}`]),
+          `rmdir ${q(legacy)}`,
+        ],
+        undo: ['move the restored entries back into .legacy-checkout (names: ' + reserved.join(', ') + ')'],
+      }] : []),
       {
         name: 'restart',
         // The stopped process keeps the cwd it was started with, so drop it and start from the legacy file.
