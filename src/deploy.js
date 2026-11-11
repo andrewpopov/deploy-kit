@@ -12,7 +12,7 @@ const { backupIdFromOutput, backupReferenceFromId } = require('./backup-referenc
 const { resolveBranch } = require('./branch');
 const { onlineAppNames } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
-const { clearAutoCutPending } = require('./auto-cut');
+const { clearAutoCutPending, wouldAutoCutRun } = require('./auto-cut');
 const { assertShaOptions } = require('./sha-options');
 const {
   assertVerifiedRefOptions, verifiedRefLabel, resolveVerifiedTip, assertContainedInVerified,
@@ -309,10 +309,17 @@ function deploy(config, options = {}, ctx = {}) {
     // fetch, or pull yet). Each is a command on the target; a non-zero exit aborts the
     // deploy with nothing changed. Use for preconditions — free disk, DB reachable,
     // a required env var present. Generic: the kit runs them, the consumer supplies them.
+    // PKG-299: R known before auto-cut (--sha, verified tip) reaches every check as $DEPLOY_KIT_SHA, and is what ships.
+    if (!wouldAutoCutRun(config, options, c)) {
+      if (options.sha) R = options.sha;
+      else if (verifiedRef) R = verifiedTip = resolveVerifiedTip(config, verifiedProbe);
+    }
+    const checkEnv = R ? `export DEPLOY_KIT_SHA=${shQuote(R)} && ` : '';
     for (const check of config.preDeployChecks) {
-      gate({ message: `Pre-deploy check: ${check.name}`, command: check.command }, config, c);
+      gate({ message: `Pre-deploy check: ${check.name}`, command: `${checkEnv}${check.command}` }, config, c);
       steps.push(`check:${check.name}`);
     }
+    const checkedSha = R;
 
     // Auto-cut, on the LOCAL controller checkout, runs here -- AFTER the lock is
     // held and after target preflight (assertNotReleaseHost, pre-deploy checks)
@@ -327,6 +334,9 @@ function deploy(config, options = {}, ctx = {}) {
     // takes over from the branch tip as what this deploy actually brings the
     // target to.
     autoCutResult = runAutoCutPreflight(config, options, c);
+    if (checkedSha && autoCutResult.ran) {
+      throw new Error(`Deploy aborted: auto-cut ran after the pre-deploy checks had already approved ${checkedSha.slice(0, 12)}`);
+    }
     R = autoCutResult.ran ? autoCutResult.sha : null;
     if (R) {
       log.info(`auto-cut: deploying release ${autoCutResult.version} (${R.slice(0, 12)}, PR #${autoCutResult.prNumber})`);
@@ -341,7 +351,7 @@ function deploy(config, options = {}, ctx = {}) {
     } else if (config.requireVerifiedRef) {
       // requireVerifiedRef: ship the tip of the train-verified ref, never the
       // branch tip. Resolved before anything on the target is touched.
-      verifiedTip = resolveVerifiedTip(config, verifiedProbe);
+      verifiedTip = verifiedTip || resolveVerifiedTip(config, verifiedProbe);
       R = verifiedTip;
       log.info(`${verifiedRefLabel(config)}: deploying ${R.slice(0, 12)}`);
     }

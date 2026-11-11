@@ -123,6 +123,64 @@ describe('requireVerifiedRef: legacy layout (real git)', () => {
   });
 });
 
+describe('PKG-299: pre-deploy checks see the sha that ships (legacy layout, real git)', () => {
+  const quietLog = {
+    header() {}, step() {}, info() {}, warning() {}, error() {}, success() {}, dim() {},
+  };
+  function legacyWithCheck(over: any = {}, extraCheckCommand = '') {
+    const o = makeOrigin();
+    const target = path.join(o.root, 'target');
+    const seen = path.join(o.root, 'seen-sha');
+    git(o.root, 'clone', '-q', '-b', 'master', o.origin, target);
+    git(target, 'reset', '-q', '--hard', o.c1);
+    process.env.HOME = o.root;
+    const command = `printf %s "\${DEPLOY_KIT_SHA:-}" > ${seen}${extraCheckCommand}`;
+    const config = mergeConfig(DEFAULT_CONFIG, {
+      mode: 'local', projectDir: target, branch: 'master', autoCut: false, lock: false, appNames: [],
+      dbBoundApps: [], hooks: { install: 'INSTALL-STEP' }, requireVerifiedRef: 'green',
+      preDeployChecks: [{ name: 'record-sha', command }], ...over,
+    });
+    const runtime = {
+      execFileSync: (file: string, args: string[], options: any) => {
+        if (args[args.length - 1].includes('INSTALL-STEP')) throw new Error(SENTINEL);
+        return execFileSync(file, args, options);
+      },
+    };
+    const run = (options: any = {}) => expect(() => deploy(config, { stash: false, ...options }, { runtime, log: quietLog })).toThrow();
+    const seenSha = () => execFileSync('cat', [seen], { encoding: 'utf8' });
+    return { ...o, run, seenSha, head: () => git(target, 'rev-parse', 'HEAD') };
+  }
+
+  it('a plain deploy exports the verified tip, which is what the target is brought to', () => {
+    const t = legacyWithCheck();
+    t.run();
+    expect(t.seenSha()).toBe(t.c2);
+    expect(t.head()).toBe(t.c2);
+  });
+
+  it('a --sha deploy exports that sha', () => {
+    const t = legacyWithCheck();
+    t.run({ sha: t.c1 });
+    expect(t.seenSha()).toBe(t.c1);
+    expect(t.head()).toBe(t.c1);
+  });
+
+  it('the checked tip ships even when the verified ref moves after the checks', () => {
+    const t = legacyWithCheck({}, ' && git -C ../origin branch -f green master');
+    t.run();
+    expect(git(t.origin, 'rev-parse', 'green')).toBe(t.c3);
+    expect(t.seenSha()).toBe(t.c2);
+    expect(t.head()).toBe(t.c2);
+  });
+
+  it('a branch-tip deploy, whose sha is only known after the pull, exports nothing', () => {
+    const t = legacyWithCheck({ requireVerifiedRef: null });
+    t.run();
+    expect(t.seenSha()).toBe('');
+    expect(t.head()).toBe(t.c3);
+  });
+});
+
 describe('requireVerifiedRef: release layout (real bare repo)', () => {
   function releaseTarget(withGreen = true) {
     const o = makeOrigin(withGreen);
