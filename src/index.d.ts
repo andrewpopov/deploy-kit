@@ -155,6 +155,7 @@ export interface DeployConfig {
   dbBoundApps: string[];
   tunnelName: string | null;
   ensureApps?: string[];
+  /** Legacy layout: each check runs with `DEPLOY_KIT_SHA` exported when the deploy's sha is known before auto-cut. */
   preDeployChecks?: PreDeployCheck[];
   /** Named gates run after candidate preparation but before dbBoundApps are
    * stopped. Intended for disposable current-data migration rehearsals: a
