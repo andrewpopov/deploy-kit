@@ -839,7 +839,7 @@ function run(argv = process.argv.slice(2), {
   }
 
   if (command === 'deploy' && options.onHost) {
-    return require('./on-host/operator').onHostDeploy(config, options, { cwd });
+    return require('./on-host/operator').onHostDeploy(config, options, { cwd, resolveShip });
   }
   if (command === 'deploy' && !options.onHost && options.runId !== undefined) {
     log.error('deploy: --run-id only applies with --on-host');
@@ -853,14 +853,14 @@ function run(argv = process.argv.slice(2), {
     }
   }
   if (command === 'rollback' && options.onHost) {
-    return require('./on-host/operator').onHostRollback(config, options, { cwd });
+    return require('./on-host/operator').onHostRollback(config, options, { cwd, resolveShip });
   }
   if (command === 'recover') {
     if (!options.onHost) {
       log.error('recover only exists as `recover --on-host`: it settles an interrupted on-host deploy');
       return 1;
     }
-    return require('./on-host/operator').onHostRecover(config, options, { cwd });
+    return require('./on-host/operator').onHostRecover(config, options, { cwd, resolveShip });
   }
 
   switch (command) {

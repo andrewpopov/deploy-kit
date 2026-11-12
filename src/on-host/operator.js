@@ -40,7 +40,8 @@ const OPTIONAL_CAPTURE_ENV = ['LANG', 'PM2_HOME'];
 
 // ---- 1. flags and config ------------------------------------------------------------
 
-function validateOnHostRequest(config, options) {
+// The checks that need only the operator's own flags, so they run BEFORE the config is re-read from the sha.
+function validateOnHostArguments(options) {
   const refuse = (code, why) => { throw new OnHostError(code, why); };
   if (options.dryRun) refuse('ONHOST_DRY_RUN', '--dry-run is not supported with --on-host (a plan would contact no host, so nothing on-host could be rehearsed)');
   if (options.lock === false) refuse('ONHOST_NO_LOCK', '--no-lock is refused: the on-host run always holds the deploy lock');
@@ -50,6 +51,15 @@ function validateOnHostRequest(config, options) {
   if (options.sha === undefined) refuse('ONHOST_NO_SHA', '--on-host requires --sha <40-hex> (the exact commit to deploy)');
   if (!FULL_SHA_RE.test(options.sha)) refuse('ONHOST_NO_SHA', `--sha ${JSON.stringify(options.sha)} is not 40 lowercase hex characters`);
   if (options.autoCut !== false) refuse('ONHOST_AUTO_CUT', '--on-host requires --no-auto-cut (the host cannot cut a release)');
+  if (options.runId !== undefined && !RUN_ID_RE.test(options.runId)) {
+    refuse('ONHOST_RUN_ID', `--run-id ${JSON.stringify(options.runId)} must match YYYYMMDDTHHMMSSZ-<12 hex>-<8 hex>`);
+  }
+}
+
+// Arguments plus everything that reads the config; call it with the config that will ship.
+function validateOnHostRequest(config, options) {
+  const refuse = (code, why) => { throw new OnHostError(code, why); };
+  validateOnHostArguments(options);
   if (!config.layout || config.layout.type !== 'releases') refuse('ONHOST_LAYOUT', 'config layout.type must be "releases"');
   if (config.mode !== 'ssh') refuse('ONHOST_MODE', `config mode must be "ssh" (got ${JSON.stringify(config.mode)})`);
   if (typeof config.host !== 'string' || !/^[^\s-]\S*$/.test(config.host)) refuse('ONHOST_HOST', 'config host must be a non-empty user@host');
@@ -62,9 +72,6 @@ function validateOnHostRequest(config, options) {
   }
   if (!Array.isArray(config.appNames)) refuse('ONHOST_CONFIG', 'config appNames must be an array');
   requestMeta(config, options);
-  if (options.runId !== undefined && !RUN_ID_RE.test(options.runId)) {
-    refuse('ONHOST_RUN_ID', `--run-id ${JSON.stringify(options.runId)} must match YYYYMMDDTHHMMSSZ-<12 hex>-<8 hex>`);
-  }
   if (config.onHost != null) {
     // One rule: the same validator config.js runs at load time (a caller can bypass load-time validation).
     const problems = validateConfig({ onHost: config.onHost }, { source: 'config' });
@@ -387,6 +394,7 @@ function onHostDeploy(config, options, deps = {}) {
   const {
     runtime,
     log = defaultLog,
+    resolveShip = resolveShipConfig,
     now = () => new Date(),
     randomHex = (bytes) => crypto.randomBytes(bytes).toString('hex'),
     receiptsPath,
@@ -402,14 +410,15 @@ function onHostDeploy(config, options, deps = {}) {
   const bundleRoot = fs.mkdtempSync(path.join(deps.tmpRoot || os.tmpdir(), 'deploy-kit-on-host-'));
 
   try {
-    validateOnHostRequest(config, options);
+    validateOnHostArguments(options);
     if (options.kind !== 'rollback' && options.kind !== 'recover') {
       try {
-        ({ config, options } = resolveShipConfig({ config, options, log }));
+        ({ config, options } = resolveShip({ config, options, log }));
       } catch (error) {
         throw new OnHostError('ONHOST_CONFIG', error.message);
       }
     }
+    validateOnHostRequest(config, options);
 
     const scripted = runScriptOnTarget(preflightScript(config), sshConfig, {
       capture: true, runtime, timeoutSeconds: PREFLIGHT_TIMEOUT_SECONDS,

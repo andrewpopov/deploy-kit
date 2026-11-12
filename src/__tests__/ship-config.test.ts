@@ -341,6 +341,15 @@ describe('PKG-318 --on-host', () => {
     expect(bundledConfig(host).hooks.install).toBe(NEW_INSTALL);
   });
 
+  it('CANARY on-host-required-transition: onHost.required dropped at the sha is judged on the sha\'s config, not the stale one', () => {
+    const stalecfg = pipelineConfig(OLD_INSTALL, { layout: RELEASE_LAYOUT, onHost: { required: true } });
+    const { work, newerSha } = stale(stalecfg, pipelineConfig(NEW_INSTALL, { layout: RELEASE_LAYOUT }));
+    git(work, 'fetch', '-q', 'origin');
+    const host = scriptedHost();
+    expect(deploy(work, newerSha, host)).toBe(0);
+    expect(bundledConfig(host).hooks.install).toBe(NEW_INSTALL);
+  });
+
   it('CANARY on-host-bootstrap: a sha that moves the host is refused before anything is uploaded', () => {
     const cfg = (install: string, over = {}) => pipelineConfig(install, { layout: RELEASE_LAYOUT, ...over });
     const { work, newerSha } = stale(cfg(OLD_INSTALL), cfg(NEW_INSTALL, { host: 'other@host' }));
