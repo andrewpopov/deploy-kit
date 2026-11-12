@@ -167,15 +167,16 @@ never swallows the next record. Recording is best-effort: a killed process leave
 `--on-host` runs are not recorded yet.
 
 Both pipelines (legacy and `layout.type: "releases"`) report marks through `ctx.onStep`. A legacy deploy marks, in
-order and only when the step runs: `preDeployChecks`, `fetch`, `merge`, `install`, `generate`, `verify-pins`,
+order and only when the step runs: `preDeployChecks`, `auto-cut`, `stash`, `fetch`, `merge`, `install`, `generate`, `verify-pins`,
 `preMigrationChecks`, `stop-writers`, `backup`, `migrate`, `build` (before `migrate` with `buildBeforeMigrate`),
 `preRestartChecks`, `pm2-restart`, `health`, `postDeployChecks`, and `resume-writers` on a failure path that restarts the
 paused apps. A mark is emitted before its step starts.
 
 The deploy log carries the same timeline: every `▸` step line ends in `[+12.3s]` (seconds since the deploy began), and a
 deploy that ends, successful or not, prints a `deploy timing:` table with seconds per step, the total, and the
-downtime window (from `stop-writers`, else `pm2-restart`, to the end of `health` or `pm2-restart`; on a failure, to the
-end of the run). A `--dry-run` prints no table.
+downtime window (from `stop-writers`, else `pm2-restart`, to the moment the health poll returns; in the releases layout,
+to the end of `pm2-restart`; on a failure that resumed the paused apps, to `resume-writers`, else to the end of the run).
+This applies to `deploy()` and CLI deploys without `--on-host`; a `--dry-run` and `--on-host` runs print no suffix or table.
 
 ### Last-deploy record (`.deploy-kit-last-deploy.json`)
 

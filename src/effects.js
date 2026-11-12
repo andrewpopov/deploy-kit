@@ -35,6 +35,8 @@ const BUILT_IN_STEPS = {
   'pm2-restart': 'live',
   postDeployChecks: 'live',
   prune: 'live',
+  'auto-cut': 'live', // legacy deploy only: cuts, pushes and merges a release PR from the controller checkout
+  stash: 'live', // legacy deploy only: `git stash push` on the serving checkout
   merge: 'live', // legacy deploy only: fast-forwards the serving checkout
   health: 'read-only', // legacy deploy only: polls the health endpoint
   'resume-writers': 'live', // legacy deploy only: restarts the paused DB-bound apps on a failure path

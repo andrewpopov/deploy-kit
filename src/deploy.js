@@ -172,7 +172,7 @@ function deploy(config, options = {}, ctx = {}) {
   // Artifact-first release layout (SMH-112) is a separate pipeline. Lazy-require to
   // avoid a top-level cycle (release.js pulls shared helpers, not this module).
   const timing = createStepTiming({ clock: ctx.clock, onStep: ctx.onStep, log: ctx.log || defaultLog });
-  const timedCtx = { ...ctx, onStep: timing.onStep, log: timing.log };
+  const timedCtx = { ...ctx, onStep: timing.onStep, log: timing.log, timing };
   const dryRun = normalizeRuntime(ctx.runtime).dryRun;
   let ok = false;
   try {
@@ -192,7 +192,10 @@ function deployLegacy(config, options, ctx) {
   const runtime = ctx.runtime;
   const c = { ...ctx, log, sleep, runtime };
   assertVerifiedRefOptions(config, options, c);
-  const mark = (step) => { if (typeof c.onStep === 'function') c.onStep({ step, class: stepClass(config, step) }); };
+  const mark = (step) => {
+    if (typeof c.onStep !== 'function') return;
+    try { c.onStep({ step, class: stepClass(config, step) }); } catch { /* telemetry never disturbs a deploy */ }
+  };
 
   const {
     skipDeps = false,
@@ -351,6 +354,7 @@ function deployLegacy(config, options, ctx) {
     // before auto-cut existed. When it DID run, `R` (the immutable merged sha)
     // takes over from the branch tip as what this deploy actually brings the
     // target to.
+    if (wouldAutoCutRun(config, options, c)) mark('auto-cut');
     autoCutResult = runAutoCutPreflight(config, options, c);
     if (checkedSha && autoCutResult.ran) {
       throw new Error(`Deploy aborted: auto-cut ran after the pre-deploy checks had already approved ${checkedSha.slice(0, 12)}`);
@@ -413,6 +417,7 @@ function deployLegacy(config, options, ctx) {
     if (stash) {
       // Tracked-only stash: never sweep untracked .ssh/.cloudflared into a stash —
       // that would break the tunnel and lose the key mid-deploy.
+      mark('stash');
       run('Stashing local tracked changes', `git stash push -m "deploy-kit $(date -u +%FT%TZ)" || true`, { tolerate: true });
       steps.push('stash');
     }
@@ -655,7 +660,6 @@ function deployLegacy(config, options, ctx) {
         steps.push(`pre-migration-check:${check.name}`);
       }
       if (config.dbBoundApps.length) {
-        mark('stop-writers');
         // Stop DB-bound processes BEFORE the backup — matches release.js
         // (:488-494): a writer left online during the snapshot can produce an
         // inconsistent backup, defeating the entire reason the backup gate exists.
@@ -677,6 +681,7 @@ function deployLegacy(config, options, ctx) {
         const dryRun = normalizeRuntime(runtime).dryRun;
         if (dryRun) {
           log.warning('--dry-run: skipping DB-bound pause verification (pm2 state is never real under a dry run).');
+          mark('stop-writers');
           run(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`,
             `pm2 stop ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, { tolerate: true });
           dbAppsPaused = true;
@@ -695,6 +700,7 @@ function deployLegacy(config, options, ctx) {
             );
           }
 
+          mark('stop-writers');
           run(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`,
             `pm2 stop ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, { tolerate: true });
           dbAppsPaused = true;
@@ -844,6 +850,7 @@ function deployLegacy(config, options, ctx) {
 
     mark('health');
     const healthy = waitForHealth(config, c);
+    if (c.timing) c.timing.endWindow('health');
     if (!healthy) {
       throw new Error(
         'Deploy completed but the application is unhealthy: the new code is now live and failing health '

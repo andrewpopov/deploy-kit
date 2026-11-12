@@ -5,6 +5,7 @@
 const WRITERS_STOPPED = 'stop-writers';
 const RESTART = 'pm2-restart';
 const HEALTH = 'health';
+const RESUME = 'resume-writers';
 
 const seconds = (ms) => `${(Math.max(0, ms) / 1000).toFixed(1)}s`;
 
@@ -14,14 +15,18 @@ function createStepTiming({ clock = () => performance.now(), onStep, log }) {
   const elapsed = () => clock() - started;
 
   const forwardingOnStep = (event) => {
-    marks.push({ step: String(event && event.step), at: elapsed() });
+    const step = String(event && event.step);
+    marks.push({ step, at: elapsed() });
+    if (step === RESUME) endWindow(RESUME);
     if (typeof onStep === 'function') onStep(event);
   };
 
-  const timedLog = {
-    ...log,
+  const timedLog = Object.assign(Object.create(log), {
     step: (msg) => log.step(`${msg} [+${seconds(elapsed())}]`),
-  };
+  });
+
+  let windowEnd = null;
+  const endWindow = (name) => { if (!windowEnd) windowEnd = { name, at: elapsed() }; };
 
   const rows = (endAt) => marks.map((mark, index) => ({
     step: mark.step,
@@ -32,9 +37,13 @@ function createStepTiming({ clock = () => performance.now(), onStep, log }) {
   const downtime = (all, ok, endAt) => {
     const first = (name) => all.find((row) => row.step === name);
     const from = first(WRITERS_STOPPED) || first(RESTART);
-    const to = first(HEALTH) || first(RESTART);
     if (!from) return null;
+    if (windowEnd) {
+      const named = windowEnd.name === RESUME ? RESUME : `${windowEnd.name} done`;
+      return { ms: windowEnd.at - from.startAt, label: `${from.step} -> ${named}` };
+    }
     if (!ok) return { ms: endAt - from.startAt, label: `${from.step} -> deploy ended (failed)` };
+    const to = first(HEALTH) || first(RESTART);
     return to ? { ms: to.endAt - from.startAt, label: `${from.step} -> ${to.step} done` } : null;
   };
 
@@ -51,7 +60,7 @@ function createStepTiming({ clock = () => performance.now(), onStep, log }) {
     } catch { /* timing output must never change a deploy's outcome */ }
   };
 
-  return { onStep: forwardingOnStep, log: timedLog, marks, report };
+  return { onStep: forwardingOnStep, log: timedLog, marks, endWindow, report };
 }
 
 module.exports = { createStepTiming };
