@@ -19,6 +19,7 @@ const { verifyTunnelConfig } = require('./tunnel-config-guard');
 const { verifyNoSecrets } = require('./secret-file-guard');
 const { assertShaOptions } = require('./sha-options');
 const { markPlanningRuntime } = require('./lock');
+const { resolveShipConfig } = require('./ship-config');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
@@ -604,7 +605,7 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     return require('./target-state').runCommand(command, argv.slice(1), targetConfig, { log });
   }
 
-  const options = parseOptions(argv.slice(1));
+  let options = parseOptions(argv.slice(1));
 
   // Reject any flag this command does not consume, BEFORE any side effect
   // (the version banner below, loadConfig, or dispatch) has run. See
@@ -811,6 +812,16 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   } catch (error) {
     log.error(error instanceof Error ? error.message : String(error));
     return 1;
+  }
+  if (command === 'deploy') {
+    try {
+      ({ config, options } = resolveShipConfig({
+        config, options, override: configOverride, cwd,
+      }));
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
   }
   if (options.lock === false) config = { ...config, lock: false };
 

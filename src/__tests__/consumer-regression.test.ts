@@ -13,6 +13,8 @@ import { describe, it, expect } from 'vitest';
 import { createRequire } from 'module';
 import { execSync } from 'child_process';
 import path from 'path';
+import { mkdtempSync, writeFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import Module from 'module';
 
 const require = createRequire(__filename);
@@ -562,6 +564,37 @@ describe('consumer regression: v0.9.4 command sequence is byte-identical (preRes
       if (layout && layout.type === 'releases') {
         expect(oldRun.calls.some((c) => c.includes('worktree add'))).toBe(true);
         expect(newRun.calls.some((c) => c.includes('worktree add'))).toBe(true);
+      }
+    });
+  }
+});
+
+// PKG-318: committing each real consumer config and shipping it from its own sha must change nothing:
+// no bootstrap-key refusal, no "working tree differs" notice, and the same effective config.
+describe('consumer regression: shipping each real config from its own sha is a no-op (PKG-318)', () => {
+  const { resolveShipConfig } = require('../ship-config.js');
+  const gitEnv = {
+    ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.invalid', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.invalid',
+  };
+  for (const [name, raw] of Object.entries(CONFIGS)) {
+    it(`${name}: same config, no notice`, () => {
+      const dir = mkdtempSync(path.join(tmpdir(), 'dk-ship-regress-'));
+      try {
+        const git = (...args: string[]) => execSync(['git', ...args].join(' '), { cwd: dir, encoding: 'utf8', env: gitEnv }).trim();
+        git('init', '-q');
+        writeFileSync(path.join(dir, '.deploy-kit.config.json'), JSON.stringify(raw));
+        git('add', '-A');
+        git('commit', '-q', '-m', 'c');
+        const config = loadConfig({ cwd: dir });
+        const lines: string[] = [];
+        const result = resolveShipConfig({
+          config, options: { sha: git('rev-parse', 'HEAD') }, override: {}, cwd: dir,
+          log: { info: (m: string) => lines.push(m), warning: (m: string) => lines.push(m) },
+        });
+        expect(result.config).toEqual(config);
+        expect(lines).toEqual([]);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
       }
     });
   }

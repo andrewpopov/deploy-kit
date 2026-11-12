@@ -853,11 +853,14 @@ function mergeConfig(base, override = {}) {
 
 // Load `.deploy-kit.config.json` from cwd (or a given dir) and merge over
 // defaults, then over any inline override. Missing file is fine (defaults only).
+// `configText` supplies the file's content from another source (the deployed sha's
+// copy, ship-config.js) through this same parse + validation instead of reading cwd.
 // Unknown/removed keys and wrong types are rejected by default (validate:true);
 // pass `validate:false` to skip (or `strict:false` to warn instead of throw).
 function loadConfig({
   cwd = process.cwd(),
   override = {},
+  configText,
   fsImpl = fs,
   validate = true,
   strict = true,
@@ -865,9 +868,9 @@ function loadConfig({
 } = {}) {
   let fileConfig = {};
   const configPath = path.join(cwd, CONFIG_FILENAME);
-  if (fsImpl.existsSync(configPath)) {
+  if (configText !== undefined || fsImpl.existsSync(configPath)) {
     try {
-      fileConfig = JSON.parse(fsImpl.readFileSync(configPath, 'utf8'));
+      fileConfig = JSON.parse(configText !== undefined ? configText : fsImpl.readFileSync(configPath, 'utf8'));
     } catch (error) {
       throw new Error(`Failed to parse ${CONFIG_FILENAME}: ${error.message}`);
     }

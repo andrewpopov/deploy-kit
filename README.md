@@ -54,6 +54,18 @@ Drop a `.deploy-kit.config.json` in the repo root (or run `deploy-kit init`):
 See [Contributing](./CONTRIBUTING.md), [Support](./SUPPORT.md), and the
 [Security Policy](./SECURITY.md). This package is licensed under [MIT](./LICENSE).
 
+**A deploy ships the config of the commit it deploys (PKG-318).** The working-tree
+`.deploy-kit.config.json` only bootstraps: it names the target and the ref. Once the sha is known
+(`--sha`, or the `requireVerifiedRef` tip, resolved locally and pinned as `--sha`), `deploy` re-reads
+the file from that sha with `git show` through the same loader and validation, so a stale checkout
+cannot run an old `hooks.backup`, check or monitor setting. When it differs it prints
+`deploy-kit: using .deploy-kit.config.json from <sha8> (the working tree differs)`. A sha without
+the file is refused; so is a sha whose `mode`, `host`, `projectDir`, `ssh`, `remote`, `branch`,
+`requireVerifiedRef`, `autoCut` or `layout` differs from the working tree (update the checkout).
+There is no flag to deploy an uncommitted config: the host builds from the sha, so the config
+should be committed with it. `--dry-run` plans from the sha's config when that sha is already
+local. A deploy with neither (auto-cut, plain branch tip) still reads the working tree.
+
 The `.deploy-kit.config.json` holding your real host/paths lives in each
 **consumer** repo, never in this package. The config is validated on load —
 unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
