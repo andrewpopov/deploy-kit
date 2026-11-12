@@ -816,7 +816,8 @@ function run(argv = process.argv.slice(2), {
     log.error(error instanceof Error ? error.message : String(error));
     return 1;
   }
-  if (command === 'deploy') {
+  // `--on-host` validates its own arguments first, then resolves in onHostDeploy against the explicit --sha.
+  if (command === 'deploy' && !options.onHost) {
     try {
       ({ config, options } = resolveShip({ config, options }));
     } catch (error) {

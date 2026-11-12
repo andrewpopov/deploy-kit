@@ -497,3 +497,16 @@ describe('PKG-318 one project root', () => {
     expect(result.options.projectRoot).toBe(work);
   });
 });
+
+describe('PKG-318 on-host argument guards run on the operator\'s own options', () => {
+  it.each([
+    ['--branch override', ['deploy', '--on-host', '--branch', 'feature/x', '--no-auto-cut'], 'ONHOST_BRANCH'],
+    ['no explicit --sha', ['deploy', '--on-host', '--no-auto-cut'], 'ONHOST_NO_SHA'],
+  ])('CANARY on-host-guards: %s is refused with %s, not rewritten into a pinned tip', (_name, argv, code) => {
+    const cfg = pipelineConfig(NEW_INSTALL, { layout: RELEASE_LAYOUT });
+    const { work } = stale(cfg, cfg);
+    const lines = captureLog();
+    expect(cli.run(argv, { cwd: work, env: {} })).toBe(1);
+    expect(lines.join('\n')).toContain(`${code}:`);
+  });
+});
