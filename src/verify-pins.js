@@ -38,6 +38,12 @@ const GITHUB_SPEC_RE = /^(?:github:)?([\w.-]+)\/([\w.-]+)(?:#(\S+))?$/;
 const SEMVER_VERSION_RE = '(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)(?:-(?:(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+[0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*)?';
 const SEMVER_TAG_RE = new RegExp(`^(?:semver:)?v?(${SEMVER_VERSION_RE})$`);
 
+// A dependency VALUE that is an exact registry version (`0.1.7`): no range
+// operator, no `v`, no `npm:` alias. Only `@andrewpopov/*` names with such a
+// value are treated as pins (the fleet's private-registry packages).
+const EXACT_VERSION_RE = new RegExp(`^${SEMVER_VERSION_RE}$`);
+const REGISTRY_PIN_SCOPE_PREFIX = '@andrewpopov/';
+
 // Fields where a pin with NOTHING installed is not a lie the manifest is telling.
 //
 // optional/peer: npm never guarantees they get installed at all — an optional dep
@@ -77,11 +83,50 @@ function parseGithubSpecifier(specifier) {
   return { owner: m[1], repo: m[2], ref: m[3] || null };
 }
 
+function isRegistryPin(name, specifier) {
+  return typeof specifier === 'string'
+    && name.startsWith(REGISTRY_PIN_SCOPE_PREFIX)
+    && EXACT_VERSION_RE.test(specifier.trim());
+}
+
+// `--forbid-github-scope @andrewpopov` / `andrewpopov` -> the GitHub owner.
+function githubOwnerOfScope(scope) {
+  return typeof scope === 'string' && scope.trim() ? scope.trim().replace(/^@/, '') : null;
+}
+
+const GITHUB_PREFIX_RE = /^github:([^/\s]+)\//i;
+const GITHUB_URL_RE = /^(?:git\+)?(?:ssh|https?|git):\/\/(?:[^@/\s]*@)?([^/:\s]+)(?::\d+)?[/:]([^/\s]+)\//i;
+const GITHUB_SCP_RE = /^[^@/\s:]+@([^:/\s]+):([^/\s]+)\//;
+const GITHUB_BARE_RE = /^([\w.-]+)\/[\w.-]+(?:#.*)?$/;
+const GITHUB_HOST_RE = /^(?:github\.com|github-[\w.-]+)$/i;
+
+// The GitHub owner a dependency spec fetches from, or null when it is not a
+// GitHub source. Deliberately separate from parseGithubSpecifier: the forbid
+// guard must catch every spelling npm resolves to GitHub (shorthand, URLs,
+// scp-like, the `github-*` ssh aliases), including refs the narrow pin parser
+// cannot parse (`#semver:>=1 <2`).
+function githubSourceOwner(specifier) {
+  if (typeof specifier !== 'string') return null;
+  const spec = specifier.trim();
+  const prefixed = GITHUB_PREFIX_RE.exec(spec);
+  if (prefixed) return prefixed[1];
+  const hosted = GITHUB_URL_RE.exec(spec) || GITHUB_SCP_RE.exec(spec);
+  if (hosted) return GITHUB_HOST_RE.test(hosted[1]) ? hosted[2] : null;
+  const bare = GITHUB_BARE_RE.exec(spec);
+  return bare ? bare[1] : null;
+}
+
 // Every GitHub-shorthand pin across dependencies/devDependencies/
 // optionalDependencies/peerDependencies, tagged with which field it came
 // from — deduped by name per DEP_FIELD_PRECEDENCE when the same name appears
 // in more than one field (see the comment there).
-function collectPins(pkg) {
+//
+// Exact registry versions of `@andrewpopov/*` packages are pins too
+// (`registry: true`, `ref` is the version). With `forbidGithubScope` set, a
+// github spec owned by that scope is returned as `status: 'forbidden'` instead
+// of being checked — the migrated-repo guard against new github pins.
+function collectPins(pkg, { forbidGithubScope = null } = {}) {
+  const forbiddenOwner = githubOwnerOfScope(forbidGithubScope);
   const claimed = new Map(); // name -> { field, specifier }
   for (const field of DEP_FIELD_PRECEDENCE) {
     const deps = pkg[field];
@@ -94,9 +139,20 @@ function collectPins(pkg) {
   const pins = [];
   for (const [name, { field, specifier }] of claimed) {
     const parsed = parseGithubSpecifier(specifier);
-    if (parsed) pins.push({
-      name, field, specifier, owner: parsed.owner, repo: parsed.repo, ref: parsed.ref,
-    });
+    const sourceOwner = forbiddenOwner && githubSourceOwner(specifier);
+    if (sourceOwner && sourceOwner.toLowerCase() === forbiddenOwner.toLowerCase()) {
+      pins.push({
+        name, field, specifier, owner: sourceOwner, repo: parsed ? parsed.repo : null, ref: parsed ? parsed.ref : null, forbidden: true,
+      });
+    } else if (parsed) {
+      pins.push({
+        name, field, specifier, owner: parsed.owner, repo: parsed.repo, ref: parsed.ref,
+      });
+    } else if (isRegistryPin(name, specifier)) {
+      pins.push({
+        name, field, specifier, owner: null, repo: null, ref: specifier.trim(), registry: true,
+      });
+    }
   }
   return pins;
 }
@@ -152,7 +208,10 @@ function resolveInstalled(startDir, name, boundaryDir = startDir) {
 // The forced re-install that actually fixes a mismatch/missing pin — see the
 // module doc. Uses the owner/repo/ref parsed from the manifest itself, not a
 // hardcoded org, so it is correct for every consumer, not just this fleet.
-function remediationCommand({ owner, repo, ref }) {
+function remediationCommand({
+  name, owner, repo, ref, registry,
+}) {
+  if (registry) return `npm install ${name}@${ref} --save-exact`;
   return `npm install "github:${owner}/${repo}#${ref}" --save`;
 }
 
@@ -185,10 +244,15 @@ function semverEquals(a, b) {
   return normalizeSemver(a) === normalizeSemver(b);
 }
 
+function forbiddenRemediation({ name }) {
+  return `pin the exact registry version: npm install ${name}@<version> --save-exact (see package-registry.md)`;
+}
+
 // Check one pin against what's actually installed in `dir`, bounded to
 // `boundaryDir` (defaults to `dir` — see resolveInstalled). Pure given the
 // parsed pin and directories — the testable core `checkPin` builds on.
 function checkPin(pin, dir, boundaryDir = dir) {
+  if (pin.forbidden) return { ...pin, status: 'forbidden', remediation: forbiddenRemediation(pin) };
   const semverMatch = pin.ref && SEMVER_TAG_RE.exec(pin.ref);
   if (!semverMatch) return { ...pin, status: 'unverifiable' };
 
@@ -419,7 +483,7 @@ function readPackageJson(pkgPath) {
 // field), `corrupt` (a hard failure for EVERY field — something IS installed
 // but isn't readable, which is never mistaken for "not installed"), and
 // `unverifiable` (no assertable version at all).
-function verifyPins({ dir = process.cwd() } = {}) {
+function verifyPins({ dir = process.cwd(), forbidGithubScope = null } = {}) {
   const rootDir = path.resolve(dir);
   const rootPkgPath = path.join(rootDir, 'package.json');
   const rootPkg = readPackageJson(rootPkgPath);
@@ -434,7 +498,7 @@ function verifyPins({ dir = process.cwd() } = {}) {
   const entries = [];
   for (const manifest of manifests) {
     const manifestRel = path.relative(rootDir, manifest.pkgPath) || 'package.json';
-    for (const pin of collectPins(manifest.pkg)) {
+    for (const pin of collectPins(manifest.pkg, { forbidGithubScope })) {
       entries.push({ ...checkPin(pin, manifest.dir, manifest.boundaryDir), manifest: manifestRel });
     }
   }
@@ -446,13 +510,17 @@ function verifyPins({ dir = process.cwd() } = {}) {
     unverifiable: entries.filter((e) => e.status === 'unverifiable').length,
     absent: entries.filter((e) => e.status === 'absent').length,
     corrupt: entries.filter((e) => e.status === 'corrupt').length,
+    forbidden: entries.filter((e) => e.status === 'forbidden').length,
     manifests: manifests.length,
   };
-  const ok = summary.mismatch === 0 && summary.missing === 0 && summary.corrupt === 0;
+  const ok = summary.mismatch === 0 && summary.missing === 0 && summary.corrupt === 0 && summary.forbidden === 0;
   return { ok, entries, summary };
 }
 
-function describePin({ name, ref }) {
+function describePin({
+  name, ref, registry,
+}) {
+  if (registry) return `${name}: pinned ${ref}`;
   return ref ? `${name}: pinned #${ref}` : `${name}: pinned (no ref — resolves to the default branch)`;
 }
 
@@ -478,6 +546,9 @@ function formatReport(result) {
     } else if (e.status === 'corrupt') {
       problemLines.push(`CORRUPT   ${e.manifest}  ${describePin(e)} (want ${e.expectedVersion}) — installed node_modules/${e.name}/package.json exists but could not be read/parsed`);
       problemLines.push(`  fix: ${e.remediation}`);
+    } else if (e.status === 'forbidden') {
+      problemLines.push(`FORBIDDEN ${e.manifest}  ${e.name}: github spec "${e.specifier}" is not allowed (forbidGithubScope)`);
+      problemLines.push(`  fix: ${e.remediation}`);
     } else if (e.status === 'unverifiable') {
       unverifiableLines.push(`unverifiable  ${e.manifest}  ${describePin(e)} — not a semver tag, cannot verify against an installed version`);
     } else if (e.status === 'absent') {
@@ -485,13 +556,14 @@ function formatReport(result) {
     }
   }
   const {
-    ok, mismatch, missing, unverifiable, absent, corrupt, manifests,
+    ok, mismatch, missing, unverifiable, absent, corrupt, forbidden, manifests,
   } = result.summary;
   // Manifest count is folded into the summary line only when there's more
   // than one manifest, so a plain single-package run's summary text is
   // unchanged from before this fix.
   const manifestSuffix = manifests > 1 ? ` across ${manifests} manifests` : '';
-  const summaryLine = `verify-pins: ${ok} ok, ${mismatch} MISMATCH, ${missing} missing, ${unverifiable} unverifiable (non-semver refs), ${absent} absent, ${corrupt} corrupt${manifestSuffix}`;
+  const forbiddenSuffix = forbidden > 0 ? `, ${forbidden} FORBIDDEN` : '';
+  const summaryLine = `verify-pins: ${ok} ok, ${mismatch} MISMATCH, ${missing} missing, ${unverifiable} unverifiable (non-semver refs), ${absent} absent, ${corrupt} corrupt${forbiddenSuffix}${manifestSuffix}`;
   return {
     problemLines, unverifiableLines, absentLines, summaryLine,
   };

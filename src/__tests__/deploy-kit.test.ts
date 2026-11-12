@@ -720,7 +720,9 @@ describe('pin gate', () => {
   // against real fixture directories.
   describe('the assembled program, executed by a real node', () => {
     const { spawnSync } = require('child_process') as typeof import('child_process');
-    const { buildPinCheckProgram } = require('../pin-gate.js') as { buildPinCheckProgram: () => string };
+    const { buildPinCheckProgram } = require('../pin-gate.js') as {
+      buildPinCheckProgram: (o?: { forbidGithubScope?: string }) => string;
+    };
 
     function fixture(manifestRef: string, installedVersion: string | null) {
       const dir = mkdtempSync(path.join(tmpdir(), 'pin-gate-'));
@@ -771,6 +773,37 @@ describe('pin gate', () => {
         const { code, output } = runProgram(dir);
         expect(code).toBe(0);
         expect(output).toContain('1 ok, 0 MISMATCH');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('checks exact registry versions (forbid alone fails the program), and enforces forbidGithubScope, with fs/path only', () => {
+      const dir = mkdtempSync(path.join(tmpdir(), 'pin-gate-'));
+      try {
+        writeFileSync(path.join(dir, 'package.json'), JSON.stringify({
+          name: 'fixture', version: '1.0.0', dependencies: { '@andrewpopov/db-backup': '0.2.0', other: 'github:andrewpopov/other#v1.0.0' },
+        }));
+        const installed = path.join(dir, 'node_modules', '@andrewpopov', 'db-backup');
+        mkdirSync(installed, { recursive: true });
+        writeFileSync(path.join(installed, 'package.json'), JSON.stringify({ name: '@andrewpopov/db-backup', version: '0.2.0' }));
+        const other = path.join(dir, 'node_modules', 'other');
+        mkdirSync(other, { recursive: true });
+        writeFileSync(path.join(other, 'package.json'), JSON.stringify({ name: 'other', version: '1.0.0' }));
+        const exec = (forbidGithubScope?: string) => {
+          const res = spawnSync(process.execPath, ['-'], {
+            cwd: dir, input: buildPinCheckProgram({ forbidGithubScope }), encoding: 'utf8',
+          });
+          return { code: res.status, output: `${res.stdout || ''}${res.stderr || ''}` };
+        };
+        const off = exec();
+        expect(off.code).toBe(0);
+        expect(off.output).toContain('2 ok');
+        expect(off.output).not.toContain('FORBIDDEN');
+        const on = exec('@andrewpopov');
+        expect(on.code).toBe(1);
+        expect(on.output).toContain('FORBIDDEN');
+        expect(buildPinCheckProgram({ forbidGithubScope: '@andrewpopov' })).not.toMatch(/require\((?!'fs'\)|'path'\))/);
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }

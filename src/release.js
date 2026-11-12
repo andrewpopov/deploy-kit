@@ -1438,7 +1438,7 @@ function deployRelease(config, options = {}, ctx = {}) {
       st.phase = 'verify-pins';
       log.step('Verifying dependency pins in the candidate release');
       stepStart('verify-pins');
-      runInDir(st.releaseDir, PIN_CHECK_COMMAND, config, c, { input: buildPinCheckProgram() });
+      runInDir(st.releaseDir, PIN_CHECK_COMMAND, config, c, { input: buildPinCheckProgram({ forbidGithubScope: config.forbidGithubScope }) });
       steps.push('verify-pins');
     }
 

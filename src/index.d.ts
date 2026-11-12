@@ -191,6 +191,9 @@ export interface DeployConfig {
    * re-resolves a changed `github:owner/repo#ref`, so without this gate a stale
    * dependency ships under a green deploy. */
   verifyPins?: boolean;
+  /** A GitHub owner/scope (`"@andrewpopov"`): verify-pins then fails any `github:<owner>/...` or `<owner>/...#ref`
+   * dependency. Default `null` (off) until the repo has migrated to exact registry versions. */
+  forbidGithubScope?: string | null;
   /** Skip `hooks.install` when the lockfiles, node version, package manager versions and install command match the
    * last successful install and `node_modules` exists (the releases layout copies the current release's
    * `node_modules` instead). Default `true`; `--force-install` overrides it for one run. */
@@ -515,7 +518,7 @@ export function parseGithubSpecifier(specifier: unknown): GithubPin | null;
  * installed" (see `VerifyPinsStatus`'s `corrupt`). */
 export function resolveInstalled(startDir: string, name: string, boundaryDir?: string): Record<string, unknown> | { corrupt: true } | null;
 
-export type VerifyPinsStatus = 'ok' | 'mismatch' | 'missing' | 'absent' | 'corrupt' | 'unverifiable';
+export type VerifyPinsStatus = 'ok' | 'mismatch' | 'missing' | 'absent' | 'corrupt' | 'unverifiable' | 'forbidden';
 
 /** One dependency's github: pin checked against what's actually installed.
  * `expectedVersion`/`installedVersion`/`remediation` are present only for the
@@ -535,12 +538,18 @@ export type VerifyPinsStatus = 'ok' | 'mismatch' | 'missing' | 'absent' | 'corru
  * emitted, for the field npm gives effective precedence to — currently just
  * `optionalDependencies` over `dependencies` — see `collectPins`'s
  * `DEP_FIELD_PRECEDENCE` in verify-pins.js. */
-export interface VerifyPinsEntry extends GithubPin {
+export interface VerifyPinsEntry extends Omit<GithubPin, 'owner' | 'repo'> {
+  owner: string | null;
+  repo: string | null;
   name: string;
   field: 'dependencies' | 'devDependencies' | 'optionalDependencies' | 'peerDependencies';
   specifier: string;
   status: VerifyPinsStatus;
   manifest: string;
+  /** `true` for an exact `@andrewpopov/*` registry version (`ref` is that version; `owner`/`repo` are null). */
+  registry?: boolean;
+  /** `true` when `forbidGithubScope` matched this github spec (`status: 'forbidden'`). */
+  forbidden?: boolean;
   expectedVersion?: string;
   installedVersion?: string;
   /** The exact `npm install ... --save` command that fixes a mismatch/missing/
@@ -566,6 +575,8 @@ export interface VerifyPinsResult {
     /** Installed node_modules/<name>/package.json exists but could not be
      * read/parsed — fails the run for every dep field. */
     corrupt: number;
+    /** github specs rejected by `forbidGithubScope`; fails the run. */
+    forbidden: number;
     /** Total package.json manifests scanned — 1 for a standalone project, or
      * the root plus every workspace member for a workspace root run. */
     manifests: number;
@@ -577,7 +588,7 @@ export interface VerifyPinsResult {
  * `verifyPins` test suite; `verifyPins` is the entry point that reads
  * package.json and calls this per pin, per manifest. */
 export function checkPin(
-  pin: GithubPin & { name: string; field: string; specifier: string },
+  pin: Omit<GithubPin, 'owner' | 'repo'> & { owner: string | null; repo: string | null; registry?: boolean; forbidden?: boolean; name: string; field: string; specifier: string },
   dir: string,
   boundaryDir?: string,
 ): Omit<VerifyPinsEntry, 'manifest'>;
@@ -590,7 +601,7 @@ export function checkPin(
  * the network. Backs the `deploy-kit verify-pins [--dir <path>] [--json]` CLI
  * command. Throws if `<dir>/package.json`, or any workspace member's
  * package.json, cannot be read/parsed. */
-export function verifyPins(options?: { dir?: string }): VerifyPinsResult;
+export function verifyPins(options?: { dir?: string; forbidGithubScope?: string | null }): VerifyPinsResult;
 
 /** Format a `verifyPins()` result into human-readable report lines — mismatch/
  * missing/corrupt "problems", "unverifiable" refs, and tolerated-`absent`

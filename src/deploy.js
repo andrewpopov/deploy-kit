@@ -648,7 +648,7 @@ function deployLegacy(config, options, ctx) {
     // shipped to the target rather than invoked there.
     if (verifyPins) {
       mark('verify-pins');
-      run('Verifying dependency pins', PIN_CHECK_COMMAND, { input: buildPinCheckProgram() });
+      run('Verifying dependency pins', PIN_CHECK_COMMAND, { input: buildPinCheckProgram({ forbidGithubScope: config.forbidGithubScope }) });
       steps.push('verify-pins');
     }
 

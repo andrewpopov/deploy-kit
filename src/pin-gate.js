@@ -38,10 +38,10 @@ const path = require('path');
 // Runs after the module source, in the same CJS scope, so `module.exports` is
 // verify-pins.js's exports. Writes to stderr and sets the exit code; deploy.js
 // turns a non-zero exit into an aborted deploy.
-const RUNNER = `
+const runnerFor = (forbidGithubScope) => `
 ;(() => {
   const { verifyPins, formatReport } = module.exports;
-  const result = verifyPins({ dir: process.cwd() });
+  const result = verifyPins({ dir: process.cwd(), forbidGithubScope: ${JSON.stringify(forbidGithubScope || null)} });
   const report = formatReport(result);
   for (const line of report.problemLines) console.error(line);
   for (const line of report.unverifiableLines) console.error(line);
@@ -54,9 +54,9 @@ const RUNNER = `
 // clean up, and nothing lands on the target's disk.
 const PIN_CHECK_COMMAND = 'node -';
 
-function buildPinCheckProgram({ readFile = fs.readFileSync } = {}) {
+function buildPinCheckProgram({ readFile = fs.readFileSync, forbidGithubScope = null } = {}) {
   const source = readFile(path.join(__dirname, 'verify-pins.js'), 'utf8');
-  return `${source}\n${RUNNER}`;
+  return `${source}\n${runnerFor(forbidGithubScope)}`;
 }
 
 module.exports = { buildPinCheckProgram, PIN_CHECK_COMMAND };
