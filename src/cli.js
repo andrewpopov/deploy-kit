@@ -426,7 +426,9 @@ function runRecorded({ operation, config, options, home, sha, call }) {
   }
 }
 
-function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = process.stdin, env = process.env, fetchImpl, home } = {}) {
+function run(argv = process.argv.slice(2), {
+  cwd = process.cwd(), stdin = process.stdin, env = process.env, fetchImpl, home, resolveShip = resolveShipConfig,
+} = {}) {
   const command = argv[0];
   if (!command || command === 'help' || command === '--help' || command === '-h') {
     console.log(HELP);
@@ -816,7 +818,7 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   }
   if (command === 'deploy') {
     try {
-      ({ config, options } = resolveShipConfig({ config, options }));
+      ({ config, options } = resolveShip({ config, options }));
     } catch (error) {
       log.error(error instanceof Error ? error.message : String(error));
       return 1;

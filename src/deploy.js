@@ -366,13 +366,14 @@ function deployLegacy(config, options, ctx) {
     if (autoCutResult.ran) assertConfigAtCut(config, R);
     if (R) {
       log.info(`auto-cut: deploying release ${autoCutResult.version} (${R.slice(0, 12)}, PR #${autoCutResult.prNumber})`);
-    } else if (options.sha) {
+    } else if (options.sha || options.branchTipPin) {
       // `--sha`: an operator-supplied exact commit, taking over from the
       // branch tip exactly the way auto-cut's `R` does below -- runAutoCutPreflight
       // above has already thrown if auto-cut is configured and would actually
       // run (see auto-cut.js's own `options.sha` guard), so reaching here means
-      // either auto-cut isn't configured at all or `--no-auto-cut` disabled it.
-      R = options.sha;
+      // either auto-cut isn't configured at all, `--no-auto-cut` disabled it, or
+      // it had nothing to cut and the branch tip the config came from ships (PKG-318).
+      R = options.sha || options.branchTipPin;
       log.info(`--sha: deploying ${R.slice(0, 12)} exactly`);
     } else if (config.requireVerifiedRef) {
       // requireVerifiedRef: ship the tip of the train-verified ref, never the

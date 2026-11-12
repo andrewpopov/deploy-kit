@@ -1248,12 +1248,12 @@ function deployRelease(config, options = {}, ctx = {}) {
     if (autoCutResult.ran) assertConfigAtCut(config, R);
     if (R) {
       log.info(`auto-cut: deploying release ${autoCutResult.version} (${R.slice(0, 12)}, PR #${autoCutResult.prNumber})`);
-    } else if (options.sha) {
+    } else if (options.sha || options.branchTipPin) {
       // `--sha`: an operator-supplied exact commit, taking over from the
       // branch tip exactly the way auto-cut's `R` does below -- see the
       // matching comment in deploy.js for why runAutoCutPreflight above has
       // already thrown if auto-cut is configured and would actually run.
-      R = options.sha;
+      R = options.sha || options.branchTipPin;
       log.info(`--sha: deploying ${R.slice(0, 12)} exactly`);
     }
     // See the matching comment in deploy.js -- strict either/or provenance,
@@ -1331,7 +1331,7 @@ function deployRelease(config, options = {}, ctx = {}) {
         `git --git-dir=${paths.repoGit} merge-base --is-ancestor ${shQuote(R)} refs/heads/${shQuote(branch)}`,
         config, c, { tolerate: true },
       );
-      if (options.pinnedBranchTip) {
+      if (options.branchTipPin) {
         const tipNow = capture(paths.root, `git --git-dir=${paths.repoGit} rev-parse refs/heads/${shQuote(branch)}`, config, c);
         assertPinnedTipHolds(options, R, tipNow, `refs/heads/${branch}`);
       }

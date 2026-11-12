@@ -186,12 +186,19 @@ const pipelineConfig = (install: string, extra: Record<string, unknown> = {}) =>
 });
 
 // A fake target good enough to carry a legacy or release deploy past install. `movedTip` makes the target's branch tip differ from `sha`.
-function pipelineRuntime(sha: string, movedTip = '') {
+function pipelineRuntime(sha: string, movedTip = '', autoCutTipReads = 0) {
   const calls: string[] = [];
+  let remoteTipReads = 0;
   const execFileSync = (_file: string, args: string[]) => {
     const cmd = args[args.length - 1];
     calls.push(cmd);
-    if (movedTip && (cmd.includes("rev-parse 'origin'/'master'") || cmd.includes("rev-parse refs/heads/'master'"))) return movedTip;
+    if (cmd.includes('ls-remote --symref')) return `ref: refs/heads/master\tHEAD\n${sha}\tHEAD\n`;
+    if (/MERGE_HEAD|rebase-merge|rebase-apply|CHERRY_PICK_HEAD|REVERT_HEAD|BISECT_LOG/.test(cmd)) return 'none\n';
+    if (cmd.includes('@{u}')) return 'origin/master\n';
+    if (cmd.includes('remote get-url --push')) return 'git@github.com:andrewpopov/demo.git\n';
+    if (cmd.includes('gh repo view')) return 'andrewpopov/demo\n';
+    if (movedTip && cmd.includes("rev-parse 'origin'/'master'")) { remoteTipReads += 1; return remoteTipReads <= autoCutTipReads ? sha : movedTip; }
+    if (movedTip && cmd.includes("rev-parse refs/heads/'master'")) return movedTip;
     if (cmd.includes('.deploy-kit-layout')) return '{"layout":"releases","version":1}';
     if (cmd.includes('mv --version')) return 'mv (GNU coreutils) 9.1';
     if (cmd.includes('df -kP') || cmd.includes('df -Pk')) return '99999999';
@@ -262,6 +269,32 @@ describe.each([
     const stream = runDeploy(fn, loadWorking(work), {}, pipelineRuntime(newerSha));
     expect(stream).toContain(NEW_INSTALL);
     expect(stream).not.toContain(PIN_CHECK_COMMAND);
+  });
+
+  describe('auto-cut that may run but has nothing to cut', () => {
+    const fakeKit = { collectFragments: () => [], resolvePaths: () => ({ rootDir: '/unused' }) };
+    function prepare(movedTip = '') {
+      const { work, newerSha } = stale(pipelineConfig(OLD_INSTALL, extra), pipelineConfig(NEW_INSTALL, extra));
+      writeFileSync(path.join(work, 'release-kit.config.js'), 'module.exports = {};\n');
+      const rt = pipelineRuntime(newerSha, movedTip, 1);
+      Object.assign(rt.ctx, { resolve: () => 'fake-release-kit', requireModule: (id: string) => (id === 'fake-release-kit' ? fakeKit : {}) });
+      return { work, newerSha, rt };
+    }
+
+    it('CANARY autocut-zero-fragments: the tip it read the config from ships, with that config', () => {
+      const { work, newerSha, rt } = prepare();
+      const lines = captureLog();
+      const stream = runDeploy(fn, loadWorking(work), { autoCut: undefined, projectRoot: work }, rt);
+      expect(installs(stream)).toEqual({ old: false, new: true });
+      expect(lines).toContain(NOTICE(newerSha));
+    });
+
+    it('CANARY autocut-zero-fragments-tip-moved: the tip moved after the config was read -> refused, not deployed with the old config', () => {
+      const { work, rt } = prepare('b'.repeat(40));
+      captureLog();
+      expect(() => fn(loadWorking(work), { autoCut: undefined, projectRoot: work }, rt.ctx)).toThrow(/moved to bbbbbbbbbbbb/);
+      expect(rt.calls.join('\n')).not.toContain(NEW_INSTALL);
+    });
   });
 
   it('an inline config (no file behind it) is left alone: nothing to re-read', () => {
@@ -414,14 +447,16 @@ describe('PKG-318 protections and validation come from the shipped config', () =
 });
 
 describe('PKG-318 edges', () => {
-  it('CANARY not-a-git-checkout: a config loaded outside any git checkout is used as given, with a warning', () => {
+  it('CANARY not-a-git-checkout: a real deploy from a non-git directory is refused; only a dry run may plan with the file as is', () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'dk-ship-nogit-'));
     roots.push(dir);
     writeFileSync(path.join(dir, '.deploy-kit.config.json'), JSON.stringify(withHooks(OLD_BACKUP)));
     const lines = captureLog();
     const config = loadWorking(dir);
-    const result = resolveShipConfig({ config, options: { sha: 'a'.repeat(40) } });
-    expect(result.config.hooks.backup).toBe(OLD_BACKUP);
+    expect(() => resolveShipConfig({ config, options: { sha: 'a'.repeat(40) } })).toThrow(/is not a git checkout/);
+    expect(() => resolveShipConfig({ config, options: {} })).toThrow(/Run deploy-kit from a checkout/);
+    const planned = resolveShipConfig({ config, options: { sha: 'a'.repeat(40), dryRun: true } });
+    expect(planned.config.hooks.backup).toBe(OLD_BACKUP);
     expect(lines.join('\n')).toContain('is not a git checkout');
   });
 

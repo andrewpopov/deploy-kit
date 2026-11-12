@@ -8,6 +8,8 @@ import { spawnSync } from 'child_process';
 const require = createRequire(__filename);
 const { createDeployRecorder } = require('../deploy-history.js') as { createDeployRecorder: (o: any) => { onStep: (e: any) => void; finish: (r: any) => void } };
 const cli = require('../cli.js') as { run: (argv: string[], opts?: any) => number };
+// These specs drive other behaviour in a non-git temp dir; a real deploy from one is refused by PKG-318 (ship-config.test.ts), so they skip resolution.
+const runCli = (argv: string[], opts: Record<string, unknown> = {}) => cli.run(argv, { resolveShip: (a: { config: unknown; options: unknown }) => a, ...opts });
 const deployOps = require('../deploy.js') as Record<string, (...a: any[]) => any>;
 const { log } = require('../log.js') as { log: Record<string, (m: string) => void> };
 
@@ -239,7 +241,7 @@ describe('cli deploy and rollback recording', () => {
     withConfig((dir) => {
       const home = tmp(); capture();
       vi.spyOn(deployOps, 'deploy').mockImplementation((_c, _o, ctx) => { ctx.onStep({ step: 'build', class: 'staging' }); });
-      expect(cli.run(['deploy', '--sha', SHA, '--no-auto-cut'], { cwd: dir, env: {}, home })).toBe(0);
+      expect(runCli(['deploy', '--sha', SHA, '--no-auto-cut'], { cwd: dir, env: {}, home })).toBe(0);
       const rows = lines(home);
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({ operation: 'deploy', result: 'ok', sha: SHA, marks: [{ step: 'build', class: 'staging' }] });
@@ -250,7 +252,7 @@ describe('cli deploy and rollback recording', () => {
     withConfig((dir) => {
       const home = tmp(); const errors = capture();
       vi.spyOn(deployOps, 'deploy').mockImplementation(() => { throw new Error('boom'); });
-      expect(cli.run(['deploy'], { cwd: dir, env: {}, home })).toBe(1);
+      expect(runCli(['deploy'], { cwd: dir, env: {}, home })).toBe(1);
       expect(errors).toEqual(['boom']);
       const rows = lines(home);
       expect(rows).toHaveLength(1);
@@ -262,9 +264,9 @@ describe('cli deploy and rollback recording', () => {
     withConfig((dir) => {
       const home = tmp(); const errors = capture();
       const spy = vi.spyOn(deployOps, 'rollback').mockImplementation(() => {});
-      expect(cli.run(['rollback'], { cwd: dir, env: {}, home })).toBe(0);
+      expect(runCli(['rollback'], { cwd: dir, env: {}, home })).toBe(0);
       spy.mockImplementation(() => { throw new Error('nope'); });
-      expect(cli.run(['rollback'], { cwd: dir, env: {}, home })).toBe(1);
+      expect(runCli(['rollback'], { cwd: dir, env: {}, home })).toBe(1);
       expect(errors).toEqual(['nope']);
       expect(lines(home).map((r) => [r.operation, r.result, r.sha])).toEqual([['rollback', 'ok', null], ['rollback', 'failed', null]]);
     });
@@ -277,7 +279,7 @@ describe('cli deploy and rollback recording', () => {
       fs.symlinkSync(tmp(), historyDir(home));
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       vi.spyOn(deployOps, 'deploy').mockImplementation(() => {});
-      expect(cli.run(['deploy'], { cwd: dir, env: {}, home })).toBe(0);
+      expect(runCli(['deploy'], { cwd: dir, env: {}, home })).toBe(0);
       expect(warn).toHaveBeenCalledTimes(1);
     });
   });
@@ -287,7 +289,7 @@ describe('cli deploy and rollback recording', () => {
       const home = tmp(); capture();
       let seen: any;
       vi.spyOn(deployOps, 'deploy').mockImplementation((_c, _o, ctx) => { seen = ctx; });
-      expect(cli.run(['deploy', '--dry-run'], { cwd: dir, env: {}, home })).toBe(0);
+      expect(runCli(['deploy', '--dry-run'], { cwd: dir, env: {}, home })).toBe(0);
       expect(fs.existsSync(path.join(home, '.cache'))).toBe(false);
       expect(seen.onStep).toBeUndefined();
     });
@@ -299,7 +301,7 @@ describe('cli deploy and rollback recording', () => {
       const event = { step: 'flip', class: 'live' };
       let after: unknown;
       vi.spyOn(deployOps, 'deploy').mockImplementation((_c, _o, ctx) => { ctx.onStep(event); after = { ...event }; });
-      cli.run(['deploy'], { cwd: dir, env: {}, home });
+      runCli(['deploy'], { cwd: dir, env: {}, home });
       expect(after).toEqual({ step: 'flip', class: 'live' });
       expect(event).toEqual({ step: 'flip', class: 'live' });
     });

@@ -8,6 +8,8 @@ import * as path from 'path';
 
 const require = createRequire(__filename);
 const cli = require('../cli.js') as { run: (argv: string[], opts?: any) => number | Promise<number> };
+// These specs drive other behaviour in a non-git temp dir; a real deploy from one is refused by PKG-318 (ship-config.test.ts), so they skip resolution.
+const runCli = (argv: string[], opts: Record<string, unknown> = {}) => cli.run(argv, { resolveShip: (a: { config: unknown; options: unknown }) => a, ...opts });
 const { log } = require('../log.js') as { log: Record<string, (m: string) => void> };
 const kit = require('../index.js');
 const release = require('../release.js');
@@ -31,7 +33,7 @@ describe('the CLI', () => {
   it.each([['deploy'], ['rollback']])('%s without --on-host is refused for an onHost.required app, naming the on-host command', (command) => {
     spies();
     inProject({ onHost: { required: true } }, (cwd) => {
-      expect(cli.run([command], { cwd })).toBe(1);
+      expect(runCli([command], { cwd })).toBe(1);
     });
     expect(out).toContain(`deploy-kit ${command} --on-host`);
   });
@@ -41,8 +43,8 @@ describe('the CLI', () => {
   ])('%s %s is refused for an onHost.required app', (command, flag) => {
     spies();
     inProject({ onHost: { required: true } }, (cwd) => {
-      expect(cli.run([command, flag], { cwd })).toBe(1);
-      expect(cli.run([command, '--on-host', flag], { cwd })).toBe(1);
+      expect(runCli([command, flag], { cwd })).toBe(1);
+      expect(runCli([command, '--on-host', flag], { cwd })).toBe(1);
     });
     expect(out).toMatch(/--steal-lock and --no-lock are refused|deploy-kit \w+ --on-host/);
   });
@@ -51,11 +53,11 @@ describe('the CLI', () => {
     spies();
     const execFileSync = vi.spyOn(require('child_process'), 'execFileSync');
     inProject({ onHost: { required: true }, ecosystemFile: 'ecosystem.config.cjs' }, (cwd) => {
-      expect(cli.run([command, '--dry-run'], { cwd })).toBe(0);
+      expect(runCli([command, '--dry-run'], { cwd })).toBe(0);
       expect(out).toContain('[dry-run]');
       expect(execFileSync).not.toHaveBeenCalled();
       out = '';
-      expect(cli.run([command], { cwd })).toBe(1);
+      expect(runCli([command], { cwd })).toBe(1);
       expect(out).toContain(`deploy-kit ${command} --on-host`);
     });
   });
@@ -64,7 +66,7 @@ describe('the CLI', () => {
     spies();
     inProject({}, (cwd) => {
       // the plain rollback proceeds to the pipeline (and fails there, on the unreachable host, not at the entry check)
-      expect(cli.run(['rollback', '--dry-run'], { cwd })).not.toBeUndefined();
+      expect(runCli(['rollback', '--dry-run'], { cwd })).not.toBeUndefined();
     });
     expect(out).not.toContain('onHost.required');
   });

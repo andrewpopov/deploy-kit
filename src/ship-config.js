@@ -137,7 +137,13 @@ function resolveShipConfig({ config, options = {}, log = defaultLog }) {
   const origin = config[CONFIG_ORIGIN];
   if (!origin || origin.notGit) return { config, options };
   if (!localGit(origin.cwd, 'git rev-parse --git-dir').ok) {
-    log.warning(`deploy-kit: ${origin.cwd} is not a git checkout, so there is no commit to read ${CONFIG_FILENAME} from; using it as is`);
+    if (!options.dryRun) {
+      throw new Error(
+        `deploy: ${origin.cwd} is not a git checkout, so there is no commit to ship ${CONFIG_FILENAME} from, and a real deploy `
+        + 'would run an unversioned file against the target. Run deploy-kit from a checkout of the app. Nothing was changed.',
+      );
+    }
+    log.warning(`deploy-kit: ${origin.cwd} is not a git checkout; planning with ${CONFIG_FILENAME} as is`);
     return { config: { ...config, [CONFIG_ORIGIN]: { ...origin, notGit: true } }, options };
   }
   let sha = options.sha;
@@ -153,8 +159,9 @@ function resolveShipConfig({ config, options = {}, log = defaultLog }) {
       const tip = controllerBranchTip(config, origin.cwd);
       sha = tip.sha;
       log.info(`branch "${tip.branch}" is ${sha.slice(0, 12)}`);
+      shipped = { ...options, branchTipPin: sha };
       if (!autoCut) {
-        shipped = { ...options, sha, pinnedBranchTip: true };
+        shipped.sha = sha;
         delete shipped.branch;
       }
     }
@@ -184,7 +191,7 @@ function assertConfigAtCut(config, sha) {
 
 // A branch-tip deploy pins the tip it read the config from; the target must still see that same tip.
 function assertPinnedTipHolds(options, sha, tip, label) {
-  if (options.pinnedBranchTip && tip !== sha) {
+  if (options.branchTipPin && sha === options.branchTipPin && tip !== sha) {
     throw new Error(
       `Deploy aborted: ${label} moved to ${tip.slice(0, 12)} after ${CONFIG_FILENAME} was read from ${sha.slice(0, 12)}. `
       + 'Nothing was changed. Retry to deploy the new tip with its own config.',

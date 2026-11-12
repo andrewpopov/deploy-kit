@@ -69,11 +69,13 @@ differing config prints
 the file is refused, as is a sha that could not be fetched (reported as a fetch failure, not a missing
 file), and so is a sha whose `mode`, `host`, `projectDir`, `ssh`, `remote`, `branch`,
 `requireVerifiedRef`, `autoCut` or `layout` differs from the working tree: those already chose the
-target and ref. With auto-cut the sha does not exist yet, so the branch tip's config is used and the
-deploy is refused if the cut changed the file. `rollback` and `recover` name no new commit and are
+target and ref. With auto-cut the sha does not exist yet, so the branch tip's config is used; the deploy is
+refused if the cut changed the file, and if the cut had nothing to cut the tip it read ships
+(refused if the branch moved). `rollback` and `recover` name no new commit and are
 not re-resolved. There is no flag to deploy an uncommitted config; a config built in code
-(`mergeConfig`, no file) is used as given, and so is one loaded from a directory that is not a git
-checkout (warned). `--dry-run` contacts no remote: it resolves no tip, plans from the sha's config
+(`mergeConfig`, no file) is used as given. A real deploy whose config file was loaded from a
+directory that is not a git checkout is refused (run it from a checkout); only a dry run plans with
+such a file as is (warned). `--dry-run` contacts no remote: it resolves no tip, plans from the sha's config
 when a `--sha` is already local, and fails closed when it is local without the file.
 
 The `.deploy-kit.config.json` holding your real host/paths lives in each
