@@ -874,7 +874,7 @@ function loadConfig({
   let readFromDisk = false;
   const configPath = path.join(cwd, CONFIG_FILENAME);
   if (configText !== undefined || fsImpl.existsSync(configPath)) {
-    readFromDisk = configText === undefined && fsImpl === fs;
+    readFromDisk = configText === undefined && fs.existsSync(configPath);
     try {
       fileConfig = JSON.parse(configText !== undefined ? configText : fsImpl.readFileSync(configPath, 'utf8'));
     } catch (error) {

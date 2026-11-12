@@ -1,16 +1,15 @@
 'use strict';
 
-// PKG-318: the hooks, pre/post-deploy checks and monitor settings that run a deploy must come from
-// the commit being shipped, not from the checkout deploy-kit happens to run in (a stale checkout once
-// ran an old full-backup hook against a newer commit, and on a host deploy-kit runs inside the OLD
-// checkout). A config read from `.deploy-kit.config.json` carries CONFIG_ORIGIN; deploy() and
-// deployRelease() call these functions, so every entry point (CLI, programmatic, on-host) shares them.
-//   resolveShipConfig:     the sha is known up front (--sha, or the requireVerifiedRef tip). The file is
-//                          read from that commit in the controller checkout, fetching the exact sha.
-//   resolveLateShipConfig: the sha only exists once the target has pulled or auto-cut has merged. The
-//                          file is read from the target's own repository.
-// The working-tree config is only the bootstrap: it chose the target and ref, so a sha whose bootstrap
-// keys differ is refused instead of silently re-aimed.
+// PKG-318: the hooks, pre/post-deploy checks, protections and monitor settings that run a deploy must
+// come from the commit being shipped, not from the checkout deploy-kit happens to run in (a stale
+// checkout once ran an old full-backup hook against a newer commit, and on a host deploy-kit runs
+// inside the OLD checkout). A config read from `.deploy-kit.config.json` carries CONFIG_ORIGIN.
+// resolveShipConfig is the ONE resolution point: deploy(), deployRelease() and onHostDeploy call it
+// first, before preflight, protections, derived defaults and checks. It settles the FINAL sha up front
+// (--sha; else the requireVerifiedRef tip; else the branch tip, pinned as options.sha so the target
+// deploys exactly that commit) and reads the file from it in the controller checkout. Auto-cut cannot
+// know its sha yet: it ships the tip's config and assertConfigAtCut checks the cut left it untouched.
+// The working-tree config only bootstraps: a sha whose bootstrap keys differ is refused.
 const { execFileSync } = require('child_process');
 const { isDeepStrictEqual } = require('util');
 const { loadConfig, CONFIG_FILENAME, CONFIG_ORIGIN } = require('./config');
@@ -18,6 +17,7 @@ const { runLocal, wouldAutoCutRun } = require('./auto-cut');
 const { shQuote } = require('./exec');
 const { resolveVerifiedTip } = require('./verified-ref');
 const { log: defaultLog } = require('./log');
+const { FULL_SHA_RE } = require('./sha-options');
 
 const BOOTSTRAP_KEYS = ['mode', 'host', 'projectDir', 'ssh', 'remote', 'branch', 'requireVerifiedRef', 'autoCut', 'layout'];
 
@@ -39,17 +39,36 @@ function controllerRemotes(cwd, config) {
   return [...new Set([...(names.includes(config.remote) ? [config.remote] : []), ...names])];
 }
 
+function controllerTip(config, cwd, ref) {
+  for (const remote of controllerRemotes(cwd, config)) {
+    const found = localGit(cwd, `git ls-remote ${shQuote(remote)} ${shQuote(ref)}`);
+    const tip = found.ok ? found.output.split(/\s/)[0] : '';
+    if (tip) return { ok: true, output: tip };
+  }
+  return { ok: false, output: '' };
+}
+
 function controllerVerifiedTip(config, cwd) {
-  const ref = `refs/heads/${config.requireVerifiedRef}`;
-  const tipOf = () => {
-    for (const remote of controllerRemotes(cwd, config)) {
-      const found = localGit(cwd, `git ls-remote ${shQuote(remote)} ${shQuote(ref)}`);
-      const tip = found.ok ? found.output.split(/\s/)[0] : '';
-      if (tip) return { ok: true, output: tip };
-    }
-    return { ok: false, output: '' };
-  };
-  return resolveVerifiedTip(config, { fetch: () => ({ ok: true }), revParse: tipOf });
+  return resolveVerifiedTip(config, {
+    fetch: () => ({ ok: true }),
+    revParse: () => controllerTip(config, cwd, `refs/heads/${config.requireVerifiedRef}`),
+  });
+}
+
+// The branch a plain deploy ships: config.branch, else the remote's default branch, else master.
+function controllerBranchTip(config, cwd) {
+  let branch = config.branch;
+  for (const remote of branch ? [] : controllerRemotes(cwd, config)) {
+    const head = localGit(cwd, `git ls-remote --symref ${shQuote(remote)} HEAD`);
+    const match = head.ok && head.output.match(/^ref: refs\/heads\/(\S+)\s+HEAD/m);
+    if (match) { branch = match[1]; break; }
+  }
+  branch = branch || 'master';
+  const tip = controllerTip(config, cwd, `refs/heads/${branch}`);
+  if (!FULL_SHA_RE.test(tip.output)) {
+    throw new Error(`deploy: could not resolve branch "${branch}" on any remote of ${cwd}, so there is no commit to read ${CONFIG_FILENAME} from. Nothing was changed.`);
+  }
+  return { branch, sha: tip.output };
 }
 
 function ensureCommit(cwd, config, sha) {
@@ -107,45 +126,72 @@ function adoptShippedConfig(config, sha, configText, log) {
   if (!isDeepStrictEqual(withoutOrigin(config), shipped)) {
     log.warning(`deploy-kit: using ${CONFIG_FILENAME} from ${sha.slice(0, 8)} (the working tree differs)`);
   }
-  return { ...shipped, [CONFIG_ORIGIN]: { ...origin, shippedSha: sha } };
+  return { ...shipped, [CONFIG_ORIGIN]: { ...origin, shippedSha: sha, configText } };
 }
 
-// Returns { config, options }: the sha's config and, for a verified-ref deploy, `options.sha` pinned to
-// the tip it was read from. Unchanged when the config has no file origin, or when no sha is known yet
-// (auto-cut cuts its own, a plain branch deploy pulls on the target: see resolveLateShipConfig). A dry
-// run fetches nothing: an unavailable sha plans from the working tree (warned); a commit that is
-// present and has no config still fails closed.
+// Returns { config, options }: the sha's config and `options.sha` pinned to the commit it was read
+// from. Unchanged when the config has no file origin. A dry run contacts no remote: it resolves no
+// tip, and an unavailable --sha plans from the working tree (warned), but a commit that is present
+// and has no config still fails closed.
 function resolveShipConfig({ config, options = {}, log = defaultLog }) {
   const origin = config[CONFIG_ORIGIN];
-  if (!origin) return { config, options };
+  if (!origin || origin.notGit) return { config, options };
+  if (!localGit(origin.cwd, 'git rev-parse --git-dir').ok) {
+    log.warning(`deploy-kit: ${origin.cwd} is not a git checkout, so there is no commit to read ${CONFIG_FILENAME} from; using it as is`);
+    return { config: { ...config, [CONFIG_ORIGIN]: { ...origin, notGit: true } }, options };
+  }
   let sha = options.sha;
-  if (!sha && config.requireVerifiedRef && !options.dryRun && !wouldAutoCutRun(config, { ...options, projectRoot: origin.cwd })) {
-    sha = controllerVerifiedTip(config, origin.cwd);
-    log.info(`verified ref "${config.requireVerifiedRef}" is ${sha.slice(0, 12)}`);
+  let shipped = options;
+  if (!sha && !options.dryRun) {
+    const autoCut = wouldAutoCutRun(config, { ...options, projectRoot: origin.cwd });
+    if (config.requireVerifiedRef) {
+      if (autoCut || options.branch !== undefined) return { config, options };
+      sha = controllerVerifiedTip(config, origin.cwd);
+      shipped = { ...options, sha };
+      log.info(`verified ref "${config.requireVerifiedRef}" is ${sha.slice(0, 12)}`);
+    } else {
+      const tip = controllerBranchTip(config, origin.cwd);
+      sha = tip.sha;
+      log.info(`branch "${tip.branch}" is ${sha.slice(0, 12)}`);
+      if (!autoCut) {
+        shipped = { ...options, sha, pinnedBranchTip: true };
+        delete shipped.branch;
+      }
+    }
   }
   if (!sha) return { config, options };
-  const pinned = { ...options, sha };
-  if (origin.shippedSha === sha) return { config, options: pinned };
+  if (origin.shippedSha === sha) return { config, options: shipped };
   try {
     if (!options.dryRun) ensureCommit(origin.cwd, config, sha);
-    return { config: adoptShippedConfig(config, sha, readConfigAtSha(origin.cwd, sha), log), options: pinned };
+    return { config: adoptShippedConfig(config, sha, readConfigAtSha(origin.cwd, sha), log), options: shipped };
   } catch (error) {
     if (!options.dryRun || !(error instanceof ShaUnavailableError)) throw error;
     log.warning(`deploy-kit: planning with the working-tree ${CONFIG_FILENAME}: ${error.message}`);
-    return { config: { ...config, [CONFIG_ORIGIN]: { ...origin, shippedSha: sha } }, options: pinned };
+    return { config: { ...config, [CONFIG_ORIGIN]: { ...origin, shippedSha: sha } }, options: shipped };
   }
 }
 
-// `readOnTarget(spec)` runs `git show <spec>` where the target repository lives and returns
-// { ok, output }. A planning runtime cannot answer it, so the caller skips this in a dry run.
-function resolveLateShipConfig({ config, sha, readOnTarget, log = defaultLog }) {
+// After auto-cut produced `sha`: the cut may only touch release files, so the config adopted from the
+// tip must be byte-identical in the cut commit. A refusal, never an adoption.
+function assertConfigAtCut(config, sha) {
   const origin = config[CONFIG_ORIGIN];
-  if (!origin || origin.shippedSha === sha) return config;
-  const shown = readOnTarget(`${sha}:${configPathInRepo(origin.cwd)}`);
-  if (!shown.ok) throw missingConfigError(sha, 'in the target repository');
-  return adoptShippedConfig(config, sha, shown.output, log);
+  if (!origin || origin.configText === undefined) return;
+  ensureCommit(origin.cwd, config, sha);
+  if (readConfigAtSha(origin.cwd, sha) !== origin.configText) {
+    throw new Error(`deploy: auto-cut's release ${sha.slice(0, 8)} changed ${CONFIG_FILENAME} from the branch tip it was read from (${origin.shippedSha.slice(0, 8)}); refusing to deploy with a config that was not the one in use.`);
+  }
+}
+
+// A branch-tip deploy pins the tip it read the config from; the target must still see that same tip.
+function assertPinnedTipHolds(options, sha, tip, label) {
+  if (options.pinnedBranchTip && tip !== sha) {
+    throw new Error(
+      `Deploy aborted: ${label} moved to ${tip.slice(0, 12)} after ${CONFIG_FILENAME} was read from ${sha.slice(0, 12)}. `
+      + 'Nothing was changed. Retry to deploy the new tip with its own config.',
+    );
+  }
 }
 
 module.exports = {
-  resolveShipConfig, resolveLateShipConfig, BOOTSTRAP_KEYS, ShaUnavailableError,
+  resolveShipConfig, assertConfigAtCut, assertPinnedTipHolds, BOOTSTRAP_KEYS, ShaUnavailableError,
 };

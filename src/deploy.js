@@ -14,8 +14,7 @@ const { onlineAppNames } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
 const { clearAutoCutPending, wouldAutoCutRun } = require('./auto-cut');
 const { assertShaOptions } = require('./sha-options');
-const { resolveShipConfig, resolveLateShipConfig } = require('./ship-config');
-const { CONFIG_ORIGIN } = require('./config');
+const { resolveShipConfig, assertConfigAtCut, assertPinnedTipHolds } = require('./ship-config');
 const {
   assertVerifiedRefOptions, verifiedRefLabel, resolveVerifiedTip, assertContainedInVerified,
 } = require('./verified-ref');
@@ -164,7 +163,6 @@ function gate(step, config, ctx, { onFail, capture = false } = {}) {
 //   install → BACKUP(gate) → stop db-bound apps (release SQLite lock) →
 //   migrate(gate, restart on fail) → build → restart apps → health(gate)
 function deploy(config, options = {}, ctx = {}) {
-  assertTransitionAuthorityEntryPoint(config, { supported: config.layout?.type === 'releases', options });
   // `--sha`'s format and its exclusivity with `--branch` -- checked here,
   // before ANYTHING else (including the release-layout delegation below),
   // because `deploy()` is itself an exported, programmatic entry point: the
@@ -172,6 +170,7 @@ function deploy(config, options = {}, ctx = {}) {
   assertShaOptions(options);
   // PKG-318: from here on `config` is the shipped sha's, whoever called us (CLI, API, on-host).
   ({ config, options } = resolveShipConfig({ config, options, log: ctx.log }));
+  assertTransitionAuthorityEntryPoint(config, { supported: config.layout?.type === 'releases', options });
   assertOwnedEntry(config, options, ctx, 'deploy');
   // Artifact-first release layout (SMH-112) is a separate pipeline. Lazy-require to
   // avoid a top-level cycle (release.js pulls shared helpers, not this module).
@@ -364,6 +363,7 @@ function deployLegacy(config, options, ctx) {
       throw new Error(`Deploy aborted: auto-cut ran after the pre-deploy checks had already approved ${checkedSha.slice(0, 12)}`);
     }
     R = autoCutResult.ran ? autoCutResult.sha : null;
+    if (autoCutResult.ran) assertConfigAtCut(config, R);
     if (R) {
       log.info(`auto-cut: deploying release ${autoCutResult.version} (${R.slice(0, 12)}, PR #${autoCutResult.prNumber})`);
     } else if (options.sha) {
@@ -542,6 +542,7 @@ function deployLegacy(config, options, ctx) {
       );
       const branchTipRes = runOnTarget(`git rev-parse ${shQuote(config.remote)}/${shQuote(branch)}`, config, { runtime, capture: true });
       const branchTip = (branchTipRes.output || '').trim();
+      assertPinnedTipHolds(options, R, branchTip, `${config.remote}/${branch}`);
       if (!branchTipRes.ok || !branchTip) {
         throw new Error(
           `Deploy aborted: could not resolve ${config.remote}/${branch} to a SHA at ${config.projectDir} after `
@@ -598,13 +599,6 @@ function deployLegacy(config, options, ctx) {
       mark('merge');
       run(`Pulling ${config.remote}/${branch} (--ff-only)`, `git pull --ff-only ${shQuote(config.remote)} ${shQuote(branch)}`);
       steps.push(`pull:${branch}`);
-    }
-
-    if (config[CONFIG_ORIGIN] && !normalizeRuntime(runtime).dryRun) {
-      const shippedSha = R || runOnTarget('git rev-parse HEAD', config, { runtime, capture: true }).output.trim();
-      config = resolveLateShipConfig({
-        config, sha: shippedSha, log, readOnTarget: (spec) => runOnTarget(`git show ${shQuote(spec)}`, config, { runtime, capture: true }),
-      });
     }
 
     if (stash) {

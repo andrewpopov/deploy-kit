@@ -2,9 +2,7 @@
 
 const path = require('path');
 const { execFileSync: nodeExecFileSync } = require('child_process');
-const {
-  runOnTarget, buildHealthCommand, shQuote, normalizeRuntime,
-} = require('./exec');
+const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
 const {
   acquireLock, validateOwnedLocks, lockRequiresOwnership, assertOwnedEntry,
 } = require('./lock');
@@ -16,7 +14,7 @@ const { parsePm2List } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
 const { clearAutoCutPending } = require('./auto-cut');
 const { assertShaOptions } = require('./sha-options');
-const { resolveShipConfig, resolveLateShipConfig } = require('./ship-config');
+const { resolveShipConfig, assertConfigAtCut, assertPinnedTipHolds } = require('./ship-config');
 const { DEFAULT_WEBHOOK_ENV: ALERT_WEBHOOK_ENV } = require('./alert-discord');
 const {
   assertVerifiedRefOptions, verifiedRefLabel, resolveVerifiedTip, assertContainedInVerified,
@@ -473,7 +471,6 @@ function acquireOrAdoptLock(config, c, { steal }) {
 // every phase records enough state that recover() can restore a known-good running
 // release, and the ONLY disruptive window is stop → backup → migrate → flip.
 function deployRelease(config, options = {}, ctx = {}) {
-  assertTransitionAuthorityEntryPoint(config, { supported: true, options });
   // `--sha`'s format and its exclusivity with `--branch` -- checked here too,
   // before ANYTHING else: `deployRelease()` is itself exported and callable
   // directly (not just via deploy()'s layout delegation), so the CLI's
@@ -482,6 +479,7 @@ function deployRelease(config, options = {}, ctx = {}) {
   const recoverOnly = ctx[RECOVER_ONLY] === true;
   // PKG-318: from here on `config` is the shipped sha's, whoever called us (CLI, API, on-host).
   if (!recoverOnly) ({ config, options } = resolveShipConfig({ config, options, log: ctx.log }));
+  assertTransitionAuthorityEntryPoint(config, { supported: true, options });
   assertOwnedEntry(config, options, ctx, recoverOnly ? 'recover' : 'deploy');
   const log = ctx.log || defaultLog;
   const sleep = ctx.sleep || defaultSleep;
@@ -1247,6 +1245,7 @@ function deployRelease(config, options = {}, ctx = {}) {
     // above the legacy setup).
     autoCutResult = runAutoCutPreflight(config, options, c);
     R = autoCutResult.ran ? autoCutResult.sha : null;
+    if (autoCutResult.ran) assertConfigAtCut(config, R);
     if (R) {
       log.info(`auto-cut: deploying release ${autoCutResult.version} (${R.slice(0, 12)}, PR #${autoCutResult.prNumber})`);
     } else if (options.sha) {
@@ -1332,6 +1331,10 @@ function deployRelease(config, options = {}, ctx = {}) {
         `git --git-dir=${paths.repoGit} merge-base --is-ancestor ${shQuote(R)} refs/heads/${shQuote(branch)}`,
         config, c, { tolerate: true },
       );
+      if (options.pinnedBranchTip) {
+        const tipNow = capture(paths.root, `git --git-dir=${paths.repoGit} rev-parse refs/heads/${shQuote(branch)}`, config, c);
+        assertPinnedTipHolds(options, R, tipNow, `refs/heads/${branch}`);
+      }
       if (!mergedRes.ok) {
         throw new Error(
           `Deploy aborted: release ${R.slice(0, 12)} is NOT an ancestor of refs/heads/${branch} in ${paths.repoGit} `
@@ -1355,11 +1358,6 @@ function deployRelease(config, options = {}, ctx = {}) {
       if (!/^[0-9a-f]{40}$/.test(st.sha)) {
         throw new Error(`Could not resolve ${config.remote}/${branch} (or refs/heads/${branch}) to a SHA in ${paths.repoGit} (got "${st.sha}")`);
       }
-    }
-    if (!normalizeRuntime(ctx.runtime).dryRun) {
-      config = resolveLateShipConfig({
-        config, sha: st.sha, log, readOnTarget: (spec) => runInDir(paths.root, `git --git-dir=${paths.repoGit} show ${shQuote(spec)}`, config, c, { capture: true, tolerate: true }),
-      });
     }
     const ts = capture(paths.root, 'date -u +%Y%m%dT%H%M%SZ', config, c);
     const releaseId = `${st.sha.slice(0, 12)}-${ts}`;

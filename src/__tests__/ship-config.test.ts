@@ -9,11 +9,12 @@ import path from 'path';
 
 const require = createRequire(__filename);
 const cli = require('../cli.js') as { run: (argv: string[], opts?: any) => number };
-const { resolveShipConfig } = require('../ship-config.js');
+const { resolveShipConfig, assertConfigAtCut } = require('../ship-config.js');
 const { log } = require('../log.js') as Record<string, any>;
 const kit = require('../index.js') as any;
 const release = require('../release.js');
-const { onHostDeploy } = require('../on-host/operator.js');
+const { onHostDeploy, onHostRecover } = require('../on-host/operator.js');
+const { PIN_CHECK_COMMAND } = require('../pin-gate.js');
 
 // PKG-318: a deploy ships the config of the commit it deploys, not the operator's (possibly stale) working tree.
 // Real git throughout: the sha's config is read with `git show`, so a fake would prove nothing.
@@ -184,13 +185,13 @@ const pipelineConfig = (install: string, extra: Record<string, unknown> = {}) =>
   hooks: { install }, ...extra,
 });
 
-// A fake target good enough to carry a legacy or release deploy past install. `shown` answers `git show <sha>:<config>`.
-function pipelineRuntime(sha: string, shown = '') {
+// A fake target good enough to carry a legacy or release deploy past install. `movedTip` makes the target's branch tip differ from `sha`.
+function pipelineRuntime(sha: string, movedTip = '') {
   const calls: string[] = [];
   const execFileSync = (_file: string, args: string[]) => {
     const cmd = args[args.length - 1];
     calls.push(cmd);
-    if (/\bshow\b/.test(cmd) && cmd.includes('.deploy-kit.config.json')) return shown;
+    if (movedTip && (cmd.includes("rev-parse 'origin'/'master'") || cmd.includes("rev-parse refs/heads/'master'"))) return movedTip;
     if (cmd.includes('.deploy-kit-layout')) return '{"layout":"releases","version":1}';
     if (cmd.includes('mv --version')) return 'mv (GNU coreutils) 9.1';
     if (cmd.includes('df -kP') || cmd.includes('df -Pk')) return '99999999';
@@ -226,20 +227,41 @@ describe.each([
     expect(lines.filter((l) => l === NOTICE(newerSha))).toHaveLength(1);
   });
 
-  it('CANARY late-branch-tip: no sha, the target resolves one, its config is read from the target and used', () => {
-    const { work, newerSha } = stale(pipelineConfig(OLD_INSTALL, extra), pipelineConfig(NEW_INSTALL, extra));
+  const withCheck = (install: string, command: string) => pipelineConfig(install, { ...extra, preDeployChecks: [{ name: 'chk', command }] });
+
+  it('CANARY branch-tip: no sha, the branch tip is resolved first and pinned; install AND preDeployChecks come from its config', () => {
+    const { work, newerSha } = stale(withCheck(OLD_INSTALL, 'old-check'), withCheck(NEW_INSTALL, 'new-check'));
     const lines = captureLog();
-    const stream = runDeploy(fn, loadWorking(work), {}, pipelineRuntime(newerSha, JSON.stringify(pipelineConfig(NEW_INSTALL, extra))));
+    const stream = runDeploy(fn, loadWorking(work), {}, pipelineRuntime(newerSha));
     expect(installs(stream)).toEqual({ old: false, new: true });
+    expect(stream).toContain('new-check');
+    expect(stream).not.toContain('old-check');
     expect(lines).toContain(NOTICE(newerSha));
   });
 
-  it('CANARY late-bootstrap: a target config that moves the host is refused before install', () => {
+  it('CANARY branch-tip-bootstrap: a tip config that moves the host is refused before any target command', () => {
+    const { work } = stale(pipelineConfig(OLD_INSTALL, extra), pipelineConfig(NEW_INSTALL, { ...extra, host: 'other@host' }));
+    captureLog();
+    const rt = pipelineRuntime('a'.repeat(40));
+    expect(() => fn(loadWorking(work), { autoCut: false }, rt.ctx)).toThrow(/"host" in the working tree's/);
+    expect(rt.calls).toEqual([]);
+  });
+
+  it('CANARY tip-moved: the target sees a different branch tip than the one the config was read from -> refused', () => {
     const { work, newerSha } = stale(pipelineConfig(OLD_INSTALL, extra), pipelineConfig(NEW_INSTALL, extra));
     captureLog();
-    const rt = pipelineRuntime(newerSha, JSON.stringify(pipelineConfig(NEW_INSTALL, { ...extra, host: 'other@host' })));
-    expect(() => fn(loadWorking(work), { autoCut: false }, rt.ctx)).toThrow(/"host" in the working tree's/);
+    const rt = pipelineRuntime(newerSha, 'b'.repeat(40));
+    expect(() => fn(loadWorking(work), { autoCut: false }, rt.ctx)).toThrow(/moved to bbbbbbbbbbbb/);
     expect(rt.calls.join('\n')).not.toContain(NEW_INSTALL);
+  });
+
+  it('CANARY verify-pins: verifyPins taken from the sha decides whether the pin gate runs', () => {
+    if (_name === 'release') return;
+    const { work, newerSha } = stale(pipelineConfig(OLD_INSTALL, extra), pipelineConfig(NEW_INSTALL, { ...extra, verifyPins: false }));
+    captureLog();
+    const stream = runDeploy(fn, loadWorking(work), {}, pipelineRuntime(newerSha));
+    expect(stream).toContain(NEW_INSTALL);
+    expect(stream).not.toContain(PIN_CHECK_COMMAND);
   });
 
   it('an inline config (no file behind it) is left alone: nothing to re-read', () => {
@@ -328,5 +350,87 @@ describe('PKG-318 sources of the sha', () => {
     captureLog();
     git(work, 'fetch', '-q', 'origin');
     expect(() => resolveShipConfig({ config: loadWorking(work), options: { sha: newerSha, dryRun: true } })).toThrow(/has no \.deploy-kit\.config\.json/);
+  });
+});
+
+describe('PKG-318 protections and validation come from the shipped config', () => {
+  it('CANARY migration-validation: preflight sees the sha\'s migrate hook (and refuses a missing backup hook)', () => {
+    const { work, newerSha } = stale(
+      pipelineConfig(OLD_INSTALL, { layout: RELEASE_LAYOUT }),
+      pipelineConfig(NEW_INSTALL, { layout: RELEASE_LAYOUT, hooks: { install: NEW_INSTALL, migrate: 'run-migrations' } }),
+    );
+    captureLog();
+    const rt = pipelineRuntime(newerSha);
+    expect(() => release.deployRelease(loadWorking(work), { autoCut: false, sha: newerSha }, rt.ctx)).toThrow(/requires a `backup` hook/);
+  });
+
+  it('CANARY transition-authority: a transitionAuthority added at the sha is enforced by the legacy entry point', () => {
+    const { work, newerSha } = stale(
+      pipelineConfig(OLD_INSTALL),
+      pipelineConfig(NEW_INSTALL, { transitionAuthority: { command: 'echo authority', scope: 'app' } }),
+    );
+    captureLog();
+    expect(() => kit.deploy(loadWorking(work), { autoCut: false, sha: newerSha }, pipelineRuntime(newerSha).ctx)).toThrow(/does not support a configured transitionAuthority/);
+  });
+
+  it('CANARY wrapped-fs: a config read through a wrapped fs is still stamped and still re-read from the sha', () => {
+    const { work, newerSha } = stale(withHooks(OLD_BACKUP), withHooks(NEW_BACKUP));
+    captureLog();
+    git(work, 'fetch', '-q', 'origin');
+    const config = require('../config.js').loadConfig({ cwd: work, fsImpl: { ...require('fs') } });
+    expect(Object.getOwnPropertySymbols(config)).toContain(Symbol.for('deploy-kit.configOrigin'));
+    expect(resolveShipConfig({ config, options: { sha: newerSha } }).config.hooks.backup).toBe(NEW_BACKUP);
+  });
+
+  it('CANARY on-host-recover: recover names no commit, so its config is bundled as loaded (no resolution against the zero sha)', () => {
+    const { work } = stale(pipelineConfig(OLD_INSTALL, { layout: RELEASE_LAYOUT }), pipelineConfig(NEW_INSTALL, { layout: RELEASE_LAYOUT }));
+    captureLog();
+    const dir = mkdtempSync(path.join(tmpdir(), 'dk-ship-recover-'));
+    roots.push(dir);
+    const uploads: Buffer[] = [];
+    const hex = (v: string) => Buffer.from(v, 'utf8').toString('hex');
+    const pre: Record<string, string> = {
+      DK_USER: 'dkapp', DK_UID: '1000', DK_LINGER: 'yes', DK_USER_MANAGER: 'yes', DK_NODE: '/usr/bin/node', DK_NODE_MAJOR: '24', DK_ACTIVE_UNITS: '0',
+      DK_SHELL: '/bin/bash', DK_GID: '1000', DK_GROUPS: '1000', DK_GROUP_NAMES: 'dkapp', DK_MANAGER_GROUPS: '\t1000', DK_UMASK: '0027', DK_OOM: '100',
+      DK_PATH: '/usr/bin', DK_HOME: '/srv/dkapp', DK_LOGNAME: 'dkapp', ENV_LANG: 'C.UTF-8', ENVABSENT_PM2_HOME: '1', DK_END: '1',
+    };
+    const hostExec = (_f: string, args: string[], opts: { input?: Buffer }) => {
+      const cmd = args[args.length - 1];
+      if (cmd === 'sh -se') return `${Object.entries(pre).map(([k, v]) => `${k}=${hex(v)}`).join('\n')}\n`;
+      if (cmd.includes('dk-run-exists')) return 'dk-run-free\n';
+      if (cmd.includes('tar -x')) uploads.push(opts.input as Buffer);
+      return '';
+    };
+    const quiet = { info: () => {}, warning: () => {}, error: () => {}, success: () => {} };
+    const code = onHostRecover(loadWorking(work), {
+      request: 'req-1', epoch: '0', notAfter: '1790000000', expectReservation: '{"state":"none","runId":null,"gen":0}', parentRun: '20261023T101500Z-0123456789ab-0badcafe',
+    }, {
+      runtime: { execFileSync: hostExec }, log: quiet, receiptsPath: path.join(dir, 'r.jsonl'), tmpRoot: dir, gitHead: () => 'c'.repeat(40),
+      now: () => new Date('2026-09-30T12:00:00.000Z'), randomHex: () => 'deadbeef', attach: () => 0,
+    });
+    expect(code).toBe(0);
+    expect(JSON.parse(execFileSync('tar', ['-xOf', '-', 'config.json'], { input: uploads[0], encoding: 'utf8' })).hooks.install).toBe(OLD_INSTALL);
+  });
+});
+
+describe('PKG-318 edges', () => {
+  it('CANARY not-a-git-checkout: a config loaded outside any git checkout is used as given, with a warning', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'dk-ship-nogit-'));
+    roots.push(dir);
+    writeFileSync(path.join(dir, '.deploy-kit.config.json'), JSON.stringify(withHooks(OLD_BACKUP)));
+    const lines = captureLog();
+    const config = loadWorking(dir);
+    const result = resolveShipConfig({ config, options: { sha: 'a'.repeat(40) } });
+    expect(result.config.hooks.backup).toBe(OLD_BACKUP);
+    expect(lines.join('\n')).toContain('is not a git checkout');
+  });
+
+  it('CANARY auto-cut-config: a cut that changed the config the deploy adopted from the tip is refused', () => {
+    const { work, olderSha, newerSha } = stale(withHooks(OLD_BACKUP), withHooks(NEW_BACKUP));
+    captureLog();
+    git(work, 'fetch', '-q', 'origin');
+    const adopted = resolveShipConfig({ config: loadWorking(work), options: { sha: newerSha } }).config;
+    expect(() => assertConfigAtCut(adopted, newerSha)).not.toThrow();
+    expect(() => assertConfigAtCut(adopted, olderSha)).toThrow(/auto-cut's release .* changed \.deploy-kit\.config\.json/);
   });
 });

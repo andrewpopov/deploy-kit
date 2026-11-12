@@ -403,7 +403,7 @@ function onHostDeploy(config, options, deps = {}) {
 
   try {
     validateOnHostRequest(config, options);
-    if (options.kind !== 'rollback') {
+    if (options.kind !== 'rollback' && options.kind !== 'recover') {
       try {
         ({ config, options } = resolveShipConfig({ config, options, log }));
       } catch (error) {
