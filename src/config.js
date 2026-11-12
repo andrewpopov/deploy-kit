@@ -107,6 +107,8 @@ const DEFAULT_CONFIG = {
   // `github:owner/repo#ref`, so without this gate a stale dependency ships under a
   // green deploy. Set false only for a target you accept cannot be verified.
   verifyPins: true,
+  skipUnchangedInstall: true,
+  installFingerprintFiles: [],
   // BRAIN-567: null (default) = deploy whatever `branch` resolves to. A branch
   // name (the merge train's `green`) = production only ever receives a commit
   // contained in that ref: a plain deploy ships its tip, `--sha` must be an
@@ -268,6 +270,8 @@ const KEY_TYPES = {
   hostLock: 'object?',
   buildBeforeMigrate: 'boolean',
   verifyPins: 'boolean',
+  skipUnchangedInstall: 'boolean',
+  installFingerprintFiles: 'array',
   requireVerifiedRef: 'string?',
   layout: 'object?',
   monitor: 'object?',
@@ -741,6 +745,17 @@ function typeMatches(value, spec) {
 
 // Validate a raw config object (a parsed config file or an inline override).
 // Returns an array of human-readable problem strings — empty means valid.
+const FINGERPRINT_FILE_RE = /^[A-Za-z0-9_@][A-Za-z0-9_@./*-]*$/;
+
+function validateFingerprintFiles(files, source) {
+  if (!Array.isArray(files)) return [];
+  return files.flatMap((file, i) => (
+    typeof file === 'string' && FINGERPRINT_FILE_RE.test(file) && !file.split('/').includes('..')
+      ? []
+      : [`${source}: "installFingerprintFiles[${i}]" must be a relative path or glob of letters, digits and _@./*- with no ".." segments`]
+  ));
+}
+
 function validateConfig(raw, { source = 'config' } = {}) {
   const problems = [];
   if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -780,6 +795,7 @@ function validateConfig(raw, { source = 'config' } = {}) {
     });
   }
   problems.push(...validateDeployChecks(raw.preRestartChecks, 'preRestartChecks', source));
+  problems.push(...validateFingerprintFiles(raw.installFingerprintFiles, source));
   // `layout` type is checked above (object?); if present, validate its inner shape.
   if (raw.layout != null && typeof raw.layout === 'object' && !Array.isArray(raw.layout)) {
     problems.push(...validateLayout(raw.layout, source));

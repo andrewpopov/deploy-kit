@@ -444,6 +444,7 @@ function onHostDeploy(config, options, deps = {}) {
       options: {
         skipBuild: options.skipBuild === true,
         skipDeps: options.skipDeps === true,
+        ...(options.forceInstall === true ? { forceInstall: true } : {}),
         skipMigrate: options.skipMigrate === true,
         ...(typeof options.verifyPins === 'boolean' ? { verifyPins: options.verifyPins } : {}),
       },

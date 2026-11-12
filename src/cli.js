@@ -22,7 +22,7 @@ const { markPlanningRuntime } = require('./lock');
 const { resolveShipConfig } = require('./ship-config');
 
 const KNOWN_FLAGS = [
-  '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
+  '--lines', '--follow', '--errors', '--skip-build', '--skip-deps', '--force-install',
   '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock',
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
   '--dir', '--json', '--local', '--branch', '--no-auto-cut', '--guard-config', '--sha', '--on-host',
@@ -54,7 +54,7 @@ const COMMAND_FLAGS = {
   'verify-tunnel-config': ['--dir', '--guard-config', '--json'],
   'verify-no-secrets': ['--dir', '--guard-config', '--json'],
   'clear-pending-release': ['--dir', '--json'],
-  deploy: ['--skip-build', '--skip-deps', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut', '--sha', '--on-host', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--run-id'],
+  deploy: ['--skip-build', '--skip-deps', '--force-install', '--skip-migrate', '--skip-pin-check', '--no-stash', '--dry-run', '--steal-lock', '--no-lock', '--branch', '--no-auto-cut', '--sha', '--on-host', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--run-id'],
   rollback: ['--skip-build', '--skip-deps', '--dry-run', '--steal-lock', '--no-lock', '--on-host', '--to', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--run-id'],
   recover: ['--on-host', '--parent-run', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--run-id'],
   monitor: ['--steal-lock', '--no-lock', '--local'],
@@ -139,6 +139,7 @@ function parseOptions(args) {
     else if (a === '--errors') options.errors = true;
     else if (a === '--skip-build') options.skipBuild = true;
     else if (a === '--skip-deps') options.skipDeps = true;
+    else if (a === '--force-install') options.forceInstall = true;
     else if (a === '--skip-migrate') options.skipMigrate = true;
     else if (a === '--skip-pin-check') options.verifyPins = false;
     else if (a === '--no-stash') options.stash = false;
@@ -235,9 +236,12 @@ Commands:
                                             the Cairn defaults (DEPLOY_CAIRN_PRODUCTION action,
                                             CAIRN_OPERATIONS_API_URL / CAIRN_OPERATIONS_API_KEY);
                                             takes no flags
-  deploy [--skip-build|--skip-deps|--skip-migrate|--skip-pin-check]
+  deploy [--skip-build|--skip-deps|--force-install|--skip-migrate|--skip-pin-check]
          [--no-stash] [--dry-run] [--steal-lock] [--no-lock] [--branch NAME]
          [--sha <40-hex-sha>] [--no-auto-cut] [--on-host]
+                                            --force-install runs the install hook even when
+                                            the lockfiles and node version match the last
+                                            successful install.
                                             --skip-pin-check disables the post-install
                                             check that the installed tree matches what
                                             package.json pins. It is the escape hatch for

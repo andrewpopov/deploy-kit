@@ -268,7 +268,7 @@ describe.each([
     captureLog();
     const stream = runDeploy(fn, loadWorking(work), {}, pipelineRuntime(newerSha));
     expect(stream).toContain(NEW_INSTALL);
-    expect(stream).not.toContain(PIN_CHECK_COMMAND);
+    expect(stream).not.toContain(`&& ${PIN_CHECK_COMMAND}`);
   });
 
   describe('auto-cut that may run but has nothing to cut', () => {
