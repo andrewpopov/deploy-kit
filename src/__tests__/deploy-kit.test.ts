@@ -778,7 +778,7 @@ describe('pin gate', () => {
       }
     });
 
-    it('checks exact registry versions, and enforces forbidGithubScope, with fs/path only', () => {
+    it('checks exact registry versions (forbid alone fails the program), and enforces forbidGithubScope, with fs/path only', () => {
       const dir = mkdtempSync(path.join(tmpdir(), 'pin-gate-'));
       try {
         writeFileSync(path.join(dir, 'package.json'), JSON.stringify({
@@ -786,7 +786,10 @@ describe('pin gate', () => {
         }));
         const installed = path.join(dir, 'node_modules', '@andrewpopov', 'db-backup');
         mkdirSync(installed, { recursive: true });
-        writeFileSync(path.join(installed, 'package.json'), JSON.stringify({ name: '@andrewpopov/db-backup', version: '0.1.0' }));
+        writeFileSync(path.join(installed, 'package.json'), JSON.stringify({ name: '@andrewpopov/db-backup', version: '0.2.0' }));
+        const other = path.join(dir, 'node_modules', 'other');
+        mkdirSync(other, { recursive: true });
+        writeFileSync(path.join(other, 'package.json'), JSON.stringify({ name: 'other', version: '1.0.0' }));
         const exec = (forbidGithubScope?: string) => {
           const res = spawnSync(process.execPath, ['-'], {
             cwd: dir, input: buildPinCheckProgram({ forbidGithubScope }), encoding: 'utf8',
@@ -794,7 +797,8 @@ describe('pin gate', () => {
           return { code: res.status, output: `${res.stdout || ''}${res.stderr || ''}` };
         };
         const off = exec();
-        expect(off.output).toContain('MISMATCH');
+        expect(off.code).toBe(0);
+        expect(off.output).toContain('2 ok');
         expect(off.output).not.toContain('FORBIDDEN');
         const on = exec('@andrewpopov');
         expect(on.code).toBe(1);

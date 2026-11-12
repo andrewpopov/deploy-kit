@@ -901,6 +901,43 @@ describe('BRAIN-1015: forbidGithubScope', () => {
     expect(verifyPins({ dir, forbidGithubScope: '@andrewpopov' }).ok).toBe(false);
   });
 
+  it.each([
+    ['mixed-case owner', 'github:AndrewPopov/x#v1.0.0'],
+    ['unparseable semver range ref', 'github:andrewpopov/x#semver:>=0.1.0 <1.0.0'],
+    ['git+ssh URL', 'git+ssh://git@github.com/andrewpopov/x.git#v1.0.0'],
+    ['git+https URL', 'git+https://github.com/andrewpopov/x.git#v1.0.0'],
+    ['https tarball URL', 'https://github.com/andrewpopov/x/archive/v1.0.0.tar.gz'],
+    ['git+ssh github-* alias', 'git+ssh://git@github-personal:andrewpopov/x.git#v1'],
+    ['scp-like github-* alias', 'git@github-personal:andrewpopov/x.git'],
+    ['scp-like github.com', 'git@github.com:andrewpopov/x.git#v1'],
+    ['bare shorthand without ref', 'andrewpopov/x'],
+  ])('forbids %s', (_label, spec) => {
+    const dir = freshDir();
+    writeManifest(dir, { x: spec });
+    const result = verifyPins({ dir, forbidGithubScope: '@andrewpopov' });
+    expect(result.summary.forbidden).toBe(1);
+    expect(result.ok).toBe(false);
+  });
+
+  it.each([
+    ['another owner', 'github:someoneelse/x#v1.0.0'],
+    ['a non-GitHub host', 'git+ssh://git@gitlab.com/andrewpopov/x.git'],
+    ['a registry version', '1.0.0'],
+    ['an npm alias', 'npm:@andrewpopov/x@1.0.0'],
+    ['a file: spec', 'file:../andrewpopov/x'],
+  ])('does not forbid %s', (_label, spec) => {
+    const dir = freshDir();
+    writeManifest(dir, { x: spec });
+    expect(verifyPins({ dir, forbidGithubScope: '@andrewpopov' }).summary.forbidden).toBe(0);
+  });
+
+  it('still enforces an exact @andrewpopov version in peerDependencies', () => {
+    const dir = freshDir();
+    writeManifest(dir, { '@andrewpopov/x': '1.0.0' }, 'peerDependencies');
+    install(dir, '@andrewpopov/x', '0.9.0');
+    expect(verifyPins({ dir }).summary.mismatch).toBe(1);
+  });
+
   it('passes both specs when the option is off, and ignores other owners when on', () => {
     const dir = freshDir();
     writeManifest(dir, { x: 'andrewpopov/x#v1.0.0', y: 'github:andrewpopov/y#v2.0.0' });

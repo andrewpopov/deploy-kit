@@ -635,15 +635,19 @@ exactly like a tag pin: the installed `node_modules/<name>/package.json`
 version must equal it (`ok` / `MISMATCH` / `missing` / `corrupt`, fix line
 `npm install <name>@<version> --save-exact`). `npm ci` enforces manifest/lock
 agreement but a deploy target's existing `node_modules` can still be stale.
-Ranges (`^1.2.3`), other scopes, `file:` and `workspace:` are not pins and are
+An exact version in `peerDependencies` is enforced too (npm treats a tree that
+violates it as an invalid peer), though a peer that is not installed at all is
+still only `absent`. Ranges (`^1.2.3`), other scopes, `file:` and `workspace:` are not pins and are
 left alone.
 
 **Forbidding new github pins (opt-in).** Once a repo has moved to registry
 versions, turn on `--forbid-github-scope @andrewpopov` (CLI) and/or
 `"forbidGithubScope": "@andrewpopov"` in `.deploy-kit.config.json` (read by the
 deploy gate, which runs `fs`/`path` only on the target). Any
-`github:andrewpopov/...` or bare `andrewpopov/...#ref` dependency then fails as
-`FORBIDDEN <manifest> <name>` with the fix "pin the exact registry version; see
+dependency that resolves to a GitHub source owned by that scope then fails as
+`FORBIDDEN <manifest> <name>` (matched case-insensitively, whatever the spelling: `github:`, bare
+`owner/repo`, `git+ssh:`/`git+https:`/`https:` URLs, scp-like `git@host:owner/repo`, on `github.com` or a
+`github-*` ssh alias, and even when the ref is not a parseable pin) with the fix "pin the exact registry version; see
 package-registry.md". It is off by default so repos that have not migrated
 keep passing.
 
