@@ -136,6 +136,8 @@ function adoptShippedConfig(config, sha, configText, log) {
 function resolveShipConfig({ config, options = {}, log = defaultLog }) {
   const origin = config[CONFIG_ORIGIN];
   if (!origin || origin.notGit) return { config, options };
+  // ONE project root for resolution, the verified-ref guard and auto-cut: where the file was loaded from.
+  const base = { ...options, projectRoot: origin.cwd };
   if (!localGit(origin.cwd, 'git rev-parse --git-dir').ok) {
     if (!options.dryRun) {
       throw new Error(
@@ -144,29 +146,29 @@ function resolveShipConfig({ config, options = {}, log = defaultLog }) {
       );
     }
     log.warning(`deploy-kit: ${origin.cwd} is not a git checkout; planning with ${CONFIG_FILENAME} as is`);
-    return { config: { ...config, [CONFIG_ORIGIN]: { ...origin, notGit: true } }, options };
+    return { config: { ...config, [CONFIG_ORIGIN]: { ...origin, notGit: true } }, options: base };
   }
   let sha = options.sha;
-  let shipped = options;
+  let shipped = base;
   if (!sha && !options.dryRun) {
-    const autoCut = wouldAutoCutRun(config, { ...options, projectRoot: origin.cwd });
+    const autoCut = wouldAutoCutRun(config, base);
     if (config.requireVerifiedRef) {
-      if (autoCut || options.branch !== undefined) return { config, options };
+      if (options.branch !== undefined) return { config, options: base };
       sha = controllerVerifiedTip(config, origin.cwd);
-      shipped = { ...options, sha };
+      shipped = { ...base, sha };
       log.info(`verified ref "${config.requireVerifiedRef}" is ${sha.slice(0, 12)}`);
     } else {
       const tip = controllerBranchTip(config, origin.cwd);
       sha = tip.sha;
       log.info(`branch "${tip.branch}" is ${sha.slice(0, 12)}`);
-      shipped = { ...options, branchTipPin: sha };
+      shipped = { ...base, branchTipPin: sha };
       if (!autoCut) {
         shipped.sha = sha;
         delete shipped.branch;
       }
     }
   }
-  if (!sha) return { config, options };
+  if (!sha) return { config, options: base };
   if (origin.shippedSha === sha) return { config, options: shipped };
   try {
     if (!options.dryRun) ensureCommit(origin.cwd, config, sha);

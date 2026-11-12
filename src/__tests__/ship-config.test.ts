@@ -469,3 +469,31 @@ describe('PKG-318 edges', () => {
     expect(() => assertConfigAtCut(adopted, olderSha)).toThrow(/auto-cut's release .* changed \.deploy-kit\.config\.json/);
   });
 });
+
+describe('PKG-318 one project root', () => {
+  const verified = { requireVerifiedRef: 'green' };
+  function appWithReleaseKit() {
+    const { work, newerSha } = stale(pipelineConfig(OLD_INSTALL, verified), pipelineConfig(NEW_INSTALL, verified));
+    writeFileSync(path.join(work, 'release-kit.config.js'), 'module.exports = {};\n');
+    const elsewhere = mkdtempSync(path.join(tmpdir(), 'dk-ship-elsewhere-'));
+    roots.push(elsewhere);
+    return { work, newerSha, elsewhere };
+  }
+
+  it('CANARY project-root: called with a projectRoot elsewhere, the app\'s own root decides auto-cut, and the stale file never ships', () => {
+    const { work, newerSha, elsewhere } = appWithReleaseKit();
+    captureLog();
+    const rt = pipelineRuntime(newerSha);
+    expect(() => kit.deploy(loadWorking(work), { projectRoot: elsewhere }, rt.ctx)).toThrow(/auto-cut would run/);
+    expect(rt.calls.join('\n')).not.toContain(OLD_INSTALL);
+  });
+
+  it('CANARY verified-adopts-when-auto-cut-predicted: the verified tip is pinned and adopted, with the app\'s root', () => {
+    const { work, newerSha, elsewhere } = appWithReleaseKit();
+    captureLog();
+    const result = resolveShipConfig({ config: loadWorking(work), options: { projectRoot: elsewhere } });
+    expect(result.config.hooks.install).toBe(NEW_INSTALL);
+    expect(result.options.sha).toBe(newerSha);
+    expect(result.options.projectRoot).toBe(work);
+  });
+});
