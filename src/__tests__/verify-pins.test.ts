@@ -99,7 +99,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
     const result = verifyPins({ dir });
 
     expect(result.ok).toBe(true);
-    expect(result.summary).toEqual({ ok: 1, mismatch: 0, missing: 0, unverifiable: 0, absent: 0, corrupt: 0, manifests: 1 });
+    expect(result.summary).toEqual({ ok: 1, mismatch: 0, missing: 0, unverifiable: 0, absent: 0, corrupt: 0, forbidden: 0, manifests: 1 });
     expect(result.entries[0]).toMatchObject({
       name: 'url-guard', status: 'ok', expectedVersion: '0.3.0', installedVersion: '0.3.0',
     });
@@ -115,7 +115,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
     const result = verifyPins({ dir });
 
     expect(result.ok).toBe(false);
-    expect(result.summary).toEqual({ ok: 0, mismatch: 1, missing: 0, unverifiable: 0, absent: 0, corrupt: 0, manifests: 1 });
+    expect(result.summary).toEqual({ ok: 0, mismatch: 1, missing: 0, unverifiable: 0, absent: 0, corrupt: 0, forbidden: 0, manifests: 1 });
     const entry = result.entries[0];
     expect(entry).toMatchObject({
       name: 'url-guard', status: 'mismatch', expectedVersion: '0.3.0', installedVersion: '0.2.0',
@@ -139,7 +139,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
     const result = verifyPins({ dir });
 
     expect(result.ok).toBe(false);
-    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 1, unverifiable: 0, absent: 0, corrupt: 0, manifests: 1 });
+    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 1, unverifiable: 0, absent: 0, corrupt: 0, forbidden: 0, manifests: 1 });
     const entry = result.entries[0];
     expect(entry).toMatchObject({ name: 'ghost-pkg', status: 'missing', expectedVersion: '1.0.0' });
     expect(entry.installedVersion).toBeUndefined();
@@ -162,7 +162,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
     const result = verifyPins({ dir });
 
     expect(result.ok).toBe(true); // unverifiable never fails the run
-    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 0, unverifiable: 3, absent: 0, corrupt: 0, manifests: 1 });
+    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 0, unverifiable: 3, absent: 0, corrupt: 0, forbidden: 0, manifests: 1 });
     expect(result.entries.every((e) => e.status === 'unverifiable')).toBe(true);
 
     const { problemLines, unverifiableLines, summaryLine } = formatReport(result);
@@ -221,7 +221,7 @@ describe('verifyPins: the core PKG-108 bug', () => {
 
     expect(result.entries).toHaveLength(0);
     expect(result.ok).toBe(true);
-    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 0, unverifiable: 0, absent: 0, corrupt: 0, manifests: 1 });
+    expect(result.summary).toEqual({ ok: 0, mismatch: 0, missing: 0, unverifiable: 0, absent: 0, corrupt: 0, forbidden: 0, manifests: 1 });
   });
 
   // PKG-108 finding 2: hoisting resolution is legitimate ONLY for a genuine,
@@ -832,5 +832,94 @@ describe('devDependency absence on a production install is tolerated', () => {
 
     expect(result.ok).toBe(false);
     expect(result.summary).toMatchObject({ missing: 1, absent: 0 });
+  });
+});
+
+describe('BRAIN-1015: exact @andrewpopov registry versions are pins', () => {
+  it('is ok when the installed version matches', () => {
+    const dir = freshDir();
+    writeManifest(dir, { '@andrewpopov/alert-kit': '0.1.7' });
+    install(dir, '@andrewpopov/alert-kit', '0.1.7');
+    const result = verifyPins({ dir });
+    expect(result.ok).toBe(true);
+    expect(result.summary.ok).toBe(1);
+  });
+
+  it('reports a MISMATCH and fails', () => {
+    const dir = freshDir();
+    writeManifest(dir, { '@andrewpopov/alert-kit': '0.1.7' });
+    install(dir, '@andrewpopov/alert-kit', '0.1.6');
+    const result = verifyPins({ dir });
+    expect(result.ok).toBe(false);
+    const { problemLines } = formatReport(result);
+    expect(problemLines[0]).toContain('MISMATCH');
+    expect(problemLines[0]).toContain('installed 0.1.6');
+    expect(problemLines[1]).toContain('npm install @andrewpopov/alert-kit@0.1.7 --save-exact');
+  });
+
+  it('reports a missing package and fails', () => {
+    const dir = freshDir();
+    writeManifest(dir, { '@andrewpopov/alert-kit': '0.1.7' });
+    const result = verifyPins({ dir });
+    expect(result.ok).toBe(false);
+    expect(result.summary.missing).toBe(1);
+    expect(formatReport(result).problemLines[0]).toContain('MISSING');
+  });
+
+  it('leaves ranges, other scopes and file:/workspace: specs untouched', () => {
+    const dir = freshDir();
+    writeManifest(dir, {
+      '@andrewpopov/a': '^1.2.3', '@other/b': '1.0.0', '@andrewpopov/c': 'file:../c', '@andrewpopov/d': 'workspace:*',
+      '@andrewpopov/e': 'npm:@andrewpopov/a@1.0.0',
+    });
+    const result = verifyPins({ dir });
+    expect(result.entries).toEqual([]);
+    expect(result.ok).toBe(true);
+  });
+});
+
+describe('BRAIN-1015: forbidGithubScope', () => {
+  it('fails a github:andrewpopov spec and names the dependency and the fix', () => {
+    const dir = freshDir();
+    writeManifest(dir, { '@andrewpopov/alert-kit': 'github:andrewpopov/alert-kit#v0.7.1' });
+    install(dir, '@andrewpopov/alert-kit', '0.7.1');
+    const result = verifyPins({ dir, forbidGithubScope: '@andrewpopov' });
+    expect(result.ok).toBe(false);
+    expect(result.summary.forbidden).toBe(1);
+    const lines = formatReport(result).problemLines.join('\n');
+    expect(lines).toContain('FORBIDDEN');
+    expect(lines).toContain('@andrewpopov/alert-kit');
+    expect(lines).toContain('pin the exact registry version');
+    expect(lines).toContain('package-registry.md');
+  });
+
+  it('fails a bare andrewpopov/x#v1 spec', () => {
+    const dir = freshDir();
+    writeManifest(dir, { x: 'andrewpopov/x#v1.0.0' });
+    install(dir, 'x', '1.0.0');
+    expect(verifyPins({ dir }).ok).toBe(true);
+    expect(verifyPins({ dir, forbidGithubScope: '@andrewpopov' }).ok).toBe(false);
+  });
+
+  it('passes both specs when the option is off, and ignores other owners when on', () => {
+    const dir = freshDir();
+    writeManifest(dir, { x: 'andrewpopov/x#v1.0.0', y: 'github:andrewpopov/y#v2.0.0' });
+    install(dir, 'x', '1.0.0');
+    install(dir, 'y', '2.0.0');
+    expect(verifyPins({ dir }).ok).toBe(true);
+    const other = freshDir();
+    writeManifest(other, { z: 'github:someoneelse/z#v1.0.0' });
+    install(other, 'z', '1.0.0');
+    expect(verifyPins({ dir: other, forbidGithubScope: '@andrewpopov' }).ok).toBe(true);
+  });
+
+  it('the CLI flag fails the run and the summary counts FORBIDDEN', () => {
+    const dir = freshDir();
+    writeManifest(dir, { x: 'andrewpopov/x#v1.0.0' });
+    install(dir, 'x', '1.0.0');
+    expect(captureCli(['verify-pins', '--dir', dir]).code).toBe(0);
+    const { code, out } = captureCli(['verify-pins', '--dir', dir, '--forbid-github-scope', '@andrewpopov']);
+    expect(code).toBe(1);
+    expect(out).toContain('1 FORBIDDEN');
   });
 });

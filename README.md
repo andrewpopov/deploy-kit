@@ -629,6 +629,24 @@ currently just `optionalDependencies` winning over `dependencies` — so an
 absent optional/peer duplicate is never also double-reported as a failing
 `missing` for the same install.
 
+**Registry versions are pins too.** An `@andrewpopov/*` dependency whose spec
+is an exact semver (`"0.1.7"` — no range operator, no `npm:` alias) is checked
+exactly like a tag pin: the installed `node_modules/<name>/package.json`
+version must equal it (`ok` / `MISMATCH` / `missing` / `corrupt`, fix line
+`npm install <name>@<version> --save-exact`). `npm ci` enforces manifest/lock
+agreement but a deploy target's existing `node_modules` can still be stale.
+Ranges (`^1.2.3`), other scopes, `file:` and `workspace:` are not pins and are
+left alone.
+
+**Forbidding new github pins (opt-in).** Once a repo has moved to registry
+versions, turn on `--forbid-github-scope @andrewpopov` (CLI) and/or
+`"forbidGithubScope": "@andrewpopov"` in `.deploy-kit.config.json` (read by the
+deploy gate, which runs `fs`/`path` only on the target). Any
+`github:andrewpopov/...` or bare `andrewpopov/...#ref` dependency then fails as
+`FORBIDDEN <manifest> <name>` with the fix "pin the exact registry version; see
+package-registry.md". It is off by default so repos that have not migrated
+keep passing.
+
 Run it wherever you want the guarantee — a `verify` script, or as a
 `preRestartChecks` command to gate a deploy:
 
@@ -891,7 +909,7 @@ npx deploy-kit clear-pending-release  # discard a stuck auto-cut pending-release
 | --- | --- | --- |
 | `init` | — | Write a `.deploy-kit.config.json` skeleton (never overwrites) + print the scripts block. |
 | `port-guard <port> <pm2-process-name>` | — | Exit 0 if `<port>` is free or held only by `<pm2-process-name>`'s pm2 process tree; exit 1 (naming the PID) if a foreign process holds it, or if neither `lsof` nor `ss` is available (fails closed). Meant to run ON the target as a `preRestartChecks` command — see below. |
-| `verify-pins` | `--dir PATH` `--json` | Assert that every `github:owner/repo#vX.Y.Z` dependency is actually **installed** at the version its pin claims. `npm install` does not re-resolve a `github:` tag, so bumping a pin can exit 0 while leaving the old code in `node_modules`. Exits 1 naming each mismatch and the exact re-install command that fixes it. Reports pins whose ref carries no assertable version (`#main`, a commit SHA) rather than silently skipping them. Standalone — reads no `.deploy-kit.config.json`. See below. |
+| `verify-pins` | `--dir PATH` `--json` `--forbid-github-scope @SCOPE` | Assert that every `github:owner/repo#vX.Y.Z` (and exact `@andrewpopov/*` registry version) dependency is actually **installed** at the version its pin claims. `npm install` does not re-resolve a `github:` tag, so bumping a pin can exit 0 while leaving the old code in `node_modules`. Exits 1 naming each mismatch and the exact re-install command that fixes it. Reports pins whose ref carries no assertable version (`#main`, a commit SHA) rather than silently skipping them. Standalone — reads no `.deploy-kit.config.json`. See below. |
 | `verify-tunnel-config` | `--dir PATH` `--guard-config PATH` `--json` | Verify Cloudflare ingress ordering, exact services, anchored path regexes, required host routes, forbidden origins, and final fallback against app-owned `deploy-kit.guards.json`. Standalone. |
 | `verify-no-secrets` | `--dir PATH` `--guard-config PATH` `--json` | Fail when an app-configured secret-shaped filename is tracked or is untracked and not ignored. Filename guard only; it does not scan contents. Standalone. |
 | `clear-pending-release` | `--dir PATH` `--json` | Discard the crash-recovery pointer at `.deploy-kit/pending-release.json` that auto-cut writes after merging a release PR. Prints the version/sha/PR/timestamp it is discarding, then removes the file. Does **not** unpublish, revert, or un-merge that release — it stays merged and released; the next deploy just stops resuming onto that SHA and deploys current HEAD instead, cutting any pending fragments. Idempotent — no pending pointer is a plain success, exit 0. Standalone, and dispatched before config is loaded — it works even when `.deploy-kit.config.json` or the deploy target is broken, which is exactly the situation an operator reaching for this is in. |

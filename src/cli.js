@@ -27,6 +27,7 @@ const KNOWN_FLAGS = [
   '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env',
   '--dir', '--json', '--local', '--branch', '--no-auto-cut', '--guard-config', '--sha', '--on-host',
   '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--to', '--run-id', '--parent-run',
+  '--forbid-github-scope',
 ];
 
 // Flags that take a following positional value. Kept in sync with the arity
@@ -37,6 +38,7 @@ const KNOWN_FLAGS = [
 const VALUE_FLAGS = new Set([
   '--lines', '--webhook-env', '--service', '--action', '--api-url-env', '--api-key-env', '--dir', '--branch',
   '--guard-config', '--sha', '--kind', '--request', '--epoch', '--not-after', '--expect-reservation', '--to', '--run-id', '--parent-run',
+  '--forbid-github-scope',
 ]);
 
 // The set of flags each command actually reads. KNOWN_FLAGS above is only
@@ -50,7 +52,7 @@ const COMMAND_FLAGS = {
   'announce-discord': ['--webhook-env', '--service'],
   'run-host-operations': ['--action', '--api-url-env', '--api-key-env'],
   'run-cairn-operations': [],
-  'verify-pins': ['--dir', '--json'],
+  'verify-pins': ['--dir', '--json', '--forbid-github-scope'],
   'verify-tunnel-config': ['--dir', '--guard-config', '--json'],
   'verify-no-secrets': ['--dir', '--guard-config', '--json'],
   'clear-pending-release': ['--dir', '--json'],
@@ -154,6 +156,7 @@ function parseOptions(args) {
     else if (a === '--api-url-env' && args[i + 1]) { options.apiUrlEnv = args[i + 1]; i += 1; }
     else if (a === '--api-key-env' && args[i + 1]) { options.apiKeyEnv = args[i + 1]; i += 1; }
     else if (a === '--dir' && args[i + 1]) { options.dir = args[i + 1]; i += 1; }
+    else if (a === '--forbid-github-scope' && args[i + 1]) { options.forbidGithubScope = args[i + 1]; i += 1; }
     else if (a === '--branch' && args[i + 1]) { options.branch = args[i + 1]; i += 1; }
     else if (a === '--sha' && args[i + 1]) {
       // Format-checked by the SAME helper deploy()/deployRelease() call --
@@ -184,7 +187,8 @@ Commands:
   init                                     scaffold .deploy-kit.config.json + scripts
   port-guard <port> <pm2-process-name>     fail if <port> is held by a process
                                             other than <pm2-process-name>'s pm2 tree
-  verify-pins [--dir <path>] [--json]      assert every package.json github: pin
+  verify-pins [--dir <path>] [--json] [--forbid-github-scope <@scope>]
+                                           assert every package.json github: pin
                                             (owner/repo#<semver-tag>) matches what is
                                             actually installed in node_modules — npm
                                             does NOT re-resolve a bumped tag once the
@@ -706,7 +710,10 @@ function run(argv = process.argv.slice(2), {
   if (command === 'verify-pins') {
     let result;
     try {
-      result = verifyPins({ dir: path.resolve(cwd, options.dir || '.') });
+      result = verifyPins({
+        dir: path.resolve(cwd, options.dir || '.'),
+        forbidGithubScope: options.forbidGithubScope,
+      });
     } catch (error) {
       log.error(error instanceof Error ? error.message : String(error));
       return 1;

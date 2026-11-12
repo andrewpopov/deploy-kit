@@ -107,6 +107,10 @@ const DEFAULT_CONFIG = {
   // `github:owner/repo#ref`, so without this gate a stale dependency ships under a
   // green deploy. Set false only for a target you accept cannot be verified.
   verifyPins: true,
+  // A GitHub owner/scope (`@andrewpopov`): verify-pins then FAILS any
+  // `github:<owner>/...` or `<owner>/...#ref` dependency. null = off, for repos
+  // that have not migrated to registry versions.
+  forbidGithubScope: null,
   skipUnchangedInstall: true,
   installFingerprintFiles: [],
   // BRAIN-567: null (default) = deploy whatever `branch` resolves to. A branch
@@ -270,6 +274,7 @@ const KEY_TYPES = {
   hostLock: 'object?',
   buildBeforeMigrate: 'boolean',
   verifyPins: 'boolean',
+  forbidGithubScope: 'string?',
   skipUnchangedInstall: 'boolean',
   installFingerprintFiles: 'array',
   requireVerifiedRef: 'string?',
