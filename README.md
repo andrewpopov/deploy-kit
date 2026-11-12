@@ -166,6 +166,17 @@ readers must ignore blank lines and any line that is not valid JSON: a crashed w
 never swallows the next record. Recording is best-effort: a killed process leaves no row, and
 `--on-host` runs are not recorded yet.
 
+Both pipelines (legacy and `layout.type: "releases"`) report marks through `ctx.onStep`. A legacy deploy marks, in
+order and only when the step runs: `preDeployChecks`, `fetch`, `merge`, `install`, `generate`, `verify-pins`,
+`preMigrationChecks`, `stop-writers`, `backup`, `migrate`, `build` (before `migrate` with `buildBeforeMigrate`),
+`preRestartChecks`, `pm2-restart`, `health`, `postDeployChecks`, and `resume-writers` on a failure path that restarts the
+paused apps. A mark is emitted before its step starts.
+
+The deploy log carries the same timeline: every `▸` step line ends in `[+12.3s]` (seconds since the deploy began), and a
+deploy that ends, successful or not, prints a `deploy timing:` table with seconds per step, the total, and the
+downtime window (from `stop-writers`, else `pm2-restart`, to the end of `health` or `pm2-restart`; on a failure, to the
+end of the run). A `--dry-run` prints no table.
+
 ### Last-deploy record (`.deploy-kit-last-deploy.json`)
 
 After a deploy **fully** succeeds — restart, health check, and every
