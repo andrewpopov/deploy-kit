@@ -14,6 +14,7 @@ const { parsePm2List } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
 const { clearAutoCutPending } = require('./auto-cut');
 const { assertShaOptions } = require('./sha-options');
+const { resolveShipConfig, assertConfigAtCut, assertPinnedTipHolds } = require('./ship-config');
 const { DEFAULT_WEBHOOK_ENV: ALERT_WEBHOOK_ENV } = require('./alert-discord');
 const {
   assertVerifiedRefOptions, verifiedRefLabel, resolveVerifiedTip, assertContainedInVerified,
@@ -470,13 +471,15 @@ function acquireOrAdoptLock(config, c, { steal }) {
 // every phase records enough state that recover() can restore a known-good running
 // release, and the ONLY disruptive window is stop → backup → migrate → flip.
 function deployRelease(config, options = {}, ctx = {}) {
-  assertTransitionAuthorityEntryPoint(config, { supported: true, options });
   // `--sha`'s format and its exclusivity with `--branch` -- checked here too,
   // before ANYTHING else: `deployRelease()` is itself exported and callable
   // directly (not just via deploy()'s layout delegation), so the CLI's
   // parse-time checks are not the only way in (PKG-164 review finding 6).
   assertShaOptions(options);
   const recoverOnly = ctx[RECOVER_ONLY] === true;
+  // PKG-318: from here on `config` is the shipped sha's, whoever called us (CLI, API, on-host).
+  if (!recoverOnly) ({ config, options } = resolveShipConfig({ config, options, log: ctx.log }));
+  assertTransitionAuthorityEntryPoint(config, { supported: true, options });
   assertOwnedEntry(config, options, ctx, recoverOnly ? 'recover' : 'deploy');
   const log = ctx.log || defaultLog;
   const sleep = ctx.sleep || defaultSleep;
@@ -1242,14 +1245,15 @@ function deployRelease(config, options = {}, ctx = {}) {
     // above the legacy setup).
     autoCutResult = runAutoCutPreflight(config, options, c);
     R = autoCutResult.ran ? autoCutResult.sha : null;
+    if (autoCutResult.ran) assertConfigAtCut(config, R);
     if (R) {
       log.info(`auto-cut: deploying release ${autoCutResult.version} (${R.slice(0, 12)}, PR #${autoCutResult.prNumber})`);
-    } else if (options.sha) {
+    } else if (options.sha || options.branchTipPin) {
       // `--sha`: an operator-supplied exact commit, taking over from the
       // branch tip exactly the way auto-cut's `R` does below -- see the
       // matching comment in deploy.js for why runAutoCutPreflight above has
       // already thrown if auto-cut is configured and would actually run.
-      R = options.sha;
+      R = options.sha || options.branchTipPin;
       log.info(`--sha: deploying ${R.slice(0, 12)} exactly`);
     }
     // See the matching comment in deploy.js -- strict either/or provenance,
@@ -1327,6 +1331,10 @@ function deployRelease(config, options = {}, ctx = {}) {
         `git --git-dir=${paths.repoGit} merge-base --is-ancestor ${shQuote(R)} refs/heads/${shQuote(branch)}`,
         config, c, { tolerate: true },
       );
+      if (options.branchTipPin) {
+        const tipNow = capture(paths.root, `git --git-dir=${paths.repoGit} rev-parse refs/heads/${shQuote(branch)}`, config, c);
+        assertPinnedTipHolds(options, R, tipNow, `refs/heads/${branch}`);
+      }
       if (!mergedRes.ok) {
         throw new Error(
           `Deploy aborted: release ${R.slice(0, 12)} is NOT an ancestor of refs/heads/${branch} in ${paths.repoGit} `

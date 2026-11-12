@@ -362,6 +362,8 @@ export function validateConfig(raw: unknown, options?: { source?: string }): str
 export function loadConfig(options?: {
   cwd?: string;
   override?: Partial<DeployConfig>;
+  /** The config file's content from another source (e.g. the deployed sha's copy); parsed and validated like the file. */
+  configText?: string;
   fsImpl?: unknown;
   validate?: boolean;
   strict?: boolean;

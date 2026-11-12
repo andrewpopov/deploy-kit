@@ -19,6 +19,7 @@ const { verifyTunnelConfig } = require('./tunnel-config-guard');
 const { verifyNoSecrets } = require('./secret-file-guard');
 const { assertShaOptions } = require('./sha-options');
 const { markPlanningRuntime } = require('./lock');
+const { resolveShipConfig } = require('./ship-config');
 
 const KNOWN_FLAGS = [
   '--lines', '--follow', '--errors', '--skip-build', '--skip-deps',
@@ -425,7 +426,9 @@ function runRecorded({ operation, config, options, home, sha, call }) {
   }
 }
 
-function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = process.stdin, env = process.env, fetchImpl, home } = {}) {
+function run(argv = process.argv.slice(2), {
+  cwd = process.cwd(), stdin = process.stdin, env = process.env, fetchImpl, home, resolveShip = resolveShipConfig,
+} = {}) {
   const command = argv[0];
   if (!command || command === 'help' || command === '--help' || command === '-h') {
     console.log(HELP);
@@ -604,7 +607,7 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     return require('./target-state').runCommand(command, argv.slice(1), targetConfig, { log });
   }
 
-  const options = parseOptions(argv.slice(1));
+  let options = parseOptions(argv.slice(1));
 
   // Reject any flag this command does not consume, BEFORE any side effect
   // (the version banner below, loadConfig, or dispatch) has run. See
@@ -804,6 +807,7 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   const configOverride = {};
   if (command === 'monitor' && options.local) configOverride.mode = 'local';
   if (command === 'deploy' && options.branch) configOverride.branch = options.branch;
+  if (options.lock === false) configOverride.lock = false;
 
   let config;
   try {
@@ -812,7 +816,15 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     log.error(error instanceof Error ? error.message : String(error));
     return 1;
   }
-  if (options.lock === false) config = { ...config, lock: false };
+  // `--on-host` validates its own arguments first, then resolves in onHostDeploy against the explicit --sha.
+  if (command === 'deploy' && !options.onHost) {
+    try {
+      ({ config, options } = resolveShip({ config, options }));
+    } catch (error) {
+      log.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
+  }
 
   // An onHost.required app deploys and rolls back only as an accepted request (`--on-host`), under owned locks.
   // `--dry-run` is the config-only planner: it opens no ssh and runs no target command (dryRunContext), so it is not an execution.
@@ -827,7 +839,7 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   }
 
   if (command === 'deploy' && options.onHost) {
-    return require('./on-host/operator').onHostDeploy(config, options, { cwd });
+    return require('./on-host/operator').onHostDeploy(config, options, { cwd, resolveShip });
   }
   if (command === 'deploy' && !options.onHost && options.runId !== undefined) {
     log.error('deploy: --run-id only applies with --on-host');
@@ -841,14 +853,14 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
     }
   }
   if (command === 'rollback' && options.onHost) {
-    return require('./on-host/operator').onHostRollback(config, options, { cwd });
+    return require('./on-host/operator').onHostRollback(config, options, { cwd, resolveShip });
   }
   if (command === 'recover') {
     if (!options.onHost) {
       log.error('recover only exists as `recover --on-host`: it settles an interrupted on-host deploy');
       return 1;
     }
-    return require('./on-host/operator').onHostRecover(config, options, { cwd });
+    return require('./on-host/operator').onHostRecover(config, options, { cwd, resolveShip });
   }
 
   switch (command) {

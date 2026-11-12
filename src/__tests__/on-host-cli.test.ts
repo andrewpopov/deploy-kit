@@ -6,6 +6,8 @@ import * as path from 'path';
 
 const require = createRequire(__filename);
 const cli = require('../cli.js') as { run: (argv: string[], opts?: any) => number | Promise<number> };
+// These specs drive other behaviour in a non-git temp dir; a real deploy from one is refused by PKG-318 (ship-config.test.ts), so they skip resolution.
+const runCli = (argv: string[], opts: Record<string, unknown> = {}) => cli.run(argv, { resolveShip: (a: { config: unknown; options: unknown }) => a, ...opts });
 const { log } = require('../log.js') as { log: Record<string, (m: string) => void> };
 
 const SHA = '0123456789abcdef0123456789abcdef01234567';
@@ -33,7 +35,7 @@ describe('deploy --on-host routing', () => {
   ])('deploy --on-host %j is refused by name, before any ssh', (flags, code) => {
     spies();
     inProject({}, (cwd) => {
-      expect(cli.run(['deploy', '--on-host', ...flags], { cwd })).toBe(1);
+      expect(runCli(['deploy', '--on-host', ...flags], { cwd })).toBe(1);
     });
     expect(out).toContain(code);
   });
@@ -41,7 +43,7 @@ describe('deploy --on-host routing', () => {
   it('--branch is refused with --on-host', () => {
     spies();
     inProject({}, (cwd) => {
-      expect(cli.run(['deploy', '--on-host', '--branch', 'feature/x', '--sha', SHA, '--no-auto-cut'], { cwd })).toBe(1);
+      expect(runCli(['deploy', '--on-host', '--branch', 'feature/x', '--sha', SHA, '--no-auto-cut'], { cwd })).toBe(1);
     });
     expect(out).toMatch(/--sha and --branch are mutually exclusive|ONHOST_BRANCH/);
   });
@@ -49,7 +51,7 @@ describe('deploy --on-host routing', () => {
   it('a non-releases config is refused', () => {
     spies();
     inProject({ layout: null }, (cwd) => {
-      expect(cli.run(['deploy', '--on-host', '--sha', SHA, '--no-auto-cut'], { cwd })).toBe(1);
+      expect(runCli(['deploy', '--on-host', '--sha', SHA, '--no-auto-cut'], { cwd })).toBe(1);
     });
     expect(out).toContain('ONHOST_LAYOUT');
   });
@@ -57,10 +59,10 @@ describe('deploy --on-host routing', () => {
   it('rollback --on-host needs --to, a full sha; --skip-migrate is not a rollback flag', () => {
     spies();
     inProject({}, (cwd) => {
-      expect(cli.run(['rollback', '--on-host'], { cwd })).toBe(1);
+      expect(runCli(['rollback', '--on-host'], { cwd })).toBe(1);
       expect(out).toContain('--to <40-hex> is required');
-      expect(cli.run(['rollback', '--on-host', '--to', 'abc123'], { cwd })).toBe(1);
-      expect(cli.run(['rollback', '--skip-migrate'], { cwd })).toBe(1);
+      expect(runCli(['rollback', '--on-host', '--to', 'abc123'], { cwd })).toBe(1);
+      expect(runCli(['rollback', '--skip-migrate'], { cwd })).toBe(1);
     });
     expect(out).toContain('rollback does not support: --skip-migrate');
   });
@@ -68,7 +70,7 @@ describe('deploy --on-host routing', () => {
   it('--to without --on-host is refused rather than ignored (a legacy rollback goes to previous, whatever it is)', () => {
     spies();
     inProject({}, (cwd) => {
-      expect(cli.run(['rollback', '--to', SHA], { cwd })).toBe(1);
+      expect(runCli(['rollback', '--to', SHA], { cwd })).toBe(1);
     });
     expect(out).toContain('only apply with --on-host');
   });
@@ -77,14 +79,14 @@ describe('deploy --on-host routing', () => {
 describe('attach', () => {
   it('needs exactly one run id', () => {
     spies();
-    expect(cli.run(['attach'])).toBe(1);
-    expect(cli.run(['attach', '--json'])).toBe(1);
+    expect(runCli(['attach'])).toBe(1);
+    expect(runCli(['attach', '--json'])).toBe(1);
     expect(out).toContain('Usage: deploy-kit attach <run-id>');
   });
   it('refuses something that is not a run id without touching the network', () => {
     spies();
     inProject({}, (cwd) => {
-      expect(cli.run(['attach', 'latest'], { cwd })).toBe(1);
+      expect(runCli(['attach', 'latest'], { cwd })).toBe(1);
     });
     expect(out).toContain('ONHOST_RUN_ID');
   });
@@ -97,7 +99,7 @@ describe('recover --on-host, --run-id and artifact routing (BRAIN-636 D8)', () =
   it('recover exists only as `recover --on-host`', () => {
     spies();
     inProject({}, (cwd) => {
-      expect(cli.run(['recover', '--parent-run', RUN_ID, ...request], { cwd })).toBe(1);
+      expect(runCli(['recover', '--parent-run', RUN_ID, ...request], { cwd })).toBe(1);
     });
     expect(out).toContain('recover only exists as `recover --on-host`');
   });
@@ -105,11 +107,11 @@ describe('recover --on-host, --run-id and artifact routing (BRAIN-636 D8)', () =
   it('recover --on-host needs --parent-run, a run id, and takes no --sha or --to', () => {
     spies();
     inProject({}, (cwd) => {
-      expect(cli.run(['recover', '--on-host', ...request], { cwd })).toBe(1);
+      expect(runCli(['recover', '--on-host', ...request], { cwd })).toBe(1);
       expect(out).toContain('--parent-run must be the run id');
-      expect(cli.run(['recover', '--on-host', '--parent-run', 'nope', ...request], { cwd })).toBe(1);
-      expect(cli.run(['recover', '--on-host', '--parent-run', RUN_ID, '--sha', SHA, ...request], { cwd })).toBe(1);
-      expect(cli.run(['recover', '--on-host', '--parent-run', RUN_ID, '--to', SHA, ...request], { cwd })).toBe(1);
+      expect(runCli(['recover', '--on-host', '--parent-run', 'nope', ...request], { cwd })).toBe(1);
+      expect(runCli(['recover', '--on-host', '--parent-run', RUN_ID, '--sha', SHA, ...request], { cwd })).toBe(1);
+      expect(runCli(['recover', '--on-host', '--parent-run', RUN_ID, '--to', SHA, ...request], { cwd })).toBe(1);
     });
     expect(out).toContain('recover does not support: --sha');
     expect(out).toContain('recover does not support: --to');
@@ -118,7 +120,7 @@ describe('recover --on-host, --run-id and artifact routing (BRAIN-636 D8)', () =
   it('--parent-run is only a recover flag', () => {
     spies();
     inProject({}, (cwd) => {
-      expect(cli.run(['deploy', '--on-host', '--sha', SHA, '--no-auto-cut', '--parent-run', RUN_ID], { cwd })).toBe(1);
+      expect(runCli(['deploy', '--on-host', '--sha', SHA, '--no-auto-cut', '--parent-run', RUN_ID], { cwd })).toBe(1);
     });
     expect(out).toContain('deploy does not support: --parent-run');
   });
@@ -126,7 +128,7 @@ describe('recover --on-host, --run-id and artifact routing (BRAIN-636 D8)', () =
   it('a malformed --run-id is refused by name, before any ssh', () => {
     spies();
     inProject({}, (cwd) => {
-      expect(cli.run(['deploy', '--on-host', '--sha', SHA, '--no-auto-cut', '--run-id', 'run-1'], { cwd })).toBe(1);
+      expect(runCli(['deploy', '--on-host', '--sha', SHA, '--no-auto-cut', '--run-id', 'run-1'], { cwd })).toBe(1);
     });
     expect(out).toContain('ONHOST_RUN_ID');
   });
@@ -134,8 +136,8 @@ describe('recover --on-host, --run-id and artifact routing (BRAIN-636 D8)', () =
   it('--run-id without --on-host is refused rather than ignored', () => {
     spies();
     inProject({}, (cwd) => {
-      expect(cli.run(['deploy', '--run-id', RUN_ID], { cwd })).toBe(1);
-      expect(cli.run(['rollback', '--run-id', RUN_ID], { cwd })).toBe(1);
+      expect(runCli(['deploy', '--run-id', RUN_ID], { cwd })).toBe(1);
+      expect(runCli(['rollback', '--run-id', RUN_ID], { cwd })).toBe(1);
     });
     expect(out).toContain('deploy: --run-id only applies with --on-host');
     expect(out).toContain('only apply with --on-host');
@@ -145,9 +147,9 @@ describe('recover --on-host, --run-id and artifact routing (BRAIN-636 D8)', () =
     spies();
     const printed: string[] = [];
     vi.spyOn(console, 'log').mockImplementation((message: string) => { printed.push(message); });
-    expect(cli.run(['artifact', '--json'])).toBe(0);
+    expect(runCli(['artifact', '--json'])).toBe(0);
     expect(JSON.parse(printed.join('\n'))).toMatchObject({ version: require('../../package.json').version });
-    expect(cli.run(['artifact'])).toBe(1);
+    expect(runCli(['artifact'])).toBe(1);
     expect(out).toContain('Usage: deploy-kit artifact --json');
   });
 });

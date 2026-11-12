@@ -14,6 +14,7 @@ const { onlineAppNames } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
 const { clearAutoCutPending, wouldAutoCutRun } = require('./auto-cut');
 const { assertShaOptions } = require('./sha-options');
+const { resolveShipConfig, assertConfigAtCut, assertPinnedTipHolds } = require('./ship-config');
 const {
   assertVerifiedRefOptions, verifiedRefLabel, resolveVerifiedTip, assertContainedInVerified,
 } = require('./verified-ref');
@@ -162,12 +163,14 @@ function gate(step, config, ctx, { onFail, capture = false } = {}) {
 //   install → BACKUP(gate) → stop db-bound apps (release SQLite lock) →
 //   migrate(gate, restart on fail) → build → restart apps → health(gate)
 function deploy(config, options = {}, ctx = {}) {
-  assertTransitionAuthorityEntryPoint(config, { supported: config.layout?.type === 'releases', options });
   // `--sha`'s format and its exclusivity with `--branch` -- checked here,
   // before ANYTHING else (including the release-layout delegation below),
   // because `deploy()` is itself an exported, programmatic entry point: the
   // CLI's parse-time checks are not the only way in (PKG-164 review finding 6).
   assertShaOptions(options);
+  // PKG-318: from here on `config` is the shipped sha's, whoever called us (CLI, API, on-host).
+  ({ config, options } = resolveShipConfig({ config, options, log: ctx.log }));
+  assertTransitionAuthorityEntryPoint(config, { supported: config.layout?.type === 'releases', options });
   assertOwnedEntry(config, options, ctx, 'deploy');
   // Artifact-first release layout (SMH-112) is a separate pipeline. Lazy-require to
   // avoid a top-level cycle (release.js pulls shared helpers, not this module).
@@ -360,15 +363,17 @@ function deployLegacy(config, options, ctx) {
       throw new Error(`Deploy aborted: auto-cut ran after the pre-deploy checks had already approved ${checkedSha.slice(0, 12)}`);
     }
     R = autoCutResult.ran ? autoCutResult.sha : null;
+    if (autoCutResult.ran) assertConfigAtCut(config, R);
     if (R) {
       log.info(`auto-cut: deploying release ${autoCutResult.version} (${R.slice(0, 12)}, PR #${autoCutResult.prNumber})`);
-    } else if (options.sha) {
+    } else if (options.sha || options.branchTipPin) {
       // `--sha`: an operator-supplied exact commit, taking over from the
       // branch tip exactly the way auto-cut's `R` does below -- runAutoCutPreflight
       // above has already thrown if auto-cut is configured and would actually
       // run (see auto-cut.js's own `options.sha` guard), so reaching here means
-      // either auto-cut isn't configured at all or `--no-auto-cut` disabled it.
-      R = options.sha;
+      // either auto-cut isn't configured at all, `--no-auto-cut` disabled it, or
+      // it had nothing to cut and the branch tip the config came from ships (PKG-318).
+      R = options.sha || options.branchTipPin;
       log.info(`--sha: deploying ${R.slice(0, 12)} exactly`);
     } else if (config.requireVerifiedRef) {
       // requireVerifiedRef: ship the tip of the train-verified ref, never the
@@ -538,6 +543,7 @@ function deployLegacy(config, options, ctx) {
       );
       const branchTipRes = runOnTarget(`git rev-parse ${shQuote(config.remote)}/${shQuote(branch)}`, config, { runtime, capture: true });
       const branchTip = (branchTipRes.output || '').trim();
+      assertPinnedTipHolds(options, R, branchTip, `${config.remote}/${branch}`);
       if (!branchTipRes.ok || !branchTip) {
         throw new Error(
           `Deploy aborted: could not resolve ${config.remote}/${branch} to a SHA at ${config.projectDir} after `

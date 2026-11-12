@@ -54,6 +54,30 @@ Drop a `.deploy-kit.config.json` in the repo root (or run `deploy-kit init`):
 See [Contributing](./CONTRIBUTING.md), [Support](./SUPPORT.md), and the
 [Security Policy](./SECURITY.md). This package is licensed under [MIT](./LICENSE).
 
+**A deploy ships the config of the commit it deploys (PKG-318).** A config read from
+`.deploy-kit.config.json` is re-read from the commit being shipped, once, first thing in `deploy()`,
+`deployRelease()` and `deploy --on-host`, before preflight, locks, protections (`transitionAuthority`,
+`onHost`), derived defaults (`verifyPins`, `buildBeforeMigrate`) and every check. So the CLI,
+programmatic callers and a deploy-kit running on the host inside an old checkout all behave the same.
+The final sha is settled up front: `--sha`; else the `requireVerifiedRef` tip; else the branch tip
+(`config.branch`, or the remote's default branch), which is pinned as `--sha` so the target deploys
+exactly that commit and refuses if the branch moved by the time it checks out. The file is read with
+`git show` from the controller checkout (the exact sha is fetched from whichever remote the checkout
+has; its remote names need not match `remote`) and goes through the same loader and validation. A
+differing config prints
+`deploy-kit: using .deploy-kit.config.json from <sha8> (the working tree differs)`. A commit without
+the file is refused, as is a sha that could not be fetched (reported as a fetch failure, not a missing
+file), and so is a sha whose `mode`, `host`, `projectDir`, `ssh`, `remote`, `branch`,
+`requireVerifiedRef`, `autoCut` or `layout` differs from the working tree: those already chose the
+target and ref. With auto-cut the sha does not exist yet, so the branch tip's config is used; the deploy is
+refused if the cut changed the file, and if the cut had nothing to cut the tip it read ships
+(refused if the branch moved). `rollback` and `recover` name no new commit and are
+not re-resolved. There is no flag to deploy an uncommitted config; a config built in code
+(`mergeConfig`, no file) is used as given. A real deploy whose config file was loaded from a
+directory that is not a git checkout is refused (run it from a checkout); only a dry run plans with
+such a file as is (warned). `--dry-run` contacts no remote: it resolves no tip, plans from the sha's config
+when a `--sha` is already local, and fails closed when it is local without the file.
+
 The `.deploy-kit.config.json` holding your real host/paths lives in each
 **consumer** repo, never in this package. The config is validated on load —
 unknown keys, wrong types, a bad `mode`, or a removed key (e.g.
