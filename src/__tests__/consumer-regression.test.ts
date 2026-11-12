@@ -591,7 +591,7 @@ describe('consumer regression: shipping each real config from its own sha is a n
           config, options: { sha: git('rev-parse', 'HEAD') }, override: {}, cwd: dir,
           log: { info: (m: string) => lines.push(m), warning: (m: string) => lines.push(m) },
         });
-        expect(result.config).toEqual(config);
+        expect({ ...Object.fromEntries(Object.entries(result.config)) }).toEqual({ ...Object.fromEntries(Object.entries(config)) });
         expect(lines).toEqual([]);
       } finally {
         rmSync(dir, { recursive: true, force: true });

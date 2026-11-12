@@ -2,7 +2,9 @@
 
 const path = require('path');
 const { execFileSync: nodeExecFileSync } = require('child_process');
-const { runOnTarget, buildHealthCommand, shQuote } = require('./exec');
+const {
+  runOnTarget, buildHealthCommand, shQuote, normalizeRuntime,
+} = require('./exec');
 const {
   acquireLock, validateOwnedLocks, lockRequiresOwnership, assertOwnedEntry,
 } = require('./lock');
@@ -14,6 +16,7 @@ const { parsePm2List } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
 const { clearAutoCutPending } = require('./auto-cut');
 const { assertShaOptions } = require('./sha-options');
+const { resolveShipConfig, resolveLateShipConfig } = require('./ship-config');
 const { DEFAULT_WEBHOOK_ENV: ALERT_WEBHOOK_ENV } = require('./alert-discord');
 const {
   assertVerifiedRefOptions, verifiedRefLabel, resolveVerifiedTip, assertContainedInVerified,
@@ -477,6 +480,8 @@ function deployRelease(config, options = {}, ctx = {}) {
   // parse-time checks are not the only way in (PKG-164 review finding 6).
   assertShaOptions(options);
   const recoverOnly = ctx[RECOVER_ONLY] === true;
+  // PKG-318: from here on `config` is the shipped sha's, whoever called us (CLI, API, on-host).
+  if (!recoverOnly) ({ config, options } = resolveShipConfig({ config, options, log: ctx.log }));
   assertOwnedEntry(config, options, ctx, recoverOnly ? 'recover' : 'deploy');
   const log = ctx.log || defaultLog;
   const sleep = ctx.sleep || defaultSleep;
@@ -1350,6 +1355,11 @@ function deployRelease(config, options = {}, ctx = {}) {
       if (!/^[0-9a-f]{40}$/.test(st.sha)) {
         throw new Error(`Could not resolve ${config.remote}/${branch} (or refs/heads/${branch}) to a SHA in ${paths.repoGit} (got "${st.sha}")`);
       }
+    }
+    if (!normalizeRuntime(ctx.runtime).dryRun) {
+      config = resolveLateShipConfig({
+        config, sha: st.sha, log, readOnTarget: (spec) => runInDir(paths.root, `git --git-dir=${paths.repoGit} show ${shQuote(spec)}`, config, c, { capture: true, tolerate: true }),
+      });
     }
     const ts = capture(paths.root, 'date -u +%Y%m%dT%H%M%SZ', config, c);
     const releaseId = `${st.sha.slice(0, 12)}-${ts}`;

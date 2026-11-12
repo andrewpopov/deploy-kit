@@ -14,6 +14,8 @@ const { onlineAppNames } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
 const { clearAutoCutPending, wouldAutoCutRun } = require('./auto-cut');
 const { assertShaOptions } = require('./sha-options');
+const { resolveShipConfig, resolveLateShipConfig } = require('./ship-config');
+const { CONFIG_ORIGIN } = require('./config');
 const {
   assertVerifiedRefOptions, verifiedRefLabel, resolveVerifiedTip, assertContainedInVerified,
 } = require('./verified-ref');
@@ -168,6 +170,8 @@ function deploy(config, options = {}, ctx = {}) {
   // because `deploy()` is itself an exported, programmatic entry point: the
   // CLI's parse-time checks are not the only way in (PKG-164 review finding 6).
   assertShaOptions(options);
+  // PKG-318: from here on `config` is the shipped sha's, whoever called us (CLI, API, on-host).
+  ({ config, options } = resolveShipConfig({ config, options, log: ctx.log }));
   assertOwnedEntry(config, options, ctx, 'deploy');
   // Artifact-first release layout (SMH-112) is a separate pipeline. Lazy-require to
   // avoid a top-level cycle (release.js pulls shared helpers, not this module).
@@ -594,6 +598,13 @@ function deployLegacy(config, options, ctx) {
       mark('merge');
       run(`Pulling ${config.remote}/${branch} (--ff-only)`, `git pull --ff-only ${shQuote(config.remote)} ${shQuote(branch)}`);
       steps.push(`pull:${branch}`);
+    }
+
+    if (config[CONFIG_ORIGIN] && !normalizeRuntime(runtime).dryRun) {
+      const shippedSha = R || runOnTarget('git rev-parse HEAD', config, { runtime, capture: true }).output.trim();
+      config = resolveLateShipConfig({
+        config, sha: shippedSha, log, readOnTarget: (spec) => runOnTarget(`git show ${shQuote(spec)}`, config, { runtime, capture: true }),
+      });
     }
 
     if (stash) {

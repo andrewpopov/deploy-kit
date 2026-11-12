@@ -7,6 +7,10 @@ const { verifiedRefProblems } = require('./verified-ref');
 const { DECLARABLE_CLASSES, USER_HOOK_STEPS } = require('./effects');
 
 const CONFIG_FILENAME = '.deploy-kit.config.json';
+// Marks a config that was read from a real `.deploy-kit.config.json` (PKG-318): where it was loaded
+// from and the override applied, so deploy()/deployRelease() can re-read the file from the sha they
+// ship. An enumerable symbol, so it survives `{ ...config }`; JSON and key validation never see it.
+const CONFIG_ORIGIN = Symbol.for('deploy-kit.configOrigin');
 
 // Policy-free defaults. Every app supplies its own host/dir/app-names/hooks;
 // only the shape and the safety-relevant defaults live here.
@@ -867,8 +871,10 @@ function loadConfig({
   log = defaultLog,
 } = {}) {
   let fileConfig = {};
+  let readFromDisk = false;
   const configPath = path.join(cwd, CONFIG_FILENAME);
   if (configText !== undefined || fsImpl.existsSync(configPath)) {
+    readFromDisk = configText === undefined && fsImpl === fs;
     try {
       fileConfig = JSON.parse(configText !== undefined ? configText : fsImpl.readFileSync(configPath, 'utf8'));
     } catch (error) {
@@ -895,11 +901,13 @@ function loadConfig({
   if (merged.hooks.pendingMigrations && merged.layout?.type !== 'releases') {
     log.warning('hooks.pendingMigrations is ignored unless layout.type is "releases"; `hooks.migrate` always runs under the legacy layout.');
   }
+  if (readFromDisk) merged[CONFIG_ORIGIN] = { cwd, override, shippedSha: null };
   return merged;
 }
 
 module.exports = {
   CONFIG_FILENAME,
+  CONFIG_ORIGIN,
   DEFAULT_CONFIG,
   REMOVED_KEYS,
   mergeConfig,

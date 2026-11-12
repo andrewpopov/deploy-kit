@@ -805,6 +805,7 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   const configOverride = {};
   if (command === 'monitor' && options.local) configOverride.mode = 'local';
   if (command === 'deploy' && options.branch) configOverride.branch = options.branch;
+  if (options.lock === false) configOverride.lock = false;
 
   let config;
   try {
@@ -815,15 +816,12 @@ function run(argv = process.argv.slice(2), { cwd = process.cwd(), stdin = proces
   }
   if (command === 'deploy') {
     try {
-      ({ config, options } = resolveShipConfig({
-        config, options, override: configOverride, cwd,
-      }));
+      ({ config, options } = resolveShipConfig({ config, options }));
     } catch (error) {
       log.error(error instanceof Error ? error.message : String(error));
       return 1;
     }
   }
-  if (options.lock === false) config = { ...config, lock: false };
 
   // An onHost.required app deploys and rolls back only as an accepted request (`--on-host`), under owned locks.
   // `--dry-run` is the config-only planner: it opens no ssh and runs no target command (dryRunContext), so it is not an execution.

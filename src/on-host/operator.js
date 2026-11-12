@@ -19,6 +19,7 @@ const { validateConfig } = require('../config');
 const { lockId } = require('../lock');
 const { log: defaultLog } = require('../log');
 const { FULL_SHA_RE } = require('../sha-options');
+const { resolveShipConfig } = require('../ship-config');
 const { OnHostError, listFiles, sha256File } = require('./host-run');
 const { readArtifact: readInstalledArtifact } = require('../artifact');
 const { RUN_ID_RE } = require('./outcome');
@@ -402,6 +403,13 @@ function onHostDeploy(config, options, deps = {}) {
 
   try {
     validateOnHostRequest(config, options);
+    if (options.kind !== 'rollback') {
+      try {
+        ({ config, options } = resolveShipConfig({ config, options, log }));
+      } catch (error) {
+        throw new OnHostError('ONHOST_CONFIG', error.message);
+      }
+    }
 
     const scripted = runScriptOnTarget(preflightScript(config), sshConfig, {
       capture: true, runtime, timeoutSeconds: PREFLIGHT_TIMEOUT_SECONDS,
