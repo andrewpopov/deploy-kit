@@ -19,6 +19,8 @@ const {
 } = require('./verified-ref');
 const { writeLastDeployRecord } = require('./last-deploy');
 const { assertTransitionAuthorityEntryPoint } = require('./transition-authority');
+const { stepClass } = require('./effects');
+const { createStepTiming } = require('./step-timing');
 
 function defaultSleep(seconds) {
   const ms = seconds * 1000;
@@ -169,14 +171,31 @@ function deploy(config, options = {}, ctx = {}) {
   assertOwnedEntry(config, options, ctx, 'deploy');
   // Artifact-first release layout (SMH-112) is a separate pipeline. Lazy-require to
   // avoid a top-level cycle (release.js pulls shared helpers, not this module).
-  if (config.layout && config.layout.type === 'releases') {
-    return require('./release').deployRelease(config, options, ctx);
+  const timing = createStepTiming({ clock: ctx.clock, onStep: ctx.onStep, log: ctx.log || defaultLog });
+  const timedCtx = { ...ctx, onStep: timing.onStep, log: timing.log, timing };
+  const dryRun = normalizeRuntime(ctx.runtime).dryRun;
+  let ok = false;
+  try {
+    const result = config.layout && config.layout.type === 'releases'
+      ? require('./release').deployRelease(config, options, timedCtx)
+      : deployLegacy(config, options, timedCtx);
+    ok = true;
+    return result;
+  } finally {
+    if (!dryRun) timing.report(ok);
   }
+}
+
+function deployLegacy(config, options, ctx) {
   const log = ctx.log || defaultLog;
   const sleep = ctx.sleep || defaultSleep;
   const runtime = ctx.runtime;
   const c = { ...ctx, log, sleep, runtime };
   assertVerifiedRefOptions(config, options, c);
+  const mark = (step) => {
+    if (typeof c.onStep !== 'function') return;
+    try { c.onStep({ step, class: stepClass(config, step) }); } catch { /* telemetry never disturbs a deploy */ }
+  };
 
   const {
     skipDeps = false,
@@ -226,6 +245,7 @@ function deploy(config, options = {}, ctx = {}) {
     if (!dbAppsPaused) return;
     if (!pausedApps.length) { dbAppsPaused = false; return; }
     const toResume = pausedApps;
+    mark('resume-writers');
     runOnTarget(`pm2 start ${toResume.join(' ')} 2>/dev/null || true`, config, { runtime });
     // A zero-exit `pm2 start` is not proof anything actually came back online
     // (release.js's `resumePrevious` models the same distrust) — verify before
@@ -315,6 +335,7 @@ function deploy(config, options = {}, ctx = {}) {
       else if (verifiedRef) R = verifiedTip = resolveVerifiedTip(config, verifiedProbe);
     }
     const checkEnv = R ? `export DEPLOY_KIT_SHA=${shQuote(R)} && ` : '';
+    if (config.preDeployChecks.length) mark('preDeployChecks');
     for (const check of config.preDeployChecks) {
       gate({ message: `Pre-deploy check: ${check.name}`, command: `${checkEnv}${check.command}` }, config, c);
       steps.push(`check:${check.name}`);
@@ -333,6 +354,7 @@ function deploy(config, options = {}, ctx = {}) {
     // before auto-cut existed. When it DID run, `R` (the immutable merged sha)
     // takes over from the branch tip as what this deploy actually brings the
     // target to.
+    if (wouldAutoCutRun(config, options, c)) mark('auto-cut');
     autoCutResult = runAutoCutPreflight(config, options, c);
     if (checkedSha && autoCutResult.ran) {
       throw new Error(`Deploy aborted: auto-cut ran after the pre-deploy checks had already approved ${checkedSha.slice(0, 12)}`);
@@ -395,6 +417,7 @@ function deploy(config, options = {}, ctx = {}) {
     if (stash) {
       // Tracked-only stash: never sweep untracked .ssh/.cloudflared into a stash —
       // that would break the tunnel and lose the key mid-deploy.
+      mark('stash');
       run('Stashing local tracked changes', `git stash push -m "deploy-kit $(date -u +%FT%TZ)" || true`, { tolerate: true });
       steps.push('stash');
     }
@@ -478,6 +501,7 @@ function deploy(config, options = {}, ctx = {}) {
       }
     }
 
+    mark('fetch');
     if (R) {
       // Deploy-by-SHA: bring the target to the EXACT release auto-cut merged,
       // never the branch tip a plain `git pull` would resolve (a descendant
@@ -549,6 +573,7 @@ function deploy(config, options = {}, ctx = {}) {
         );
       }
 
+      mark('merge');
       run(`Merging to ${rLabel} ${R.slice(0, 12)} (--ff-only)`, `git merge --ff-only ${shQuote(R)}`);
       steps.push(`merge:${R}`);
 
@@ -566,6 +591,7 @@ function deploy(config, options = {}, ctx = {}) {
       }
     } else {
       run('Fetching latest', `git fetch ${shQuote(config.remote)} --prune`);
+      mark('merge');
       run(`Pulling ${config.remote}/${branch} (--ff-only)`, `git pull --ff-only ${shQuote(config.remote)} ${shQuote(branch)}`);
       steps.push(`pull:${branch}`);
     }
@@ -580,6 +606,7 @@ function deploy(config, options = {}, ctx = {}) {
     }
 
     if (!skipDeps) {
+      mark('install');
       run('Installing dependencies', config.hooks.install);
       steps.push('install');
       // Always run right after install, never folded into `hooks.build` — see
@@ -587,6 +614,7 @@ function deploy(config, options = {}, ctx = {}) {
       // own cache (Nx/Turbo) can silently skip a generator baked into the
       // build script, shipping a tree that installed cleanly but can't run.
       if (config.hooks.generate) {
+        mark('generate');
         run('Running post-install generation', config.hooks.generate);
         steps.push('generate');
       }
@@ -610,6 +638,7 @@ function deploy(config, options = {}, ctx = {}) {
     // stale tree MORE likely, not less. See pin-gate.js for why the checker is
     // shipped to the target rather than invoked there.
     if (verifyPins) {
+      mark('verify-pins');
       run('Verifying dependency pins', PIN_CHECK_COMMAND, { input: buildPinCheckProgram() });
       steps.push('verify-pins');
     }
@@ -619,11 +648,13 @@ function deploy(config, options = {}, ctx = {}) {
     if (buildBeforeMigrate && doBuild) {
       // Build with apps still up — no pause yet, so a build failure aborts without
       // any service having been stopped.
+      mark('build');
       run('Building', config.hooks.build);
       steps.push('build');
     }
 
     if (!skipMigrate) {
+      if (config.preMigrationChecks.length) mark('preMigrationChecks');
       for (const check of config.preMigrationChecks) {
         run(`Pre-migration check: ${check.name}`, check.command);
         steps.push(`pre-migration-check:${check.name}`);
@@ -650,6 +681,7 @@ function deploy(config, options = {}, ctx = {}) {
         const dryRun = normalizeRuntime(runtime).dryRun;
         if (dryRun) {
           log.warning('--dry-run: skipping DB-bound pause verification (pm2 state is never real under a dry run).');
+          mark('stop-writers');
           run(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`,
             `pm2 stop ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, { tolerate: true });
           dbAppsPaused = true;
@@ -668,6 +700,7 @@ function deploy(config, options = {}, ctx = {}) {
             );
           }
 
+          mark('stop-writers');
           run(`Pausing DB-bound apps (${config.dbBoundApps.join(', ')})`,
             `pm2 stop ${config.dbBoundApps.join(' ')} 2>/dev/null || true`, { tolerate: true });
           dbAppsPaused = true;
@@ -706,6 +739,7 @@ function deploy(config, options = {}, ctx = {}) {
         }
       }
       if (config.hooks.backup) {
+        mark('backup');
         // Backup BEFORE migrating, AFTER writers are stopped. A failed backup must
         // still abort before any schema change — apps are already paused by now,
         // so (unlike before this fix) resume them on failure, same as every other
@@ -723,6 +757,7 @@ function deploy(config, options = {}, ctx = {}) {
         steps.push('backup');
       }
       if (config.hooks.migrate) {
+        mark('migrate');
         safeStep('Running database migrations', config.hooks.migrate);
         steps.push('migrate');
       }
@@ -731,6 +766,7 @@ function deploy(config, options = {}, ctx = {}) {
     if (!buildBeforeMigrate && doBuild) {
       // Default: build while apps are paused (bewks' model); resume-on-failure so a
       // broken build never leaves the fleet stopped.
+      mark('build');
       safeStep('Building', config.hooks.build);
       steps.push('build');
     }
@@ -744,6 +780,7 @@ function deploy(config, options = {}, ctx = {}) {
     // `git pull`/`git checkout` and move HEAD -- so the HEAD-equals-R assertion
     // below MUST run after every one of these, never before, or a check that
     // moves HEAD could let a descendant of R ship silently past every guard.
+    if (config.preRestartChecks.length) mark('preRestartChecks');
     for (const check of config.preRestartChecks) {
       safeStep(`Pre-restart check: ${check.name}`, check.command);
       steps.push(`pre-restart-check:${check.name}`);
@@ -773,6 +810,7 @@ function deploy(config, options = {}, ctx = {}) {
     }
 
     if (config.appNames.length) {
+      mark('pm2-restart');
       const restartCmd = config.hooks.restart || pm2StartOrRestart(config.appNames, config);
       // safeStep, not run: this is still inside the paused window. A failed
       // restart used to abort straight through `run()`, leaving apps we paused
@@ -804,12 +842,15 @@ function deploy(config, options = {}, ctx = {}) {
         (name) => !config.appNames.includes(name) && !ensured.includes(name),
       );
       if (stranded.length) {
+        if (!config.appNames.length) mark('pm2-restart');
         run(`Restarting DB-bound apps (${stranded.join(', ')})`, pm2StartOrRestart(stranded, config));
       }
       dbAppsPaused = false;
     }
 
+    mark('health');
     const healthy = waitForHealth(config, c);
+    if (c.timing) c.timing.endWindow('health');
     if (!healthy) {
       throw new Error(
         'Deploy completed but the application is unhealthy: the new code is now live and failing health '
@@ -819,6 +860,7 @@ function deploy(config, options = {}, ctx = {}) {
     }
     steps.push('health');
 
+    if (config.postDeployChecks.length) mark('postDeployChecks');
     for (const check of config.postDeployChecks) {
       gate({ message: `Post-deploy check: ${check.name}`, command: check.command }, config, c);
       steps.push(`post-check:${check.name}`);
