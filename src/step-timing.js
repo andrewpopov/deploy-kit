@@ -30,6 +30,7 @@ function createStepTiming({ clock = () => performance.now(), onStep, log }) {
 
   const rows = (endAt) => marks.map((mark, index) => ({
     step: mark.step,
+    note: mark.note,
     startAt: mark.at,
     endAt: index + 1 < marks.length ? marks[index + 1].at : endAt,
   }));
@@ -53,14 +54,16 @@ function createStepTiming({ clock = () => performance.now(), onStep, log }) {
       const all = rows(endAt);
       const width = Math.max(5, ...all.map((row) => row.step.length));
       log.info('deploy timing:');
-      for (const row of all) log.info(`  ${row.step.padEnd(width)}  ${seconds(row.endAt - row.startAt)}`);
+      for (const row of all) log.info(`  ${row.step.padEnd(width)}  ${seconds(row.endAt - row.startAt)}${row.note ? ` (${row.note})` : ''}`);
       log.info(`  ${'total'.padEnd(width)}  ${seconds(endAt)}`);
       const window = downtime(all, ok, endAt);
       if (window) log.info(`  downtime window  ${seconds(window.ms)} (${window.label})`);
     } catch { /* timing output must never change a deploy's outcome */ }
   };
 
-  return { onStep: forwardingOnStep, log: timedLog, marks, endWindow, report };
+  const annotate = (note) => { if (marks.length) marks[marks.length - 1].note = note; };
+
+  return { onStep: forwardingOnStep, log: timedLog, marks, endWindow, annotate, report };
 }
 
 module.exports = { createStepTiming };

@@ -14,6 +14,7 @@ const { parsePm2List } = require('./pm2-state');
 const { runAutoCutPreflight } = require('./auto-cut-call');
 const { clearAutoCutPending } = require('./auto-cut');
 const { assertShaOptions } = require('./sha-options');
+const { installInRelease } = require('./install-fingerprint');
 const { resolveShipConfig, assertConfigAtCut, assertPinnedTipHolds } = require('./ship-config');
 const { DEFAULT_WEBHOOK_ENV: ALERT_WEBHOOK_ENV } = require('./alert-discord');
 const {
@@ -1409,8 +1410,14 @@ function deployRelease(config, options = {}, ctx = {}) {
     } else {
       log.step('Installing dependencies in the candidate release');
       stepStart('install');
-      runInDir(st.releaseDir, `npm_config_cache=${paths.npmCache} ${config.hooks.install}`, config, c);
-      steps.push('install');
+      const unchanged = installInRelease({
+        config, options, releaseDir: st.releaseDir, currentDir: st.prevTarget ? `${paths.root}/${st.prevTarget}` : null,
+        installCommand: `npm_config_cache=${paths.npmCache} ${config.hooks.install}`, log,
+        captureIn: (dir, command) => capture(dir, command, config, c),
+        runIn: (dir, command, opts) => runInDir(dir, command, config, c, opts),
+        annotate: (note) => c.timing?.annotate(note),
+      });
+      steps.push(unchanged ? 'install:unchanged' : 'install');
       // Always run right after install, never folded into `hooks.build` — a
       // fresh worktree can still hit a build tool's GLOBAL cache (Nx/Turbo
       // caches are typically keyed by content, not by directory), so the

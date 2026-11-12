@@ -2120,3 +2120,75 @@ describe('PKG-272 probe-first zero migrations', () => {
     expect(rt.calls.some(command => command.includes('pm2 startOrRestart'))).toBe(false);
   });
 });
+
+describe('release deploy — unchanged install reuse (PKG-315)', () => {
+  const FP = 'c'.repeat(64);
+  const OTHER = 'd'.repeat(64);
+  const CURRENT = '/srv/app/releases/00000000aaaa-20260709T090000Z';
+  const CANDIDATE = '/srv/app/releases/a1b2c3d4e5f6-20260710T090000Z';
+
+  // Wraps the release fake with per-directory node_modules markers: the fingerprint script prints `fingerprints[dir]`.
+  function withMarkers(markers: Record<string, string>, fingerprints: Record<string, string>, over: any = {}) {
+    const rt = makeReleaseRuntime(over);
+    const seen: string[] = [];
+    const execFileSync = (f: string, args: string[], o: any) => {
+      const full = args[args.length - 1];
+      const dir = /^cd '?([^' ]+)'? && /.exec(full)?.[1] || '';
+      const cmd = full.replace(/^cd '?[^' ]+'? && /, '');
+      if (cmd.includes('process.version')) return `${fingerprints[dir] ?? ''}\n`;
+      if (cmd.startsWith('[ -d node_modules ]')) return `${markers[dir] ?? ''}\n`;
+      if (cmd.startsWith('cp -a --reflink=auto')) { seen.push(full); markers[dir] = markers[/'([^']+)\/node_modules'/.exec(cmd)![1]]; return ''; }
+      if (cmd.startsWith("printf '%s\\n' '")) { markers[dir] = /'([0-9a-f]{64})'/.exec(cmd)![1]; return ''; }
+      return (rt.runtime.execFileSync as any)(f, args, o);
+    };
+    return { ...rt, runtime: { execFileSync }, copies: seen };
+  }
+  const installs = (calls: string[]) => calls.filter((c) => / npm ci$/.test(c));
+
+  it('copies the current release node_modules and skips hooks.install when the fingerprint is unchanged', () => {
+    const markers: Record<string, string> = { [CURRENT]: FP };
+    const marks: Array<{ step: string }> = [];
+    const notes: string[] = [];
+    const rt = withMarkers(markers, { [CANDIDATE]: FP });
+    const result = release.deployRelease(relConfig(), {}, { ...ctx(rt.runtime), onStep: (e: any) => marks.push(e), timing: { annotate: (n: string) => notes.push(n) } });
+    expect(installs(rt.calls)).toHaveLength(0);
+    expect(rt.copies).toHaveLength(1);
+    expect(rt.copies[0]).toContain(`cp -a --reflink=auto '${CURRENT}/node_modules' node_modules`);
+    expect(rt.copies[0]).not.toMatch(/ -[a-z]*l/);
+    expect(result.steps).toContain('install:unchanged');
+    expect(notes).toEqual(['unchanged']);
+    expect(marks.map((m) => m.step)).toContain('verify-pins');
+    expect(markers[CANDIDATE]).toBe(FP);
+  });
+
+  it('installs and records the fingerprint when the current release was built from a different one', () => {
+    const markers: Record<string, string> = { [CURRENT]: OTHER };
+    const rt = withMarkers(markers, { [CANDIDATE]: FP });
+    release.deployRelease(relConfig(), {}, ctx(rt.runtime));
+    expect(installs(rt.calls)).toHaveLength(1);
+    expect(rt.copies).toHaveLength(0);
+    expect(markers[CANDIDATE]).toBe(FP);
+  });
+
+  it('installs when the current release has no node_modules marker', () => {
+    const markers: Record<string, string> = {};
+    const rt = withMarkers(markers, { [CANDIDATE]: FP });
+    release.deployRelease(relConfig(), {}, ctx(rt.runtime));
+    expect(installs(rt.calls)).toHaveLength(1);
+  });
+
+  it('a failed install records no fingerprint on the candidate', () => {
+    const markers: Record<string, string> = { [CURRENT]: OTHER };
+    const rt = withMarkers(markers, { [CANDIDATE]: FP }, { fail: [' npm ci'] });
+    expect(() => release.deployRelease(relConfig(), {}, ctx(rt.runtime))).toThrow();
+    expect(markers[CANDIDATE]).toBeUndefined();
+  });
+
+  it('skipUnchangedInstall: false and --force-install both install', () => {
+    for (const [config, options] of [[relConfig({ skipUnchangedInstall: false }), {}], [relConfig(), { forceInstall: true }]] as const) {
+      const rt = withMarkers({ [CURRENT]: FP }, { [CANDIDATE]: FP });
+      release.deployRelease(config, options, ctx(rt.runtime));
+      expect(installs(rt.calls)).toHaveLength(1);
+    }
+  });
+});

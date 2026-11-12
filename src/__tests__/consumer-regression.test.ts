@@ -539,6 +539,13 @@ function withoutLastDeployRecord(calls: string[]): string[] {
   return calls.filter((_, i) => i !== writeIndex && !(dropsHeadRead && i === writeIndex - 1));
 }
 
+// Delta 9 (PKG-315): the install step now probes the install fingerprint and clears its marker around `hooks.install`.
+// These fixtures' fake targets print nothing, so no fingerprint is ever recorded: only the probe, the marker read and
+// the marker clear are added, so they are stripped from the CURRENT run. Behavior is pinned in install-fingerprint.test.ts.
+function withoutInstallFingerprint(calls: string[]): string[] {
+  return calls.filter((cmd) => !cmd.includes('.deploy-kit-install-fingerprint') && !cmd.includes('process.version'));
+}
+
 describe('consumer regression: v0.9.4 command sequence is byte-identical (preRestartChecks absent)', () => {
   for (const [name, raw] of Object.entries(CONFIGS)) {
     it(`${name}: deploy() emits the same command sequence as v0.9.4`, () => {
@@ -549,7 +556,7 @@ describe('consumer regression: v0.9.4 command sequence is byte-identical (preRes
       const oldRun = run(oldDeploy.deploy, config, appNames);
       const newRun = run(kit.deploy, config, appNames);
 
-      expect(withoutLastDeployRecord(newRun.calls)).toEqual(applyIntentionalDeltas(oldRun.calls, config));
+      expect(withoutInstallFingerprint(withoutLastDeployRecord(newRun.calls))).toEqual(applyIntentionalDeltas(oldRun.calls, config));
       expect(newRun.error).toEqual(applyIntentionalErrorDelta(oldRun.error, config));
 
       // Guard against this test silently going vacuous again (the release-id

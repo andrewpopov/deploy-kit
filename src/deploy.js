@@ -22,6 +22,7 @@ const { writeLastDeployRecord } = require('./last-deploy');
 const { assertTransitionAuthorityEntryPoint } = require('./transition-authority');
 const { stepClass } = require('./effects');
 const { createStepTiming } = require('./step-timing');
+const { installInPlace } = require('./install-fingerprint');
 
 function defaultSleep(seconds) {
   const ms = seconds * 1000;
@@ -613,8 +614,10 @@ function deployLegacy(config, options, ctx) {
 
     if (!skipDeps) {
       mark('install');
-      run('Installing dependencies', config.hooks.install);
-      steps.push('install');
+      const unchanged = installInPlace({
+        config, options, runtime, run, log, annotate: (note) => c.timing?.annotate(note),
+      });
+      steps.push(unchanged ? 'install:unchanged' : 'install');
       // Always run right after install, never folded into `hooks.build` — see
       // config.js's `hooks.generate` comment (PKG-127) for why a build tool's
       // own cache (Nx/Turbo) can silently skip a generator baked into the
@@ -982,7 +985,9 @@ function rollback(config, options = {}, ctx = {}) {
 
     run(`Resetting to ${sha.slice(0, 12)}`, `git reset --hard ${sha}`);
     if (!options.skipDeps) {
-      run('Installing dependencies', config.hooks.install);
+      installInPlace({
+        config, options, runtime, run, log, annotate: () => {},
+      });
       // Same rationale as the forward deploy (PKG-127): a generator baked into
       // `hooks.build` can be skipped by a build tool's cache, so it must run
       // as its own always-invoked step, never folded into build.

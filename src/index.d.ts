@@ -191,6 +191,12 @@ export interface DeployConfig {
    * re-resolves a changed `github:owner/repo#ref`, so without this gate a stale
    * dependency ships under a green deploy. */
   verifyPins?: boolean;
+  /** Skip `hooks.install` when the lockfiles, node version, package manager versions and install command match the
+   * last successful install and `node_modules` exists (the releases layout copies the current release's
+   * `node_modules` instead). Default `true`; `--force-install` overrides it for one run. */
+  skipUnchangedInstall?: boolean;
+  /** Extra repo-relative files or globs (workspace manifests) hashed into the install fingerprint. */
+  installFingerprintFiles?: string[];
   /** Branch name (the merge train's `green`) that bounds what may ship. When set, a
    * plain deploy ships that ref's tip instead of `branch`, `--sha` must be contained
    * in it, and `--branch` is refused. Both layouts and `deploy --on-host` enforce it.
@@ -283,6 +289,8 @@ export interface DeployOptions {
   stash?: boolean;
   stealLock?: boolean;
   buildBeforeMigrate?: boolean;
+  /** `--force-install`: run the install hook even when the install fingerprint is unchanged. */
+  forceInstall?: boolean;
   /** `--skip-pin-check`. Overrides the config's `verifyPins`. */
   verifyPins?: boolean;
   /** `--branch`: override `config.branch` for this run. Rejected outright

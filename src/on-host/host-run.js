@@ -19,7 +19,7 @@ const { runAccepted, writeRefused, targetFiles } = require('./accept');
 
 const INVOCATION_ID_RE = /^[0-9a-f]{32}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
-const OPTION_ALLOWLIST = ['skipBuild', 'skipDeps', 'skipMigrate', 'verifyPins'];
+const OPTION_ALLOWLIST = ['skipBuild', 'skipDeps', 'forceInstall', 'skipMigrate', 'verifyPins'];
 
 class OnHostError extends Error {
   constructor(code, message) {
